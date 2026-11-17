@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to release (must already exist, e.g. v0.1.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build + package + release
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ziglang
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ziglang>=0.13"
+
+      - name: Build all targets
+        shell: bash
+        run: bash build.sh
+
+      - name: Package release zip (no models / no webui / no logs)
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/pkg
+          cp build/engine.exe build/launcher.exe 启动.bat stop.bat engine.cfg.example README.md dist/pkg/
+          cp docs/release/运行说明.txt dist/pkg/
+          PYTHONIOENCODING=utf-8 python - <<'PY'
+          import hashlib
+          import os
+          import zipfile
+          from pathlib import Path
+
+          tag = os.environ["TAG_NAME"].strip()
+          pkg = Path("dist/pkg")
+          target = Path(f"dist/local-llm-cuda-{tag}-win64.zip")
+          files = ["engine.exe", "launcher.exe", "启动.bat", "stop.bat",
+                   "engine.cfg.example", "README.md", "运行说明.txt"]
+          with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for f in files:
+                  z.write(pkg / f, arcname=f)
+          sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          lines = [f"{sha(target)}  {target.name}",
+                   f"{sha(pkg / 'engine.exe')}  engine.exe",
+                   f"{sha(pkg / 'launcher.exe')}  launcher.exe"]
+          Path("dist/SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("built", target, target.stat().st_size, "bytes")
+          print("sha256", sha(target))
+          PY
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists; uploading assets (clobber)"
+            gh release upload "$TAG_NAME" dist/*.zip dist/SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG_NAME" dist/*.zip dist/SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" --title "$TAG_NAME" --generate-notes
+          fi

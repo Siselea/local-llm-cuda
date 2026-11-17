@@ -2,10 +2,26 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/Siselea/local-llm-cuda)](https://github.com/Siselea/local-llm-cuda/releases)
+[![build](https://github.com/Siselea/local-llm-cuda/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Siselea/local-llm-cuda/actions/workflows/build.yml)
 
 > **不想自己编译？** 直接下载 [Releases](https://github.com/Siselea/local-llm-cuda/releases) 里的
 > `local-llm-cuda-v0.1.0-win64.zip`（Windows x64：engine.exe + launcher.exe + 启动脚本，不含模型）。
 > 首次运行 web UI 前用 `bash tools/fetch_webui.sh` 获取聊天前端（MIT，4.4 MB，不随仓库分发）。
+
+## 截图
+
+![Win32 启动器主界面](docs/images/launcher-main.png)
+
+*Win32 启动器：默认选中 9B（推荐），全盘模型扫描、GPU 专家层/上下文实时显存估算、放置决策回显；所有截图已裁掉底部日志路径区（无用户名/本机路径）。*
+
+![全盘扫描与盘符标签](docs/images/launcher-model-scan.png)
+
+*模型下拉：`[D:]`/`[U:]` 盘符 + 大小 + 类型；全盘扫描结果带缓存，后台刷新不阻塞界面。*
+
+![llama.cpp 官方聊天界面](docs/images/webui-chat.png)
+
+*`engine serve` 直接服务的 llama.cpp 官方 web UI（MIT；首次用 `bash tools/fetch_webui.sh` 获取，未获取时使用内置极简页）。*
+
 
 
 **面向 Windows + 消费级 NVIDIA 显卡**的自研 LLM 推理引擎（C++17 + CUDA）：
@@ -191,6 +207,9 @@ engine.exe
 ├─ src/model_scan.cpp    模型扫描/缓存/全盘枚举（固定+移动盘、跳过系统目录、多线程）
 ├─ src/config.cpp        101+ 配置项 schema（CLI/config/env/default）
 └─ src/tokenizer.cpp     GGUF tokenizer（BPE/SPM、ChatML/Qwen 模板、Unicode 表）
+
+pyref/                    Python 参考实现（IR/GGUF/safetensors 解析 + planner），
+                          仅用于 diff_ir/diff_plan 对拍，不参与构建/运行
 ```
 
 - 计算后端：**NVRTC** 运行时编译 `kernels.h` 中的 CUDA 源码；dense GEMM 走 **cuBLAS**；
@@ -229,9 +248,9 @@ engine.exe
 
 ---
 
-## 验证与测试
+## 测试与 CI
 
-在仓库根目录执行（需要模型文件；先 `export MODEL_DIR=<你的模型目录>`，脚本内可 `PY=` 覆盖 Python）：
+本地四套验证（在仓库根目录执行）（需要模型文件；先 `export MODEL_DIR=<你的模型目录>`，脚本内可 `PY=` 覆盖 Python）：
 
 ```bash
 bash tools/verify.sh              # 主验证：单元测试 + IR/plan 对拍 + 生成一致性（ALL GREEN 为通过）
@@ -241,10 +260,20 @@ bash tools/verify_generality.sh   # 配置优先级/自适应放置/优雅失败
 ```
 
 其它测试/验收脚本（HTTP、长上下文、分词器、35B e2e、webui 真实浏览器等）见
-[`tools/README.md`](tools/README.md)。
+[`tools/README.md`](tools/README.md)；贡献流程与 PR 要求见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 > 本仓库发布的是**源码**：`build/`、模型权重、日志、测试产物都被 `.gitignore` 排除，
 > 需要用户在本机构建与准备模型。
+
+GitHub Actions（`.github/workflows/`）：
+
+| workflow | 触发 | 做什么 |
+|---|---|---|
+| [build](https://github.com/Siselea/local-llm-cuda/actions/workflows/build.yml) | push / PR / 手动 | **windows-latest** 上 `pip install ziglang` + `bash build.sh`（无 CUDA 驱动只编译，不需要 GPU）；`sanity` 跑 shell/python 语法与 README 链接检查；`no-private-paths` 检查开发机绝对路径（盘符/用户目录）是否泄漏 |
+| [release](https://github.com/Siselea/local-llm-cuda/actions/workflows/release.yml) | tag `v*` / 手动 | 构建 + 打 Windows zip + `SHA256SUMS.txt` + 上传 GitHub Release |
+
+> 构建依赖：CI 不需要 GPU/CUDA Toolkit；`build.sh` 只是编译（NVRTC 源码是运行时编译）。
+> 当前 CI 状态见顶部 **build** 徽章；截图见上。
 
 ---
 
@@ -255,6 +284,10 @@ bash tools/verify_generality.sh   # 配置优先级/自适应放置/优雅失败
 - [`docs/CPU-INT8.md`](docs/CPU-INT8.md) — CPU int8/AVX2 量化内核说明
 - [`docs/WEBUI.md`](docs/WEBUI.md) — 聊天 UI 来源、离线属性、服务端兼容点
 - [`docs/reports/INDEX.md`](docs/reports/INDEX.md) — **开发报告总索引**（性能/验证/根因分析）
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — 构建/验证/代码风格/PR 要求
+- [`docs/images/`](docs/images/) — README 截图（已裁掉私有路径）
+- [`.github/workflows/`](.github/workflows) — GitHub Actions（build / release）
+- [`pyref/README.md`](pyref/README.md) — Python 参考实现（仅对拍用，不参与构建）
 - [`tools/README.md`](tools/README.md) — 所有验证/基准/诊断脚本
 - [`engine.cfg.example`](engine.cfg.example) — 配置文件示例
 - [`THIRD-PARTY.md`](THIRD-PARTY.md) — 第三方组件与模型许可证说明

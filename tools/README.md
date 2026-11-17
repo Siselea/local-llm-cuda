@@ -172,3 +172,24 @@ bash tools/run_class_gpu_probe.sh
 | `ab_int8_cpu.sh` | 纯 CPU 的 int8 A/B：`bench_cpu_layer` 的 layer 模式（24 副本轮转）交错跑 `ENGINE_CPU_INT8=0/1`，报 min/中位/配对差。**不需要 GPU**，是默认开关的判据来源 |
 | `dbg_topo.cpp` | 打印 `physical_cores()` 与 `hardware_concurrency()`（验证 CPU 线程池的"按物理核推导"）：本机 6 核 / 12 逻辑 → 9 线程 |
 | `longctx.sh` | （已在上一版加入）长上下文探针；现在支持 `BIN=` 指定构建，因为 `build/test_gen.exe` 可能被其它智能体的进程占用 |
+
+---
+
+## 诊断 / 一次性开发脚本（不参与构建，不参与四套验证）
+
+以下脚本是开发过程中用来定位具体问题的一次性/诊断工具，**保留作为可复现证据**，
+但**不会**被 `build.sh`、`verify.sh`、CI、launcher 使用，后续 PR 也不需要跑它们。
+它们依赖本机模型路径/环境变量（`MODEL_DIR`、`ENGINE_*`），按需使用即可。
+
+| 类别 | 文件 | 用途 |
+|---|---|---|
+| CPU 内核数值/ALU 诊断 | `dbg_i8.cpp`, `dbg_i8_alu.cpp`, `dbg_i8b.cpp`, `dbg_topo.cpp` | int8 行内核逐块复算、纯 ALU vs 带宽、Q4_K 索引 bug 定位、物理核数打印 |
+| MoE/MLA/qwen35 逐层探针 | `q35_*_probe.py`, `q35_full_probe.py`, `q35_state_probe.py`, `q35_variants.py`, `q35moe_attn_probe.py`, `ds2_*_probe.py`, `ds2_full_probe.py`, `mla_*_probe.py` | 与 numpy/torch 官方实现逐层对拍、定位 SSM/MLA/MoE 语义差 |
+| 利用/带宽探针 | `cpu_probe.py`, `cpu_watch.py`, `cpu_watch_trigger.py`, `measure_utilization.cpp`, `utilization_report.py`, `bench_cpu_layer.cpp`, `bench_cpu_matvec.cpp`, `bench_gd.cpp`, `bench_gemv_hbm.cpp`, `bench_q6k_dp4a.cpp`, `bench_rp.cpp` | GPU/CPU 利用率、CPU 专家 DRAM 带宽、内核微基准（历史报告用） |
+| MTP/布局实验 | `mtp_probe.cpp`, `probe_blas.cpp`, `layout_sweep.py`, `q51_check.py`, `q35_torch_*.py` | MTP 头布局、BLAS 行为、MLA 布局扫描、Q5_1 反量化对拍 |
+| 一次性 A/B/复现脚本 | `ab35*.sh`, `b35.sh`, `ab_*.sh`, `bench_*.sh`, `prof9b*.sh`, `prof35b*.sh`, `run_utilization_*.sh`, `mtp_base_35b.sh`, `numcheck.sh`, `margin35.sh`, `pf_final_measure.sh`, `repro_qwen35_prefill.sh`, `final_table.sh`, `serve_35b_e2e.sh`, `serve_longctx_check.sh` | 具体报告里的 A/B、复现、端到端数字；多数需要本机模型/GPU，不适合 CI |
+| 采样/夹具辅助 | `make_bad_models.py`, `make_quant_fixture.py`, `make_gemv_fixture.py`, `make_gguf_ref.py`, `check_output_quality.py`, `diff_ir.py`, `diff_plan.py`, `oracle_compare.py`, `serve_webui_probe.py`, `webui_e2e.py`, `serve_drift_probe.py`, `serve_prefix_cache_check.py` | 验证/诊断辅助（部分被 `verify_serve.sh` 调用，保留在原位） |
+
+> 说明：`util_bin/`、`util_results*/` 是本地测量产物，已在 `.gitignore` 中排除；
+> `tools/utilization_report.py` 只依赖 Python 标准库，可对采样结果重新出表。
+

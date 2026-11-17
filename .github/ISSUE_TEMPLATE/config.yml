@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "先看文档 / Read the docs first"
+    url: https://github.com/Siselea/local-llm-cuda/tree/main/docs
+    about: "配置、HTTP API、web UI、已知限制都在 docs/ 里。"
+  - name: "Release 下载 / Download prebuilt binaries"
+    url: https://github.com/Siselea/local-llm-cuda/releases
+    about: "Windows x64 预编译 zip（不含模型权重）。"

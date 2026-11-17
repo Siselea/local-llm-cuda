@@ -28,10 +28,13 @@
 | [PRE-FILL-REPORT.md](PRE-FILL-REPORT.md) | PRE-FILL 报告：prefill 从 llama.cpp 的 1/4 到与之同量级（多行量化 GEMM + 注意力分块 + SSM 状态常驻） | prefill fp16 tensor-core GEMM 优化：9B 1.6k prompt 333→1046-1097 tok/s。 |
 | [Q6K-DP4A-RESULTS.md](Q6K-DP4A-RESULTS.md) | Q6_K dp4a GEMV 改造（2026-11-14） | Q6_K DP4A int8 内核的结果与边界分析。 |
 | [QWEN35-SEMANTICS-FIX-REPORT.md](QWEN35-SEMANTICS-FIX-REPORT.md) | Qwen3.5-9B / Qwen3.6-35B-A3B 真实文本生成修复报告（GGUF 张量语义） | qwen35/qwen35moe GGUF 语义修复：llama.cpp 约定 vs HF 语义，逐 token 一致。 |
-| [README-v0-ARCHIVE.md](README-v0-ARCHIVE.md) | engine — 本地推理引擎 v0 | v0 开发期的旧 README（历史数字与里程碑，已被根目录 README 取代）。 |
 | [RETROSPECTIVE.md](RETROSPECTIVE.md) | 复盘（Retrospective）— 自研本地推理引擎 v0 | 项目复盘：G2 止损点、根因与经验。 |
 | [SERVE-REPORT.md](SERVE-REPORT.md) | HTTP 服务 + 分词器 + 采样器 交付报告 | HTTP serve 收口报告：OpenAI 兼容、SSE、webui、前缀缓存、思考漂移与采样。 |
 | [SPEC-COMPLIANCE.md](SPEC-COMPLIANCE.md) | engine v0 — 规格符合性与门槛实测报告 | 规格符合性逐条审计（G0/G1/G2 门槛与证据）。 |
 | [UTILIZATION-REPORT.md](UTILIZATION-REPORT.md) | 利用率与流水线气泡取证（UTILIZATION-REPORT） | GPU/CPU 利用率测量报告（含 CONTAMINATED 标注的历史数据说明）。 |
 | [WEBUI-LAUNCHER-REPORT.md](WEBUI-LAUNCHER-REPORT.md) | llama.cpp webui + Win32 launcher + 模型扫描（2026-11-15） | llama.cpp webui + Win32 launcher：全盘模型扫描/缓存、GUI 交互与真实用户验收。 |
 | [WIN-PRIORITY-REPORT.md](WIN-PRIORITY-REPORT.md) | Windows 调度优先级 + auto-margin 换层 — 实测报告（WIN-PRIORITY） | Windows 进程/线程优先级实测报告（win_priority 的真实收益）。 |
+
+## 已清理 / removed during repository cleanup
+
+- `README-v0-ARCHIVE.md` — 开发期旧 README（历史数字与里程碑），已被仓库根目录 README 取代；需要考古可在 git 历史中查看。

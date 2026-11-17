@@ -1,0 +1,79 @@
+name: Bug report / 问题反馈
+description: Report a crash, wrong output, performance regression or launcher/UI bug. 报告崩溃/输出错误/性能回退/启动器问题。
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report! 请尽量提供可复现信息。**不要上传模型权重、API key 或完整私有路径。**
+        性能问题请先确认 GPU 空闲，并附 `ENGINE_KPROF=1` 数据，避免把后台占用误判为回退。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么 / What happened
+      description: 实际行为、期望行为、是否稳定复现。
+      placeholder: e.g. engine.exe serve 启动后 3 秒崩溃；launcher 选 35B 后 OOM。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Reproduction steps
+      description: 精确命令或 launcher 操作顺序。
+      placeholder: |
+        1. engine.exe serve <MODEL_DIR>/model.gguf --port 7030 --ctx 4096
+        2. curl /v1/chat/completions ...
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 环境 / Environment
+      description: Windows 版本、GPU 型号/显存、NVIDIA 驱动版本、RAM。
+      placeholder: Windows 11 23H2 · RTX 3060 12GB · driver 5xx.xx · 32GB DDR4
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: 模型 / Model
+      description: 模型名、量化、文件大小（不要上传权重本身）。
+      placeholder: Qwen3.5-9B Q5_K_M, 6.58GB
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / Logs
+      description: |
+        `launcher-engine.log` 或 serve 控制台末尾（至少 50 行）；性能问题附 `ENGINE_KPROF=1` 输出。
+        请先删除用户名/私有路径/API key。
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: engine --print-config --json 输出
+      description: 运行 `engine.exe --print-config --json`（可只贴非默认项）。
+      render: json
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认 / Checklist
+      options:
+        - label: 我已搜索过现有 issue，确认不是重复问题。
+          required: true
+        - label: 我没有在附件/日志中保留 API key、token、完整私有路径或模型权重。
+          required: true

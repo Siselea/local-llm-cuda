@@ -5,7 +5,7 @@
 >
 > 关联文档：[FINAL-REPORT.md](FINAL-REPORT.md)（交付报告）、
 > [SPEC-COMPLIANCE.md](SPEC-COMPLIANCE.md)（规格符合性与全部实验记录）、
-> [README.md](README-v0-ARCHIVE.md)（用法）。
+> [README.md](../../README.md)（用法）。
 
 ## 1. 一句话结论
 

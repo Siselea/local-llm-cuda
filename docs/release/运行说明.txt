@@ -1,0 +1,43 @@
+local-llm-cuda release —— 运行说明（Windows x64）
+==================================================
+
+本包不含任何模型权重，需要你自备 .gguf 模型文件。
+
+【最快上手】
+1. 双击 launcher.exe
+2. 第一次启动会自动扫描所有固定盘/移动盘上的 .gguf（约 10 秒~2 分钟；之后读缓存秒开）
+3. 在「模型」下拉里选中模型 → 点「启动引擎」
+4. 状态变成「运行中」后，点「打开对话页」→ 浏览器打开 http://127.0.0.1:7030/
+
+【完整聊天界面（可选，MIT，4.4MB）】
+本包不包含 llama.cpp 官方 web UI。想要完整界面时：
+  A. 从仓库 https://github.com/Siselea/local-llm-cuda 克隆源码，在根目录运行：
+       bash tools/fetch_webui.sh
+     然后把生成的 build/webui 文件夹复制到 engine.exe 同目录，命名为 webui
+  B. 或手动下载：
+       https://raw.githubusercontent.com/ggml-org/llama.cpp/b6000/tools/server/public/index.html.gz
+     解压出 index.html，放到 engine.exe 同目录的 webui/index.html
+没有 webui 也能用：引擎会提供一个内置的极简聊天页。
+
+【命令行】
+  launcher.exe 的目录下运行：
+    engine.exe serve "你的模型.gguf" --port 7030 --ctx 4096
+    engine.exe models
+    engine.exe models --refresh --progress
+  或双击 启动.bat（命令行交互选择模型）。
+
+【停止】
+  在 launcher.exe 里点「停止」，或双击 stop.bat，或在引擎窗口按 Ctrl+C。
+
+【环境要求】
+  - Windows 11 x64
+  - NVIDIA 显卡与最新驱动（开发机 RTX 3060 12GB；建议 ≥12GB 显存，8GB 可试小模型）
+  - 无需安装 CUDA Toolkit / Visual Studio
+
+【日志】
+  launcher.exe 启动的引擎日志在 launcher.exe 同目录的 launcher-engine.log。
+
+【注意】
+  - 模型文件、.gguf 权重不在本包内；请自行下载并遵守模型许可证。
+  - 首次加载模型需要几秒到几十秒；长 prompt 的 prefill 会比 llama.cpp 稍慢（约 79%）。
+  - 详细说明与已知限制见 README.md 和仓库主页。

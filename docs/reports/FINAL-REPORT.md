@@ -1,7 +1,7 @@
 # engine v0 — 最终交付报告
 
 > 目标文档：[engine-v0-spec-and-plan.md](https://github.com/Siselea)
-> 细节见 [SPEC-COMPLIANCE.md](SPEC-COMPLIANCE.md)（门槛与证据）与 [README.md](README-v0-ARCHIVE.md)（用法）。
+> 细节见 [SPEC-COMPLIANCE.md](SPEC-COMPLIANCE.md)（门槛与证据）与 [README.md](../../README.md)（用法）。
 
 ## 1. 一句话结论
 
