@@ -1,0 +1,75 @@
+# =============================================================================
+# Build outputs, binaries, model weights, logs, cache and local databases.
+# Never commit these: they are large and/or machine-specific.
+# =============================================================================
+
+# build tree (binaries, logs, screenshots, vendored webui, caches, fixtures)
+build/
+build/bak/
+
+# native binaries / objects / debug symbols
+*.exe
+*.dll
+*.so
+*.dylib
+*.pyd
+*.obj
+*.o
+*.lib
+*.a
+*.pdb
+*.ilk
+*.exp
+*.map
+
+# model weights (never ship weights; users bring their own GGUF)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.npy
+*.npz
+
+# editor/process backup files of source and reports
+*.pre
+*.pre_*
+*.pre-*
+*.v1
+*.v2
+*.v3
+*.bak
+*.bak_*
+*.orig
+*.rej
+*~
+
+# logs, measurements, generated result trees
+*.log
+*.csv
+*.timeline.*
+tools/util_results*/
+tools/util_results_new/
+tools/util_bin/
+tools/__pycache__/
+__pycache__/
+*.pyc
+
+# generated caches and launcher artefacts
+engine-models-cache.json
+launcher-engine.cfg
+launcher-engine.log
+launcher-effective-args.txt
+launcher-evidence.json
+launcher-ui-map.json
+.build-cache/
+
+# local env / IDE / OS junk
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
