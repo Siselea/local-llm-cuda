@@ -33,8 +33,8 @@ run() { # model name path ids n layers
            -- "$BIN" "$path" "$ids" "$n" --layers "$layers" 2>&1 | tail -3
 }
 
-M_QWEN="<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-M_9B="<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf"
+M_QWEN="${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+M_9B="${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf"
 
 run qwen2.5-0.5b "$M_QWEN" "1000,1001" 257 1
 run qwen2.5-0.5b "$M_QWEN" "1000,1001" 257 12

@@ -11,7 +11,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 PY="${PY:-python}"
-MODEL="${1:-<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf}"
+MODEL="${1:-${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf}"
 PORT="${2:-7034}"
 CTX="${3:-8192}"
 TARGET="${4:-4000}"

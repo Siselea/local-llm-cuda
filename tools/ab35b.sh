@@ -5,7 +5,7 @@
 # which are the numbers that actually moved -- end-to-end decode is the judge.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M35=<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
+M35=${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
 N="${N:-17}"
 REPS="${REPS:-5}"
 dec() { grep -oE 'decode [0-9.]+' | head -1 | cut -d' ' -f2; }

@@ -16,7 +16,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 PY="${PY:-python}"
-MODEL="${1:-<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf}"
+MODEL="${1:-${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf}"
 PORT="${2:-7030}"
 CTX="${CTX:-4096}"          # override if 4096 does not fit: CTX=2048 bash tools/serve_35b_e2e.sh
 GPULAYERS="${GPULAYERS:-16}" # MoE layers kept in VRAM (12 GB card: 16)

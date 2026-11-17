@@ -3,10 +3,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPS="${REPS:-5}"
-M05=<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf
-MC=<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf
-M9=<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf
-M35=<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
+M05=${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf
+MC=${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf
+M9=${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf
+M35=${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
 dec() { grep -oE 'decode [0-9.]+' | head -1 | cut -d' ' -f2; }
 med() { printf '%s\n' "$@" | sort -n | awk '{v[NR]=$1} END {print (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2}'; }
 

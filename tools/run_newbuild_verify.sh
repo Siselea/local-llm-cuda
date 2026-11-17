@@ -6,8 +6,8 @@ cd "$(dirname "$0")/.."
 MON="./tools/util_bin/measure_utilization.exe"
 BIN="./tools/util_bin/test_gen_new.exe"
 R="tools/util_results_new"
-M35="<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
-MCO="<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
+M35="${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+MCO="${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
 run() { local dir="$1" envs="$2" n="$3" model="$4" ids="$5"; shift 5
   mkdir -p "$R/$dir"; echo "=== $dir n=$n $* ==="
   env $envs "$MON" --out-prefix "$R/$dir/measurement" --interval-ms 10 \

@@ -3,7 +3,7 @@
 # by dumping the last-token logits for one forward and comparing with numpy.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M="${M:-<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf}"
+M="${M:-${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf}"
 BIN=./build/test_gen.exe
 one() {  # $1 = out file, rest = env assignments
   local out="$1"; shift

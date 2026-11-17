@@ -4,10 +4,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=${BIN:-./build/pf_gen.exe}
-M9=<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf
-M05=<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf
-MCD=<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf
-M35=<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
+M9=${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf
+M05=${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf
+MCD=${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf
+M35=${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
 REPS=${REPS:-3}
 
 wait_quiet() {

@@ -2,7 +2,7 @@
 # Baseline + cost-breakdown probe for the 35B (MTP feasibility).
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M35=<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
+M35=${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
 IDS="760,6511,314,9338,369"
 echo "===== A: test_gen baseline (ctx 1024, 17 tokens) ====="
 ENGINE_TOPK=1 ENGINE_DEC_SKIP=2 ./build/test_gen.exe "$M35" "$IDS" 17 --ctx 1024 2>&1 |

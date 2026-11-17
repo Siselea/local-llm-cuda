@@ -4,7 +4,7 @@
 # Usage: REPS=3 bash tools/ab35_final.sh [extra args passed to both binaries]
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M="<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+M="${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
 A="build/test_gen_base.exe"
 B="build/test_gen.exe"
 N="${N:-40}"

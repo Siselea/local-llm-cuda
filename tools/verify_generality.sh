@@ -95,17 +95,17 @@ fi
 
 echo
 echo "== local models still parse + validate =="
-for m in "<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf" \
-         "<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf" \
-         "<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf" \
-         "<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"; do
+for m in "${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf" \
+         "${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf" \
+         "${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf" \
+         "${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"; do
   [ -f "$m" ] || continue
   has "info $(basename "$m")" "VALIDATION : PASS" "$ENGINE info '$m'"
 done
 
 echo
 echo "== kernel calibration (--kernel-calibrate) =="
-M_QWEN="<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+M_QWEN="${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 if [ ! -f "$M_QWEN" ]; then
   echo "  (qwen2.5-0.5b missing, skipped)"
 else
@@ -129,7 +129,7 @@ fi
 
 echo
 echo "== adaptive VRAM placement (margin sweep) =="
-M_CODER="<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
+M_CODER="${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
 if [ ! -f "$M_CODER" ]; then
   echo "  (Coder-V2-Lite missing, skipped)"
 else

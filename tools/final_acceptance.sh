@@ -14,9 +14,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 PY="${PY:-python}"
-M05="<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-M9="<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf"
-M35="<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+M05="${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+M9="${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf"
+M35="${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
 WITH_LONGCTX=0
 [ "${1:-}" = "--with-longctx" ] && WITH_LONGCTX=1
 

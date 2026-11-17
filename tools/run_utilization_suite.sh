@@ -37,10 +37,10 @@ RETRIES="${RETRIES:-2}"
 MODELS="${MODELS:-qwen2.5-0.5b DeepSeek-Coder-V2-Lite qwen3.5-9B qwen3.6-35B-A3B}"
 MODES="${MODES:-graph probe prefix1 prefixN prof}"
 
-M_QWEN="<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-M_CODER="<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
-M_9B="<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf"
-M_35B="<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+M_QWEN="${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+M_CODER="${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
+M_9B="${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf"
+M_35B="${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
 
 model_path() {
   case "$1" in

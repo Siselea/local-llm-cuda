@@ -6,10 +6,10 @@ cd "$(dirname "$0")/.."
 
 PY="${PY:-python}"
 GGUF_MODELS=(
-  "<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
-  "<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf"
-  "<MODEL_DIR>/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_K_M.gguf"
-  "<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+  "${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
+  "${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf"
+  "${MODEL_DIR}/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_K_M.gguf"
+  "${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
 )
 MODELS=("${GGUF_MODELS[@]}" "build/fixtures/tiny_hf" "build/fixtures/tiny_hf_moe" \
         "build/fixtures/tiny_gguf_moe/model.gguf" "build/fixtures/tiny_gguf_mla/model.gguf")
@@ -43,18 +43,18 @@ N_LAYER=4 "$PY" tests/make_tiny_model.py build/fixtures/tiny_model4 >/dev/null |
 "$PY" tests/make_tiny_gguf_moe.py >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_mla.py >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_ds2.py >/dev/null || fail=1
-QW="<MODEL_DIR>/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_K_M.gguf"
-CD="<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
+QW="${MODEL_DIR}/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_K_M.gguf"
+CD="${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
 "$PY" tools/make_quant_fixture.py "$QW" blk.0.ssm_alpha.weight      build/fixtures/q4k 4096  || fail=1
 "$PY" tools/make_quant_fixture.py "$CD" blk.0.attn_kv_a_mqa.weight  build/fixtures/q5k 4608  || fail=1
 "$PY" tools/make_quant_fixture.py "$QW" blk.0.ffn_down.weight       build/fixtures/q6k 4096  || fail=1
 "$PY" tools/make_quant_fixture.py "$QW" blk.32.attn_k.weight        build/fixtures/q8k 8192  || fail=1
-"$PY" tools/make_quant_fixture.py "<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf" blk.0.attn_k.weight build/fixtures/q5_0 3584 || fail=1
+"$PY" tools/make_quant_fixture.py "${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf" blk.0.attn_k.weight build/fixtures/q5_0 3584 || fail=1
 "$PY" tools/make_gemv_fixture.py  "$QW" blk.0.attn_gate.weight     build/fixtures/gemv_q4k 1024  || fail=1
 "$PY" tools/make_gemv_fixture.py  "$CD" blk.0.ffn_gate.weight      build/fixtures/gemv_q5k 1024  || fail=1
 "$PY" tools/make_gemv_fixture.py  "$QW" blk.32.attn_k.weight       build/fixtures/gemv_q8_0 1024 || fail=1
 "$PY" tools/make_gemv_fixture.py  "$QW" blk.0.attn_gate.weight     build/fixtures/gemv_q4k_big 4096 || fail=1
-"$PY" tools/make_gguf_ref.py "<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf" build/fixtures/gguf_qwen05 8 || fail=1
+"$PY" tools/make_gguf_ref.py "${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf" build/fixtures/gguf_qwen05 8 || fail=1
 [ $? -ne 0 ] && fail=1
 
 echo
@@ -94,11 +94,11 @@ if [ -x ./build/test_mla_kv.exe ]; then ./build/test_mla_kv.exe || fail=1; else 
 if [ -x ./build/test_decode.exe ]; then
   ./build/test_decode.exe || fail=1
   ./build/test_decode.exe build/fixtures/tiny_gguf_mla || fail=1
-  ./build/test_decode.exe "<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf" \
+  ./build/test_decode.exe "${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf" \
       build/fixtures/gguf_qwen05/tokens.i32 || fail=1
 else echo "missing build/test_decode.exe"; fail=1; fi
 if [ -x ./build/test_gguf.exe ]; then
-  ./build/test_gguf.exe "<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf" build/fixtures/gguf_qwen05 || fail=1
+  ./build/test_gguf.exe "${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf" build/fixtures/gguf_qwen05 || fail=1
 else echo "missing build/test_gguf.exe"; fail=1; fi
 
 echo

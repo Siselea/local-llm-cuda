@@ -225,7 +225,7 @@ engine.exe
 
 ## 验证与测试
 
-在仓库根目录执行（需要模型文件放进 `--model-dir` 或环境变量指定；脚本内可 `PY=` 覆盖 Python）：
+在仓库根目录执行（需要模型文件；先 `export MODEL_DIR=<你的模型目录>`，脚本内可 `PY=` 覆盖 Python）：
 
 ```bash
 bash tools/verify.sh              # 主验证：单元测试 + IR/plan 对拍 + 生成一致性（ALL GREEN 为通过）

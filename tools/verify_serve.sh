@@ -12,7 +12,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 PY="${PY:-python}"
-MODEL="${1:-<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf}"
+MODEL="${1:-${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf}"
 PORT="${2:-7031}"
 SKIP_PARITY="${SKIP_PARITY:-0}"  # set 1 for models that cannot fit twice in VRAM
 ENGINE=./build/engine.exe

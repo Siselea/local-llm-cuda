@@ -6,7 +6,7 @@
 # NOTE: native exe stderr does not survive a shell pipe in this MSYS env -> files.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M35="<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+M35="${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
 BIN="${BIN:-build/test_gen.exe}"
 N="${N:-14}"
 REPS="${REPS:-2}"

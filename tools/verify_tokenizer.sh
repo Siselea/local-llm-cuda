@@ -42,11 +42,11 @@ else
 fi
 
 MODELS=(
-  "<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
-  "<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf"
-  "<MODEL_DIR>/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_K_M.gguf"
-  "<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-  "<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
+  "${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+  "${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf"
+  "${MODEL_DIR}/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_K_M.gguf"
+  "${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  "${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
 )
 
 for m in "${MODELS[@]}"; do

@@ -5,7 +5,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN="${BIN:-"$BIN"}"
-M9=<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf
+M9=${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf
 IDS=$(cat build/ids2048.txt)
 N="${N:-17}"
 echo "=== 9B short prompt, ctx 4096 ==="

@@ -4,7 +4,7 @@
 # in-model cost (numerics are junk, that is fine for attribution).
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M=<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf
+M=${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf
 B=./build/test_gen.exe
 dec() { grep -oE 'decode [0-9.]+' | head -1 | cut -d' ' -f2; }
 run() {

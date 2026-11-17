@@ -8,7 +8,7 @@
 # Usage: REPS=4 bash tools/margin35.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M="<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+M="${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
 BIN="${BIN:-build/test_gen.exe}"
 N="${N:-40}"
 REPS="${REPS:-4}"

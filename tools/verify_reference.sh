@@ -9,9 +9,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PY="${PY:-python}"
-M9="<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf"
-MOE="<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
-CD="<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
+M9="${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf"
+MOE="${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+CD="${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
 
 echo "=== Qwen3.5-9B (GGUF): engine vs llama.cpp-semantics reference (layers 0-7) ==="
 # IMPORTANT: a GGUF qwen35/qwen35moe file is written with the *llama.cpp* conventions

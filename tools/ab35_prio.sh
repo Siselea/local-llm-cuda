@@ -16,7 +16,7 @@
 # Usage: REPS=5 PRE_REPS=3 bash tools/ab35_prio.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M="<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+M="${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
 NEW="build/test_gen.exe"
 PRE="build/test_gen_prepr.exe"
 N="${N:-40}"

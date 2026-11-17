@@ -2,7 +2,7 @@
 # 35B: placement/margin experiment + baseline decode median
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M=<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
+M=${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
 B=./build/test_gen.exe
 dec() { grep -oE 'decode [0-9.]+' | head -1 | cut -d' ' -f2; }
 

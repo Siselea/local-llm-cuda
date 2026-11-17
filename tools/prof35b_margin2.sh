@@ -3,7 +3,7 @@
 # Prints the placement decision and the decode ms/token immediately.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M=<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
+M=${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf
 B=./build/test_gen.exe
 N="${N:-5}"
 for MG in ${MARGINS:-1200 1000 900 800 700}; do

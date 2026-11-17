@@ -14,8 +14,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-M9="${1:-<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf}"
-M35="${2:-<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf}"
+M9="${1:-${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf}"
+M35="${2:-${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf}"
 OUT=build/logs/repro_qwen35
 LOG=build/logs/repro_qwen35.log
 GEN=./build/test_gen.exe

@@ -5,10 +5,10 @@
 #   bash tools/smoke_models.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M_QWEN="<MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-M_CODER="<MODEL_DIR>/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
-M_9B="<MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf"
-M_35B="<MODEL_DIR>/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
+M_QWEN="${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+M_CODER="${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf"
+M_9B="${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf"
+M_35B="${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf"
 
 run() {
   local tag="$1" model="$2" ids="$3" n="$4" envs="$5" expect="$6"
