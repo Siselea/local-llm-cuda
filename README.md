@@ -1,6 +1,12 @@
 # local-llm-cuda — 自研 Windows 消费级 N 卡本地 LLM 推理引擎
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/Siselea/local-llm-cuda)](https://github.com/Siselea/local-llm-cuda/releases)
+
+> **不想自己编译？** 直接下载 [Releases](https://github.com/Siselea/local-llm-cuda/releases) 里的
+> `local-llm-cuda-v0.1.0-win64.zip`（Windows x64：engine.exe + launcher.exe + 启动脚本，不含模型）。
+> 首次运行 web UI 前用 `bash tools/fetch_webui.sh` 获取聊天前端（MIT，4.4 MB，不随仓库分发）。
+
 
 **面向 Windows + 消费级 NVIDIA 显卡**的自研 LLM 推理引擎（C++17 + CUDA）：
 GGUF / safetensors 加载、MoE 专家 CPU 卸载与放置决策、逐层 CUDA Graph、KV 量化、
