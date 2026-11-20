@@ -73,3 +73,8 @@ launcher-ui-map.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# local Rust feasibility probe toolchain/builds (rust-probe/ source is tracked)
+rust-probe/.cargo/
+rust-probe/.rustup/
+rust-probe/target/
