@@ -96,7 +96,7 @@ Q5_K 12288x4096  = q5k_dp4a_s
 |---|---|---|---|---|---|
 | `model` | `--model <v>` | `ENGINE_MODEL` | — | string | `""` | 模型路径：`.gguf` 文件或 safetensors 目录（自动识别，不依赖扩展名） |
 | `ctx` | `--ctx <v>` | `ENGINE_CTX` | int [1, 1M] | `256` | 上下文长度（决定 KV cache 大小）；不设置时生成入口按 prompt+n 自动估算 |
-| `threads` | `--threads <v>` | `ENGINE_THREADS` | int [0,4096] | `0` | CPU 专家 GEMV 线程数，0 = 自动（`hardware_concurrency - max(2, hw/4)`；SMT 全占反而更慢，见 SPEC §29） |
+| `threads` | `--threads <v>` | `ENGINE_THREADS` | int [0,4096] | `0` | CPU 专家 GEMV 线程数，0 = 自动：能读到 SMT=2 拓扑时 = **2×物理核**（本机 6C/12T → 12，且默认 `win_affinity=2` 成对绑核），否则回退历史公式 `hardware_concurrency - max(2, hw/4)`（本机 9）。实测 12/11/10 成对比 9 不绑快 4–12%，见 `reports/THREAD-AFFINITY-REPORT.md` |
 | `gpu_layers` | `--gpu-layers <v>` | `ENGINE_GPU_LAYERS` | int [-1,4096] | `-1` | 放显存的 MoE 层数（层粒度，类似 llama.cpp `--n-gpu-layers`）；`auto`/`-1` = 自动推算；实际装载时还会按实测空闲显存自适应下调 |
 | `gpu_experts` | `--gpu-experts <v>` | `ENGINE_GPU_EXPERTS` | int [-1,1e5] | `-1` | 每层放显存的专家数（旧语义，固定切分；-1 = 自动/层粒度） |
 | `layers` | `--layers <v>` | `ENGINE_LAYERS` | int [0,1M] | `0` | 只跑前 N 层（性能分解），0 = 全部 |
@@ -247,7 +247,7 @@ run_attn_legacy / derive_ctx_limit / activation_bytes`（`src/runner.cpp`）；
 |---|---|---|---|---|---|
 | `win_priority` | `--win-priority <n>` | `ENGINE_WIN_PRIORITY` | int [0,2] | `1` | 进程优先级类：`1`=`HIGH_PRIORITY_CLASS`（默认），`2`=`ABOVE_NORMAL_PRIORITY_CLASS`，`0`=`NORMAL`（关闭 / 回退到历史行为）。**不用 REALTIME**：会让鼠标/IO/驱动提交线程饿死，且需要额外权限。非 Windows 上解析但不生效 |
 | `win_thread_priority` | `--win-thread-priority <n>` | `ENGINE_WIN_THREAD_PRIORITY` | int [-1,2] | `-1` | CPU worker 线程的**相对**优先级：`-1`=auto（`win_priority>0` 时 `THREAD_PRIORITY_HIGHEST`，否则继承），`0`=继承，`1`=ABOVE_NORMAL，`2`=HIGHEST（base+2）。用于区分"主线程还是 worker 是瓶颈"的 A/B |
-| `win_affinity` | `--win-affinity <n>` | `ENGINE_WIN_AFFINITY` | int [0,1] | `0` | `1`=把 worker i 硬绑到"先物理核、后 SMT 兄弟"顺序的第 i 个逻辑 CPU。本机实测与不绑持平（见 `WIN-PRIORITY-REPORT.md`），默认关，仅作 A/B 开关 |
+| `win_affinity` | `--win-affinity <n>` | `ENGINE_WIN_AFFINITY` | int [0,2] | **`2`** | `2`=**SMT 成对绑核（默认）**：逻辑线程 2k/2k+1 绑到物理核 k 的两个硬件兄弟，兄弟对**从 `GetLogicalProcessorInformationEx(RelationProcessorCore)` 拓扑动态读取**（不假设 i,i+n；主线程=逻辑线程 0；`--threads` 为奇数时 = 若干整对 + 1 个单绑）；`0`=关闭（OS 调度，2026-11 前的旧默认）；`1`=物理核优先顺序。默认线程数同时改为"能读到 SMT=2 兄弟对时 = 2×物理核（本机 12），否则回退 1.5×物理核"（本机实测成对 12/11/10 比 9 不绑快 4–12%，完整 8×2 扫描见 `reports/THREAD-AFFINITY-REPORT.md`） |
 
 生效位置：
 

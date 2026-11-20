@@ -15,7 +15,8 @@ model = <MODEL_DIR>/YourModel-Q4_K_M.gguf
 # 上下文长度（KV cache 大小）；不设置时生成入口按 prompt+n 自动估算
 ctx = 512
 
-# CPU 专家线程数，0 = 自动（physical cores - 1）
+# CPU 专家线程数，0 = 自动（SMT=2 时 = 2×物理核，本机 12，配合 win_affinity=2 成对绑核；
+# 读不到 SMT 拓扑时回退 3/4 逻辑核）
 threads = 0
 
 # 放在显存的 MoE 层数：auto/-1 = 按实测空闲显存自适应（层粒度）
@@ -96,8 +97,9 @@ debug = false
 # win_priority = 1
 # CPU worker 线程相对优先级：-1 = auto（win_priority>0 时 HIGHEST），0/1/2 = 继承/ABOVE_NORMAL/HIGHEST
 # win_thread_priority = -1
-# 把 worker 绑到"先物理核后 SMT"顺序的逻辑 CPU（实测持平，默认关，仅 A/B）
-# win_affinity = 0
+# CPU 线程池绑核：2 = SMT 成对（默认，逻辑线程 2k/2k+1 绑物理核 k 的两个硬件兄弟，
+# 兄弟对从拓扑动态读取；线程数默认 = 2×物理核），0 = 关闭（OS 调度），1 = 物理核优先顺序
+# win_affinity = 2
 
 [kernel]
 # 由 `test_gen --model <m> --kernel-calibrate` 自动写入，格式：

@@ -10,6 +10,7 @@
 #include <vector>
 #include <atomic>
 #include <condition_variable>
+#include <utility>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -122,6 +123,76 @@ std::vector<int> physical_first_cpu_order() {
   order.insert(order.end(), second.begin(), second.end());
 #endif
   return order;
+}
+
+// (first, second) logical-CPU ids of every physical core.  Primary source: the
+// GetLogicalProcessorInformationEx(RelationProcessorCore) topology (multi-group safe,
+// returns exactly the masks the scheduler uses); fallback: the classic
+// GetLogicalProcessorInformation API (one processor group).  The sibling pair is
+// whatever the firmware/OS reports -- on this host it is (0,1),(2,3)... and NOT the
+// "usual" (i, i+n_physical): see THREAD-AFFINITY-REPORT.md.  Single-threaded cores
+// yield (cpu, -1).  Used by win_affinity=2 (SMT-paired pinning, the default).
+std::vector<std::pair<int, int>> smt_cpu_pairs() {
+  std::vector<std::pair<int, int>> pairs;
+#if defined(_WIN32)
+  DWORD len = 0;
+  if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len)) {
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) len = 0;
+  }
+  if (len > 0) {
+    std::vector<unsigned char> buf(len);
+    if (GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
+      size_t off = 0;
+      // NOTE: entries are variable length (48 bytes for RelationProcessorCore on this
+      // host) while sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) is 80: a loop that
+      // requires a full struct to still fit stops one entry early (that bug dropped the
+      // last physical core, so the 12-thread paired default silently left 2 threads
+      // unpinned).  Advance by e->Size and only require the fixed header to fit.
+      while (off + 8 <= len) {
+        const auto* e =
+            reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+        if (e->Size == 0) break;
+        if (e->Relationship == RelationProcessorCore) {
+          std::vector<int> cpus;
+          const WORD ngroups = e->Processor.GroupCount;
+          for (WORD g = 0; g < ngroups; ++g) {
+            ULONG_PTR mask = e->Processor.GroupMask[g].Mask;
+            const int base = 64 * static_cast<int>(e->Processor.GroupMask[g].Group);
+            for (int bit = 0; bit < 64 && mask; ++bit, mask >>= 1)
+              if (mask & 1) cpus.push_back(base + bit);
+          }
+          if (!cpus.empty()) pairs.emplace_back(cpus[0], cpus.size() > 1 ? cpus[1] : -1);
+        }
+        off += e->Size;
+      }
+    }
+  }
+  if (!pairs.empty()) return pairs;
+  // Fallback for old Windows / degraded headers: classic per-core mask (1 group).
+  len = 0;
+  if (!GetLogicalProcessorInformation(nullptr, &len)) {
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) return pairs;
+  }
+  if (len == 0) return pairs;
+  std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> buf(
+      len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) + 1);
+  if (!GetLogicalProcessorInformation(buf.data(), &len)) return pairs;
+  const size_t cnt = len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+  for (size_t i = 0; i < cnt; ++i) {
+    if (buf[i].Relationship != RelationProcessorCore) continue;
+    ULONG_PTR mask = buf[i].ProcessorMask;
+    int first = -1, second = -1;
+    for (int bit = 0; bit < 64 && mask; ++bit, mask >>= 1) {
+      if (!(mask & 1)) continue;
+      if (first < 0) first = bit;
+      else if (second < 0) second = bit;
+    }
+    if (first >= 0) pairs.emplace_back(first, second);
+  }
+#endif
+  return pairs;
 }
 
 void scale_min(int sub, const unsigned char* s, int* sc, int* mn) {
@@ -973,6 +1044,7 @@ class Pool {
       cv_.notify_all();
     }
     for (int i = 0; i < n; i += nthreads_) fn(i);
+    record_cpu(0);
     int spins = 0;
     while (remaining_.load(std::memory_order_acquire) != 0) {
       pool_pause();
@@ -1002,8 +1074,21 @@ class Pool {
     // "3/4 of logical" rule when the physical count is unknown (VM without topology
     // information).
     const int phys = physical_cores();
+    // Read the affinity policy up-front: it decides BOTH the default thread count and the
+    // pinning.  SMT=2 topology + win_affinity=2 (the default) => one worker per hardware
+    // thread (2 x physical cores) with one worker pinned to each sibling; measured
+    // +8-12% on the host GEMV layer vs the historical 1.5 x physical thread count
+    // (THREAD-AFFINITY-REPORT.md).  With win_affinity=0/1 the historical 1.5 x physical
+    // thread count is kept, so `--win-affinity 0` is a true A/B revert.
+    const int64_t affinity_cfg = engine::config::get_int("win_affinity");
+    const std::vector<std::pair<int, int>> topo_pairs = smt_cpu_pairs();
+    const bool smt2 = affinity_cfg == 2 && phys > 0 &&
+                      hw == static_cast<unsigned>(2 * phys) &&
+                      topo_pairs.size() == static_cast<size_t>(phys);
     int nthreads;
-    if (phys > 0 && phys < static_cast<int>(hw)) {
+    if (smt2) {
+      nthreads = static_cast<int>(hw);  // 2 x physical cores: one thread per sibling
+    } else if (phys > 0 && phys < static_cast<int>(hw)) {
       nthreads = (3 * phys + 1) / 2;
       if (nthreads > static_cast<int>(hw) - 1) nthreads = static_cast<int>(hw) - 1;
     } else {
@@ -1033,29 +1118,61 @@ class Pool {
       worker_rel_priority_ = wtp == 2 ? static_cast<int>(THREAD_PRIORITY_HIGHEST)
                              : wtp == 1 ? static_cast<int>(THREAD_PRIORITY_ABOVE_NORMAL)
                                         : 0;
-      affinity_mode_ = static_cast<int>(engine::config::get_int("win_affinity"));
-      if (affinity_mode_ > 0) affinity_order_ = physical_first_cpu_order();
-      if (affinity_order_.empty()) affinity_mode_ = 0;
-      if (affinity_mode_ > 0 && nthreads_ + 1 > static_cast<int>(affinity_order_.size()))
-        affinity_mode_ = 0;  // not enough CPUs to pin without sharing
+      affinity_mode_ = static_cast<int>(affinity_cfg);
+      if (affinity_mode_ == 2) {
+        // SMT-paired mode: logical thread 2k / 2k+1 share physical core k (its two
+        // hardware siblings).  Default on this host (win_affinity=2).
+        affinity_pairs_ = topo_pairs;
+        if (affinity_pairs_.empty()) affinity_mode_ = 0;
+        if (std::getenv("ENGINE_DBG_AFFINITY")) {
+          for (size_t i = 0; i < affinity_pairs_.size(); ++i)
+            std::fprintf(stderr, "[cpu] smt pair %zu = (cpu %d, cpu %d)\n", i,
+                         affinity_pairs_[i].first, affinity_pairs_[i].second);
+        }
+      } else if (affinity_mode_ > 0) {
+        affinity_order_ = physical_first_cpu_order();
+        if (affinity_order_.empty()) affinity_mode_ = 0;
+        if (affinity_mode_ > 0 && nthreads_ + 1 > static_cast<int>(affinity_order_.size()))
+          affinity_mode_ = 0;  // not enough CPUs to pin without sharing
+      }
+      // Per-thread "which CPU did I actually run on" counters (opt-in diagnostics).
+      if (std::getenv("ENGINE_DBG_AFFINITY")) {
+        affinity_dbg_ = true;
+        cpu_hits_.assign(static_cast<size_t>(nthreads_), std::vector<int>(64, 0));
+      }
       if ((affinity_mode_ > 0 || worker_rel_priority_ != 0) &&
           std::getenv("ENGINE_DBG_SCHED") == nullptr) {
         // Keep the default logs quiet: one line only when the user asks for it.
       }
       if (std::getenv("ENGINE_DBG_SCHED")) {
         std::fprintf(stderr,
-                     "[cpu] sched: win_priority=%lld worker_rel=%d affinity=%d cpus=%zu\n",
+                     "[cpu] sched: win_priority=%lld worker_rel=%d affinity=%d "
+                     "cpus=%zu pairs=%zu nthreads=%d\n",
                      static_cast<long long>(wp), worker_rel_priority_, affinity_mode_,
-                     affinity_order_.size());
+                     affinity_order_.size(), affinity_pairs_.size(), nthreads_);
       }
     }
 #endif
+    if (affinity_mode_ == 2 && !affinity_pairs_.empty())
+      SetThreadAffinityMask(GetCurrentThread(),
+                            static_cast<DWORD_PTR>(1) << affinity_pairs_[0].first);
     for (int t = 0; t < extra; ++t) {
       workers_.emplace_back([this, t] {
 #if defined(_WIN32)
         if (worker_rel_priority_ != 0)
           SetThreadPriority(GetCurrentThread(), worker_rel_priority_);
-        if (affinity_mode_ > 0 && !affinity_order_.empty()) {
+        if (affinity_mode_ == 2 && !affinity_pairs_.empty()) {
+          const size_t logical = static_cast<size_t>(t) + 1;  // main thread is id 0
+          const size_t core = logical / 2;
+          const int sib = static_cast<int>(logical % 2);
+          if (core < affinity_pairs_.size()) {
+            const int cpu = sib == 0 ? affinity_pairs_[core].first
+                                     : (affinity_pairs_[core].second >= 0
+                                            ? affinity_pairs_[core].second
+                                            : affinity_pairs_[core].first);
+            SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << cpu);
+          }
+        } else if (affinity_mode_ > 0 && !affinity_order_.empty()) {
           const int cpu = affinity_order_[static_cast<size_t>(t + 1) % affinity_order_.size()];
           SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << cpu);
         }
@@ -1073,6 +1190,15 @@ class Pool {
     gen_.fetch_add(1, std::memory_order_release);
     cv_.notify_all();
     for (auto& w : workers_) w.join();
+    if (affinity_dbg_) {
+      for (size_t t = 0; t < cpu_hits_.size(); ++t) {
+        std::fprintf(stderr, "[cpu] thread %2zu actual CPUs:", t);
+        for (int c = 0; c < 64; ++c)
+          if (cpu_hits_[t][static_cast<size_t>(c)])
+            std::fprintf(stderr, " cpu%d=%d", c, cpu_hits_[t][static_cast<size_t>(c)]);
+        std::fprintf(stderr, "\n");
+      }
+    }
   }
   void loop(int id) {
     long long seen = 0;
@@ -1105,15 +1231,26 @@ class Pool {
       const int n = n_;
       if (fn == nullptr) continue;
       for (int i = id; i < n; i += nthreads_) (*fn)(i);
+      record_cpu(id);
       remaining_.fetch_sub(1, std::memory_order_acq_rel);
     }
   }
 
+  void record_cpu(int id) {
+    if (!affinity_dbg_ || id < 0 || static_cast<size_t>(id) >= cpu_hits_.size()) return;
+#if defined(_WIN32)
+    const DWORD cpu = GetCurrentProcessorNumber();
+    if (cpu < 64) ++cpu_hits_[static_cast<size_t>(id)][cpu];
+#endif
+  }
   std::vector<std::thread> workers_;
   int nthreads_ = 1;
   int worker_rel_priority_ = 0;  // THREAD_PRIORITY_* relative value for the workers
-  int affinity_mode_ = 0;        // win_affinity: 0 = off, 1 = physical-core-first pinning
+  int affinity_mode_ = 0;        // win_affinity: 0 off, 1 physical-first, 2 SMT-paired
   std::vector<int> affinity_order_;
+  std::vector<std::pair<int, int>> affinity_pairs_;  // mode 2: (sibling0, sibling1) per core
+  bool affinity_dbg_ = false;                        // ENGINE_DBG_AFFINITY
+  std::vector<std::vector<int>> cpu_hits_;
   std::mutex m_;
   std::condition_variable cv_;
   const std::function<void(int)>* fn_ = nullptr;

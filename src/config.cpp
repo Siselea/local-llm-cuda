@@ -34,7 +34,9 @@ const OptionDef kDefs[] = {
      "context length in tokens (max_seq; KV cache is sized from it); 0 = derive the "
      "maximum that fits from free VRAM and the configured kv_type (ctx_auto)"},
     {"threads", "ENGINE_THREADS", "threads", true, false, Type::Int, "0",
-     0, 4096, "CPU worker threads for MoE experts, 0 = auto (~3/4 of logical CPUs)"},
+     0, 4096, "CPU worker threads for MoE experts, 0 = auto: 2 x physical cores when SMT=2 "
+     "topology is available (12 on a 6C/12T host, paired with win_affinity=2), else the "
+     "historical ~3/4 of logical CPUs (9)"},
     {"gpu_layers", "ENGINE_GPU_LAYERS", "gpu-layers", true, false, Type::Int, "-1",
      -1, 4096, "number of MoE layers kept on the GPU, -1 = auto (layer granular)"},
     {"gpu_experts", "ENGINE_GPU_EXPERTS", "gpu-experts", true, false, Type::Int, "-1",
@@ -315,10 +317,14 @@ const OptionDef kDefs[] = {
      "CPU pool worker threads' relative priority: -1 = auto (THREAD_PRIORITY_HIGHEST when "
      "win_priority>0, inherit when 0), 0 = inherit, 1 = ABOVE_NORMAL, 2 = HIGHEST (base+2). "
      "A/B switch for 'is the main thread or the workers the bottleneck'"},
-    {"win_affinity", "ENGINE_WIN_AFFINITY", "win-affinity", true, false, Type::Int, "0", 0, 1,
-     "Windows CPU affinity for the CPU pool workers: 0 = off (default; the OS schedules), "
-     "1 = worker i pinned to the i-th logical CPU in physical-core-first order (SMT siblings "
-     "last). Measured a wash on this host (see WIN-PRIORITY-REPORT.md), kept opt-in for A/B"},
+    {"win_affinity", "ENGINE_WIN_AFFINITY", "win-affinity", true, false, Type::Int, "2", 0, 2,
+     "Windows CPU affinity for the CPU pool: 2 = SMT-paired (DEFAULT; logical thread 2k/2k+1 "
+     "pinned to the two hardware siblings of physical core k, pairs read from the ACTUAL "
+     "GetLogicalProcessorInformationEx topology mask - not an assumed i,i+n mapping; the main "
+     "thread is logical thread 0; an odd --threads count fills k pairs + one single). "
+     "0 = off (the OS schedules; pre-2026-11 default), 1 = physical-core-first order. "
+     "Measured on this host: paired 12/11/10 threads are 4-12% faster than 9 unbound on the "
+     "CPU expert GEMV layer, see THREAD-AFFINITY-REPORT.md"},
     {"attn_warp_ctx_mid", "ENGINE_ATTN_WARP_CTX_MID", "attn-warp-mid", true, false, Type::Int,
      "96", 1, 1 << 20,
      "cached-attention warp bucket: ctx_len above this uses 16 warps instead of 8 "
