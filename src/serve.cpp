@@ -13,6 +13,7 @@
 // accept loop and frees the VRAM before exiting.
 #include "engine/config.h"
 #include "engine/serve.h"
+#include "engine/serve_guard.h"
 
 #include <algorithm>
 #include <atomic>
@@ -219,7 +220,9 @@ struct ServerState {
   PrefixCache pc;
   int no_limit_tokens = 1024;   // reply cap for max_tokens <= 0 (webui sends -1)
   int think_budget = 512;       // force </think> after N thinking tokens (0 = off)
-  bool repeat_guard = true;     // stop degenerate "same sentence x3" loops
+  int repeat_guard = 2;         // loop guard level: 0 off, 1 sentences, 2 +chars/phrases
+  bool mtp_enabled = false;     // --mtp and the loaded model has a usable MTP block
+  int mtp_k = 2;                // drafts per speculative round
   std::atomic<bool> busy{false};
 };
 
@@ -380,68 +383,18 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
   bool in_think = gp.thinking_active;
   bool aborted = false;
 
-  // ---- repetition guard: same sentence 3x in a row => stop generation ----
-  std::string sent_buf;        // text since the last sentence terminator
-  std::string prev_sent;       // previous complete sentence (trimmed)
-  int sent_run = 0;
+  // ---- degenerate-loop guard (sentence / char levels, see engine/serve_guard.h) ----
+  engine::serve::RepeatGuard guard;
+  guard.configure(st.repeat_guard);
   bool repeat_stop = false;
-  auto guard_update = [&](const std::string& text) {
-    if (!st.repeat_guard) return;
-    sent_buf += text;
-    while (true) {
-      size_t cut = std::string::npos;
-      for (size_t i = 0; i < sent_buf.size(); ++i) {
-        const char c = sent_buf[i];
-        if (c == '\n' || c == '.' || c == '!' || c == '?' ||
-            static_cast<unsigned char>(c) >= 0x80) {
-          // CJK terminators are multi-byte: check the decoded codepoints
-          if (static_cast<unsigned char>(c) >= 0x80) {
-            if (i + 3 <= sent_buf.size()) {
-              const std::string t3 = sent_buf.substr(i, 3);
-              if (t3 == "\xE3\x80\x82" /* 。 */ || t3 == "\xEF\xBC\x81" /* ！ */ ||
-                  t3 == "\xEF\xBC\x9F" /* ？ */ || t3 == "\xEF\xBC\x9B" /* ； */) {
-                cut = i + 3;
-                break;
-              }
-            }
-            continue;
-          }
-          if (c == '\n') { cut = i + 1; break; }
-          // ASCII terminators only when followed by whitespace/end (avoid 3.14, e.g.)
-          if (i + 1 >= sent_buf.size() || sent_buf[i + 1] == ' ') {
-            cut = i + 1;
-            break;
-          }
-        }
-      }
-      if (cut == std::string::npos) break;
-      std::string sent = sent_buf.substr(0, cut);
-      sent_buf.erase(0, cut);
-      // trim ASCII whitespace
-      size_t b = 0, e = sent.size();
-      while (b < e && (sent[b] == ' ' || sent[b] == '\n' || sent[b] == '\r' || sent[b] == '\t')) ++b;
-      while (e > b && (sent[e - 1] == ' ' || sent[e - 1] == '\n' || sent[e - 1] == '\r' || sent[e - 1] == '\t')) --e;
-      sent = sent.substr(b, e - b);
-      const size_t min_len = 8;
-      if (sent.size() < min_len) { prev_sent.clear(); sent_run = 0; continue; }
-      if (sent == prev_sent) {
-        ++sent_run;
-      } else {
-        prev_sent = sent;
-        sent_run = 1;
-      }
-      if (sent_run >= 3) {
-        repeat_stop = true;
-        out.repeat_guard_hit = true;
-        return;
-      }
-    }
-  };
 
   auto feed_emitted = [&](const std::string& text) {
     if (text.empty()) return;
     out.raw_text += text;
-    guard_update(text);
+    if (guard.update(text, gp.thinking_active && in_think)) {
+      repeat_stop = true;
+      out.repeat_guard_hit = true;
+    }
     if (!gp.thinking_active) {
       out.content += text;
       if (!on_delta(text, false)) aborted = true;
@@ -527,28 +480,78 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
   int pos = static_cast<int>(ids.size());
   int next = greedy ? sampler::Sampler::argmax(last) : sampler.sample(last, context);
   int produced = 0;
-  const auto t_dec0 = Clock::now();
 
+  // ---- optional MTP speculative decoding (greedy + single-call prefill only) ----
+  // spec_begin() needs the prompt residual rows in x_, so it is limited to the
+  // non-prefix-cache prefill path (first turn / short prompts).  Sampling requests
+  // and prefix-cache-hit turns keep the plain token-by-token loop.
+  bool spec_active = false;
+  std::vector<int> spec_emit;
+  if (greedy && st.mtp_enabled && !cacheable) {
+    spec_active = model.spec_begin(ids, next, static_cast<int>(ids.size()) - 1);
+    if (spec_active)
+      std::fprintf(stderr, "[serve] mtp: speculative decoding active (k=%d)\n", st.mtp_k);
+  }
+
+  const auto t_dec0 = Clock::now();
   while (true) {
-    // still thinking after budget tokens -> switch to the forced </think> token
-    if (!think_forcing && in_think && !think_close_ids.empty() &&
-        produced >= st.think_budget) {
+    int cur;
+    if (spec_active) {
+      if (spec_emit.empty()) {
+        if (!model.spec_round(st.mtp_k, &spec_emit)) {
+          // context nearly exhausted: stop cleanly at the current position
+          spec_active = false;
+          out.finish_reason = "length";
+          break;
+        }
+      }
+      cur = spec_emit.front();
+      spec_emit.erase(spec_emit.begin());
+    } else {
+      cur = next;
+    }
+    // still thinking after budget tokens -> switch to the forced </think> token.
+    // Cap the effective budget to max_new-1: if max_tokens <= think_budget the old
+    // check could never run (the length break happened first) and the reply ended
+    // with an empty answer.
+    const int budget_eff =
+        (st.think_budget > 0)
+            ? std::min(st.think_budget, std::max(1, max_new - 1))
+            : 0;
+    if (!think_forcing && in_think && !think_close_ids.empty() && budget_eff > 0 &&
+        produced >= budget_eff) {
+      if (spec_active) {
+        // a verified batch cannot carry an injected token: stop here and let the
+        // chat handler re-run the answer with thinking disabled
+        if (!flush(true)) {
+          out.finish_reason = "stop";
+          break;
+        }
+        feed_emitted("</think>");
+        out.think_budget_hit = true;
+        std::fprintf(stderr,
+                     "[serve] WARN think-budget: forced </think> after %d tokens "
+                     "(model did not close its thinking block)\n",
+                     produced);
+        out.finish_reason = "stop";
+        break;
+      }
       think_forcing = true;
       think_close_at = 0;
     }
-    if (think_forcing) next = think_close_ids[think_close_at];
-    if (next < 0) {
+    if (think_forcing) cur = think_close_ids[think_close_at];
+    if (cur < 0) {
       out.finish_reason = "error";
       break;
     }
     // end of generation token: stop without emitting it
-    if (tk.is_eog(next)) {
+    if (tk.is_eog(cur)) {
       out.finish_reason = "stop";
       break;
     }
-    out.token_ids.push_back(next);
+    out.token_ids.push_back(cur);
     ++produced;
-    context.push_back(next);
+    context.push_back(cur);
     if (think_forcing) {
       // the forced </think> is a special token (its piece is empty): feed it to
       // the model as context, and once the last forced id is consumed emit the
@@ -570,7 +573,7 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
         break;
       }
     } else {
-      pending += tk.token_piece(next, /*skip_special=*/true);
+      pending += tk.token_piece(cur, /*skip_special=*/true);
     }
     if (!flush(false)) {
       out.finish_reason = "stop";
@@ -581,20 +584,23 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
       break;
     }
     if (repeat_stop) {
-      out.finish_reason = "stop";
+      out.finish_reason = "repetition";
       std::fprintf(stderr,
-                   "[serve] WARN repeat-guard: stopped generation after the same "
-                   "sentence repeated 3 times\n");
+                   "[serve] WARN repeat-guard(level %d): stopped a degenerate loop "
+                   "after %d generated tokens (rule=%s, tail=%s)\n",
+                   st.repeat_guard, produced, guard.rule().c_str(),
+                   guard.snippet().c_str());
       break;
     }
     if (produced >= max_new) {
       out.finish_reason = "length";
       break;
     }
-    // forward this token to obtain the logits for the next one
+    if (spec_active) continue;  // the next tokens come from the next spec round
+    // plain single-token forward to obtain the logits for the next token
     if (greedy) {
       runner::DenseRunner::TopKResult tkr;
-      auto row = model.forward_topk({next}, pos, 5, &tkr);
+      auto row = model.forward_topk({cur}, pos, 5, &tkr);
       ++pos;
       if (!row.empty()) {
         last.assign(row.end() - vocab, row.end());
@@ -606,7 +612,7 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
         break;
       }
     } else {
-      auto row = model.forward({next}, pos, /*last_row_only=*/true);
+      auto row = model.forward({cur}, pos, /*last_row_only=*/true);
       ++pos;
       if (static_cast<int>(row.size()) < vocab) {
         out.finish_reason = "error";
@@ -616,6 +622,7 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
       next = sampler.sample(last, context);
     }
   }
+  if (spec_active) model.spec_end();
 
   if (!stop_hit) flush(true);
   out.decode_ms = ms_since(t_dec0);
@@ -934,7 +941,16 @@ void handle_props(const ServerState& st, http::Conn& conn) {
   w.key("think_budget");
   w.integer(st.think_budget);
   w.key("repeat_guard");
-  w.boolean(st.repeat_guard);
+  w.integer(st.repeat_guard);
+  w.key("mtp");
+  w.begin_obj();
+  w.key("available");
+  w.boolean(st.model->mtp_available());
+  w.key("enabled");
+  w.boolean(st.mtp_enabled);
+  w.key("k");
+  w.integer(st.mtp_k);
+  w.end_obj();
   w.key("default_generation_settings");
   w.begin_obj();
   w.key("n_predict");
@@ -1118,6 +1134,8 @@ void handle_chat_completions(ServerState& st, const http::Request& req, http::Co
         result.decode_ms += r2.decode_ms;
         result.prefilled_tokens = r2.prefilled_tokens;
         result.cache_hit_tokens = r2.cache_hit_tokens;
+        result.repeat_guard_hit = result.repeat_guard_hit || r2.repeat_guard_hit;
+        result.think_budget_hit = result.think_budget_hit || r2.think_budget_hit;
       }
       if (think_tag_open && !conn.failed()) {
         // thinking ran into the token limit without a final answer: close the
@@ -1201,6 +1219,8 @@ void handle_chat_completions(ServerState& st, const http::Request& req, http::Co
         result.decode_ms += r2.decode_ms;
         result.prefilled_tokens = r2.prefilled_tokens;
         result.cache_hit_tokens = r2.cache_hit_tokens;
+        result.repeat_guard_hit = result.repeat_guard_hit || r2.repeat_guard_hit;
+        result.think_budget_hit = result.think_budget_hit || r2.think_budget_hit;
       }
       json::Writer w;
       w.begin_obj();
@@ -1913,8 +1933,8 @@ int run(const Options& opts) {
   std::fflush(stdout);
   const auto t_tok0 = Clock::now();
   try {
-    st.tk = tokenizer::Tokenizer::load(opts.model);
-  } catch (const std::exception& e) {
+      st.tk = tokenizer::Tokenizer::load(opts.model);
+    } catch (const std::exception& e) {
     std::fprintf(stderr, "[serve] ERROR: cannot load tokenizer: %s\n", e.what());
     return 1;
   }
@@ -1938,7 +1958,15 @@ int run(const Options& opts) {
   if (st.no_limit_tokens <= 0) st.no_limit_tokens = 1024;
   st.think_budget = static_cast<int>(engine::config::get_int("serve_think_budget"));
   if (st.think_budget < 0) st.think_budget = 0;
-  st.repeat_guard = engine::config::get_bool("serve_repeat_guard");
+  st.repeat_guard = static_cast<int>(engine::config::get_int("serve_repeat_guard"));
+  if (st.repeat_guard < 0) st.repeat_guard = 0;
+  if (st.repeat_guard > 2) st.repeat_guard = 2;
+  st.mtp_k = static_cast<int>(engine::config::get_int("mtp_k"));
+  if (st.mtp_k < 1) st.mtp_k = 1;
+  if (st.mtp_k > 3) st.mtp_k = 3;
+  // NOTE: st.mtp_enabled must be initialised AFTER the model is constructed (it
+  // queries st.model->mtp_available()); doing it here used to null-deref whenever
+  // --mtp was enabled.  See the block after the "model ready" banner.
   // Qwen3-family recommended sampling defaults, used when the client does not send
   // its own values (the llama.cpp webui bundle ships the same defaults).
   if (!engine::config::was_set("default_temperature")) st.opts.default_temperature = 0.6;
@@ -1972,16 +2000,23 @@ int run(const Options& opts) {
   const double load_ms = ms_since(t_load0);
   std::printf("[serve] model ready: vocab=%d ctx=%d load=%.1f s\n", st.model->vocab(), st.ctx,
               load_ms / 1000.0);
+  st.mtp_enabled = engine::config::get_bool("mtp") && st.model->mtp_available();
+  if (engine::config::get_bool("mtp"))
+    std::printf("[serve] mtp        : %s (k=%d)\n",
+                st.mtp_enabled ? "speculative decoding ON for greedy requests"
+                               : "requested but not available on this model",
+                st.mtp_k);
   std::printf("[serve] prefix-cache: %s (state snapshot: %s, %.1f MiB/slot, prefill chunk %d, "
               "no-limit cap %d tok)\n",
               st.pc.enabled ? "on" : "off",
               st.model->prefix_state_supported() ? "hybrid SSM+KV" : "KV only",
               static_cast<double>(st.model->prefix_state_bytes()) / 1048576.0,
               st.model->prefill_chunk(), st.no_limit_tokens);
-  std::printf("[serve] sampling: temp=%.2f top_k=%d top_p=%.2f | think budget: %s%d tokens\n",
+  std::printf("[serve] sampling: temp=%.2f top_k=%d top_p=%.2f | think budget: %s%d tokens "
+              "| repeat guard: level %d\n",
               st.opts.default_temperature, st.opts.default_top_k, st.opts.default_top_p,
               st.think_budget > 0 ? "force </think> after " : "off",
-              st.think_budget);
+              st.think_budget, st.repeat_guard);
   if (st.tk.vocab_size() != st.model->vocab())
     std::fprintf(stderr,
                  "[serve] WARN: tokenizer vocab (%d) != model vocab (%d); sampling uses the "

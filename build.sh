@@ -45,3 +45,4 @@ build tests/test_mla_cache_cmp.cpp test_mla_cmp.exe
 build tests/test_matrix.cpp test_matrix.exe
 build tests/test_tokenizer.cpp test_tokenizer.exe
 build tests/test_sampler.cpp test_sampler.exe
+build tests/test_serve_guard.cpp test_serve_guard.exe

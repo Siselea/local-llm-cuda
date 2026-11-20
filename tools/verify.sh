@@ -100,6 +100,9 @@ else echo "missing build/test_decode.exe"; fail=1; fi
 if [ -x ./build/test_gguf.exe ]; then
   ./build/test_gguf.exe "${MODEL_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf" build/fixtures/gguf_qwen05 || fail=1
 else echo "missing build/test_gguf.exe"; fail=1; fi
+if [ -x ./build/test_serve_guard.exe ]; then
+  ./build/test_serve_guard.exe || fail=1
+else echo "missing build/test_serve_guard.exe"; fail=1; fi
 
 echo
 echo "== M2: C++ plan == Python plan =="

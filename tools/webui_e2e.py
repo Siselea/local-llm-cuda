@@ -233,23 +233,60 @@ def run_turn(cdp, text, tag, out_dir, settle=2.0, timeout=600):
     t0 = time.time()
     if rect:
         click(cdp, rect["x"], rect["y"])
+    # Some webui versions do not submit on the synthetic mouse click (focus/overlay
+    # quirks).  If the textarea still holds the text, send real Enter key events.
+    time.sleep(0.4)
+    still_typed = cdp.eval("(() => { const t = document.querySelector('#msg-input');"
+                           " return t ? t.value.trim().length > 0 : false; })()")
+    if still_typed:
+        print("  [webui] click did not submit, sending Enter key")
+        for kind in ("keyDown", "keyUp"):
+            cdp.send("Input.dispatchKeyEvent", {"type": kind, "key": "Enter",
+                                               "code": "Enter",
+                                               "windowsVirtualKeyCode": 13})
+        time.sleep(0.4)
 
-    # 3) poll: first rendered assistant character + completion
+    # 3) poll: wait for generation to start, first assistant character, completion.
+    #    The turn is only "done" once the webui is idle AND we have seen assistant
+    #    text: a slow prefill/think phase otherwise looks like a finished turn.
     first_char = None
     last = before
     stable_since = None
     while time.time() - t0 < timeout:
         time.sleep(0.15)
+        gen = bool(cdp.eval(JS_IS_GENERATING))
         now = cdp.eval(JS_LIST_TEXT) or ""
         if first_char is None and len(now) > len(before) + len(text) + 2:
             first_char = time.time() - t0
         if now != last:
             last = now
             stable_since = time.time()
-        elif stable_since and time.time() - stable_since > settle:
+        elif (not gen and first_char is not None and stable_since and
+              time.time() - stable_since > settle):
             break
+    # 3b) a turn that never produced assistant text still has to finish generating
+    if first_char is None:
+        for _ in range(1200):
+            if not cdp.eval(JS_IS_GENERATING):
+                break
+            time.sleep(0.2)
     wall = time.time() - t0
+    # let the answer render completely, then scroll the transcript to the bottom so
+    # the screenshot shows the final text instead of a mid-stream frame
+    time.sleep(2.0)
+    cdp.eval("(() => { const sc = document.querySelector('#chat-scroll, .overflow-y-auto, main');"
+             " if (sc) sc.scrollTop = sc.scrollHeight; window.scrollTo(0, document.body.scrollHeight); })()")
+    time.sleep(0.5)
     gen = bool(cdp.eval(JS_IS_GENERATING))
+    # wait until the webui is really idle again (stop button gone, send button back)
+    # so the next turn's typing/click cannot race with the previous generation.
+    for _ in range(60):
+        busy = bool(cdp.eval(JS_IS_GENERATING))
+        has_send = bool(cdp.eval(JS_SEND_RECT))
+        if not busy and has_send:
+            break
+        time.sleep(0.5)
+    time.sleep(1.5)
     cdp.screenshot(os.path.join(out_dir, f"{tag}_done.png"))
     title = cdp.eval(JS_TITLE)
     return {"text": text, "first_char_s": first_char, "wall_s": wall,

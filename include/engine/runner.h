@@ -103,6 +103,22 @@ class DenseRunner {
   // a draft is only kept when the target model's own arg-max agrees with it.
   std::vector<int> spec_generate(const std::vector<int>& prompt, int n_gen, SpecStats* st);
 
+  // ---- incremental greedy speculative decoding (used by `engine serve --mtp`) ----
+  // spec_begin() must be called right after a SINGLE-CALL prompt prefill whose
+  // residual rows are still in x_ (row `last_row` produced `first_token`).  It
+  // seeds the MTP attention history and the hidden state used by the draft chain.
+  // spec_round() then drafts up to k tokens, verifies them with one batched
+  // forward, appends [pending, accepted drafts...] to `emit`, and updates the
+  // waiting token to the bonus token that follows the accepted prefix.
+  // The emitted sequence is token-for-token identical to plain greedy decoding
+  // (a draft is kept only when the target model's own arg-max agrees).
+  // Returns false when MTP is unavailable or the context is nearly exhausted;
+  // the caller then falls back to the plain single-token loop.
+  bool spec_begin(const std::vector<int>& prompt_ids, int first_token, int last_row);
+  bool spec_round(int k, std::vector<int>* emit);
+  void spec_end() { spec_active_ = false; }
+  int spec_pending() const { return spec_pending_; }
+
   // P0 self-test hook: draft the token that should follow `tok` at position `pos`,
   // given the residual stream that produced it (x_ row `row`).  Returns the draft id
   // and, when `h_out` is given, the MTP block output hidden state (chain drafting).
@@ -214,6 +230,9 @@ class DenseRunner {
   };
 
   // ---- MTP / speculative decoding internals --------------------------------
+  bool spec_active_ = false;      // incremental spec decode in progress
+  int spec_pending_ = -1;         // token waiting to be emitted next
+  int spec_pos_ = 0;              // model position for the next draft round
   bool mtp_ok_ = false;
   int mtp_block_ = -1;                  // block index of the MTP layer
   int mtp_gpu_experts_ = 0;             // MTP-block experts kept in VRAM (0 = host)

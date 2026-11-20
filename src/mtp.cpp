@@ -103,10 +103,22 @@ void DenseRunner::load_mtp() {
   // The draft KV cache of the MTP layer starts as garbage; it is filled by
   // mtp_prefill_ctx() for prompt positions, and positions past the prompt are written
   // before they are ever read.
+  //
+  // NOTE: upload the *allocated* buffer size, not a f32-sized zero vector - with
+  // --kv-type q8_0/q4_0 the KV buffer is quantized (smaller), and a float-sized
+  // upload used to throw "Buffer::upload exceeds allocation" (MTP could not be
+  // enabled together with a quantized KV cache).
   {
-    std::vector<float> z(static_cast<size_t>(n_kv_) * max_seq_ * head_dim_, 0.f);
-    layers_[b].kc.upload(z.data(), z.size() * 4);
-    layers_[b].vc.upload(z.data(), z.size() * 4);
+        const size_t kb = layers_[b].kc.size();  // already kv-type dependent
+    std::vector<unsigned char> z(kb, 0);
+    if (kb > 0 && layers_[b].vc.size() == kb) {
+      layers_[b].kc.upload(z.data(), kb);
+      layers_[b].vc.upload(z.data(), kb);
+    } else {
+      std::vector<float> zf(static_cast<size_t>(n_kv_) * max_seq_ * head_dim_, 0.f);
+      layers_[b].kc.upload(zf.data(), zf.size() * 4);
+      layers_[b].vc.upload(zf.data(), zf.size() * 4);
+    }
   }
   mtp_ok_ = true;
   std::fprintf(stderr,
@@ -423,6 +435,77 @@ std::vector<int> DenseRunner::spec_generate(const std::vector<int>& prompt, int 
     st->decode_ms = now_ms() - t_first_round_end;
   }
   return gen;
+}
+
+// ---------------------------------------- incremental spec decode (serve) ----
+bool DenseRunner::spec_begin(const std::vector<int>& prompt_ids, int first_token,
+                             int last_row) {
+  spec_active_ = false;
+  spec_pending_ = -1;
+  spec_pos_ = 0;
+  if (!mtp_ok_ || prompt_ids.empty() || first_token < 0 || last_row < 0) return false;
+  const int prompt_len = static_cast<int>(prompt_ids.size());
+  if (last_row >= prompt_len) return false;
+  if (prompt_len + 8 >= max_seq_) return false;
+  // h of the row that produced `first_token`
+  cuda::copy_d2d_async(mtp_h_.data(),
+                       static_cast<float*>(x_.data()) +
+                           static_cast<size_t>(last_row) * hidden_,
+                       static_cast<size_t>(hidden_) * 4);
+  spec_pending_ = first_token;
+  spec_pos_ = prompt_len;
+  auto& cfg = engine::config::Config::get();
+  if (cfg.get_bool("mtp_ctx_prefill")) {
+    std::vector<int> toks(prompt_ids);
+    toks.push_back(first_token);
+    mtp_prefill_ctx(toks, prompt_len);
+  }
+  ensure_ssm_slots(3);
+  spec_active_ = true;
+  return true;
+}
+
+bool DenseRunner::spec_round(int k, std::vector<int>* emit) {
+  if (!spec_active_ || !mtp_ok_ || !emit) return false;
+  if (k < 1) k = 1;
+  if (k > 3) k = 3;
+  if (spec_pos_ + k + 2 >= max_seq_) {
+    spec_active_ = false;
+    return false;
+  }
+  std::vector<int> drafts(static_cast<size_t>(k), -1);
+  int tok = spec_pending_;
+  int dpos = spec_pos_;
+  for (int i = 0; i < k; ++i) {
+    drafts[static_cast<size_t>(i)] = mtp_draft(tok, dpos, -1);
+    tok = drafts[static_cast<size_t>(i)];
+    ++dpos;
+    if (tok < 0) break;
+  }
+  std::vector<int> vt;
+  vt.reserve(static_cast<size_t>(k) + 1);
+  vt.push_back(spec_pending_);
+  for (int i = 0; i < k; ++i) vt.push_back(drafts[static_cast<size_t>(i)]);
+  verify_rows_forward(vt, spec_pos_);
+  int m = 0;
+  while (m < k && verify_argmax_[static_cast<size_t>(m)] == drafts[static_cast<size_t>(m)])
+    ++m;
+  emit->clear();
+  emit->push_back(spec_pending_);
+  for (int i = 0; i < m; ++i) emit->push_back(drafts[static_cast<size_t>(i)]);
+  const int bonus = verify_argmax_[static_cast<size_t>(m)];
+  if (m < k) ssm_restore(m);
+  // residual row `m` is the hidden state that produced `bonus`
+  cuda::copy_d2d_async(mtp_h_.data(),
+                       static_cast<float*>(x_.data()) + static_cast<size_t>(m) * hidden_,
+                       static_cast<size_t>(hidden_) * 4);
+  spec_pending_ = bonus;
+  spec_pos_ += m + 1;
+  if (bonus < 0) {
+    spec_active_ = false;
+    return false;
+  }
+  return true;
 }
 
 // ------------------------------------------------------- draft accuracy (P0) ----

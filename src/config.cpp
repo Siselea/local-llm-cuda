@@ -371,11 +371,12 @@ const OptionDef kDefs[] = {
      "serve: multi-turn prefix KV cache (reuse the shared conversation prefix instead of "
      "re-prefilling the whole chat every request; hybrid models also snapshot/restore the "
      "recurrent SSM state). --prefix-cache=0 disables it"},
-    {"serve_repeat_guard", "ENGINE_SERVE_REPEAT_GUARD", "repeat-guard", false, false,
-     Type::Bool, "true",
-     0, 0,
-     "serve: stop generation when the same sentence repeats 3 times in a row "
-     "(degenerate loop guard; the thought block / answer otherwise runs to the token cap)"},
+    {"serve_repeat_guard", "ENGINE_SERVE_REPEAT_GUARD", "repeat-guard", true, false,
+     Type::Int, "2", 0, 2,
+     "serve: degenerate-loop guard level: 0=off, 1=sentence level (3 identical "
+     "sentences in a row), 2=+character/phrase level (a 4..96-byte unit repeated 5x, "
+     "or a 16..48-byte phrase repeated >=4x in the last 512 bytes of the answer); "
+     "stops generation with finish_reason=repetition"},
     {"serve_think_budget", "ENGINE_SERVE_THINK_BUDGET", "think-budget", true, false,
      Type::Int, "512", 0, 1 << 20,
      "serve: max tokens generated inside an open <think> block before the engine force-closes "
