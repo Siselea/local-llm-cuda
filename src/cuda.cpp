@@ -1,5 +1,6 @@
 #include "engine/cuda.h"
 #include "engine/config.h"
+#include "engine/dll_search.h"
 
 #include <windows.h>
 
@@ -102,11 +103,30 @@ CUdevice g_device = -1;
 DeviceInfo g_info;
 bool g_ready = false;
 
-std::string default_nvrtc_path() {
-  // config key `nvrtc_path` (env DSH_NVRTC_PATH is the compatibility layer).
-  const std::string cfg_path = engine::config::get_string("nvrtc_path");
-  if (!cfg_path.empty()) return cfg_path;
-  return "D:\\p0\\py312\\Lib\\site-packages\\nvidia\\cuda_nvrtc\\bin\\nvrtc64_120_0.dll";
+// Ordered candidates for nvrtc64_120_0.dll.  Kept as paths (not just dirs) so the
+// final error can list exactly what was tried; load_nvrtc() registers each
+// candidate's directory before LoadLibrary so nvrtc's own nvrtc-builtins DLL is
+// found as well.
+std::vector<std::string> nvrtc_candidates() {
+  namespace ds = engine::dll_search;
+  const std::string dll = "nvrtc64_120_0.dll";
+  std::vector<std::string> out;
+  auto add = [&](const std::string& path) {
+    if (path.empty()) return;
+    if (std::find(out.begin(), out.end(), path) == out.end()) out.push_back(path);
+  };
+  // 1) explicit config key / env (config maps DSH_NVRTC_PATH to nvrtc_path).
+  add(ds::dll_path(engine::config::get_string("nvrtc_path"), dll));
+  if (const char* env = std::getenv("DSH_NVRTC_PATH"))
+    if (*env) add(ds::dll_path(env, dll));
+  // 2) next to engine.exe / launcher.exe (portable drop-in install).
+  add(ds::dll_path(ds::exe_dir(), dll));
+  // 3) a CUDA Toolkit install (CUDA_PATH / CUDA_HOME bin).
+  for (const std::string& dir : ds::cuda_bin_dirs()) add(ds::dll_path(dir, dll));
+  // 4) pip nvidia-cuda-nvrtc-cu12 wheel under %LOCALAPPDATA%/%USERPROFILE%.
+  for (const std::string& dir : ds::pip_nvidia_bin_dirs("cuda_nvrtc", "bin"))
+    add(ds::dll_path(dir, dll));
+  return out;
 }
 
 const char* g_err = nullptr;
@@ -202,23 +222,35 @@ void load_driver() {
 }
 
 void load_nvrtc() {
-  std::string path = default_nvrtc_path();
+  const std::vector<std::string> candidates = nvrtc_candidates();
   // nvrtc loads nvrtc-builtins64_*.dll at compile time via its own loader, which
-  // uses the process search path — so register its directory before loading.
-  const size_t slash = path.find_last_of("\\/");
-  std::string dir = slash == std::string::npos ? "." : path.substr(0, slash);
-  SetDllDirectoryA(dir.c_str());
-  {
-    std::wstring wdir(dir.begin(), dir.end());
+  // uses the process search path — so register each candidate directory before
+  // trying to load it.
+  for (const std::string& path : candidates) {
+    const std::string dir = engine::dll_search::parent_dir(path);
+    SetDllDirectoryA(dir.empty() ? "." : dir.c_str());
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
-    AddDllDirectory(wdir.c_str());
+    if (!dir.empty()) {
+      std::wstring wdir(dir.begin(), dir.end());
+      AddDllDirectory(wdir.c_str());
+    }
+    g_nvrtc.lib = LoadLibraryExA(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (g_nvrtc.lib) break;
   }
-  g_nvrtc.lib = LoadLibraryExA(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+  // 5) Last resort: let Windows search PATH (works when the user put the CUDA
+  //    bin directory on PATH, e.g. a normal CUDA Toolkit install).
+  if (!g_nvrtc.lib) g_nvrtc.lib = LoadLibraryA("nvrtc64_120_0.dll");
   if (!g_nvrtc.lib) {
-    g_nvrtc.lib = LoadLibraryA("nvrtc64_120_0.dll");
-    if (!g_nvrtc.lib)
-      throw std::runtime_error("nvrtc64_120_0.dll not found (set DSH_NVRTC_PATH). tried: " +
-                               path);
+    std::string msg =
+        "nvrtc64_120_0.dll not found.\n"
+        "Install the pip wheel (nvidia-cuda-nvrtc-cu12) or a CUDA Toolkit, or point the "
+        "engine at the DLL explicitly:\n"
+        "  engine.exe ... --nvrtc-path <full path to nvrtc64_120_0.dll>\n"
+        "  set DSH_NVRTC_PATH=<full path to nvrtc64_120_0.dll>\n"
+        "Tried:";
+    msg += engine::dll_search::join_lines(candidates);
+    msg += "\n  - nvrtc64_120_0.dll from PATH";
+    throw std::runtime_error(msg);
   }
   auto bind = [&](auto& fn, const char* name) {
     fn = reinterpret_cast<std::decay_t<decltype(fn)>>(GetProcAddress(g_nvrtc.lib, name));

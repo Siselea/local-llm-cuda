@@ -1,11 +1,13 @@
 #include "engine/cublas.h"
 #include "engine/config.h"
+#include "engine/dll_search.h"
 
 #include <windows.h>
 
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace cublas {
 
@@ -50,27 +52,68 @@ void check(cublasStatus_t s, const char* what) {
                              std::to_string(s) + ")");
 }
 
-std::string default_dir() {
-  // config key `cublas_dir` (env DSH_CUBLAS_DIR is the compatibility layer).
-  const std::string cfg_dir = engine::config::get_string("cublas_dir");
-  if (!cfg_dir.empty()) return cfg_dir;
-  return "D:\\p0\\py312\\Lib\\site-packages\\nvidia\\cublas\\bin";
+// Ordered directories that may contain cublas64_12.dll.  Kept as a list so the
+// error message can show every path that was tried.
+std::vector<std::string> cublas_candidate_dirs() {
+  namespace ds = engine::dll_search;
+  std::vector<std::string> out;
+  auto add_dir = [&](const std::string& dir) {
+    if (dir.empty()) return;
+    if (std::find(out.begin(), out.end(), dir) == out.end()) out.push_back(dir);
+  };
+  auto add_value = [&](const std::string& value) {
+    if (value.empty()) return;
+    if (ds::is_dir(value)) {
+      add_dir(value);
+    } else if (value.size() >= 4 && value.compare(value.size() - 4, 4, ".dll") == 0) {
+      add_dir(ds::parent_dir(value));
+    } else {
+      add_dir(value);
+    }
+  };
+  // 1) explicit config key / env (config maps DSH_CUBLAS_DIR to cublas_dir).
+  add_value(engine::config::get_string("cublas_dir"));
+  if (const char* env = std::getenv("DSH_CUBLAS_DIR"))
+    if (*env) add_value(env);
+  // 2) next to engine.exe / launcher.exe (portable drop-in install).
+  add_dir(ds::exe_dir());
+  // 3) a CUDA Toolkit install (CUDA_PATH / CUDA_HOME bin).
+  for (const std::string& dir : ds::cuda_bin_dirs()) add_dir(dir);
+  // 4) pip nvidia-cublas-cu12 wheel under %LOCALAPPDATA%/%USERPROFILE%.
+  for (const std::string& dir : ds::pip_nvidia_bin_dirs("cublas", "bin")) add_dir(dir);
+  return out;
 }
 
 }  // namespace
 
 void init() {
   if (g_handle) return;
-  const std::string dir = default_dir();
-  SetDllDirectoryA(dir.c_str());
-  SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
-  {
-    std::wstring wdir(dir.begin(), dir.end());
-    AddDllDirectory(wdir.c_str());
+  const std::vector<std::string> candidates = cublas_candidate_dirs();
+  for (const std::string& dir : candidates) {
+    SetDllDirectoryA(dir.c_str());
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
+    {
+      std::wstring wdir(dir.begin(), dir.end());
+      AddDllDirectory(wdir.c_str());
+    }
+    g.lib = LoadLibraryExA((dir + "\\cublas64_12.dll").c_str(), nullptr,
+                           LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (g.lib) break;
   }
-  g.lib = LoadLibraryExA((dir + "\\cublas64_12.dll").c_str(), nullptr,
-                         LOAD_WITH_ALTERED_SEARCH_PATH);
-  if (!g.lib) throw std::runtime_error("cublas64_12.dll not found (set DSH_CUBLAS_DIR)");
+  // 5) Last resort: let Windows search PATH (normal CUDA Toolkit install).
+  if (!g.lib) g.lib = LoadLibraryA("cublas64_12.dll");
+  if (!g.lib) {
+    std::string msg =
+        "cublas64_12.dll not found.\n"
+        "Install the pip wheel (nvidia-cublas-cu12) or a CUDA Toolkit, or point the "
+        "engine at the DLL directory explicitly:\n"
+        "  engine.exe ... --cublas-dir <directory containing cublas64_12.dll>\n"
+        "  set DSH_CUBLAS_DIR=<directory containing cublas64_12.dll>\n"
+        "Tried:";
+    msg += engine::dll_search::join_lines(candidates);
+    msg += "\n  - cublas64_12.dll from PATH";
+    throw std::runtime_error(msg);
+  }
 
   auto bind = [](auto& fn, const char* name) {
     fn = reinterpret_cast<std::decay_t<decltype(fn)>>(GetProcAddress(g.lib, name));

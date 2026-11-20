@@ -131,8 +131,8 @@
 |---|---|---|---|---|
 | D1 | `include/engine/kernels.h:2028-2036` | `moe_route`：`float pr[256]`；`if (ne > 256) return;` | >256 专家时内核静默返回 → 未初始化/残留的 slot 被 gate/up/down kernel 使用；调用侧（`src/runner.cpp:1481,1817`）不检查 `ne<=256` | 调用侧强制 `ne<=256` 走 host 路由，>256 直接报错或升 kernel 模板；`pr` 改动态 shared/上限检查 |
 | D2 | `include/engine/kernels.h:2002,2019`（另 `254,291,330,579,618,963` 同类） | `row = blockIdx.x * 8 + warp`：**8 行/块**写死；`src/runner.cpp:2632-2637` 注释承认"launch shape 必须是 8 行/256 线程" | 任何想把 kernel 改成 4 行/16 行（不同 quant 的 x4 变体）都必须同时改 launch 侧，两处靠注释维系 | 把行数作为 kernel 描述字段（`rows_per_block`）随 kernel 名一起注册，launch 统一查表 |
-| D3 | `src/cuda.cpp:100-104` | NVRTC 默认路径 `<PATH>\py312\Lib\site-packages\nvidia\cuda_nvrtc\bin\nvrtc64_120_0.dll`（可用 `DSH_NVRTC_PATH` 覆盖） | 换机器/换 Python 环境即失败；默认值与作者本机绑定 | 自动探测：`nvidia` 包目录搜索 → PATH → CUDA_HOME；失败信息给搜索路径列表 |
-| D4 | `src/cublas.cpp:51-55` | cuBLAS 默认目录 `<PATH>\py312\...\nvidia\cublas\bin`（可用 `DSH_CUBLAS_DIR` 覆盖） | 同上 | 同上 |
+| D3 | `src/cuda.cpp` | ~~NVRTC 默认路径硬编码~~ **已修复（2026-11-20）**：配置/`DSH_NVRTC_PATH` → exe 目录 → `CUDA_PATH`/`CUDA_HOME` → pip `nvidia/cuda_nvrtc/bin`（LOCALAPPDATA/USERPROFILE/PATH Python）→ PATH；失败时列出候选并提示 `--nvrtc-path`/`DSH_NVRTC_PATH` | 原硬编码私有路径已移除；换机器可自动发现 | 已实现（`include/engine/dll_search.h`） |
+| D4 | `src/cublas.cpp` | ~~cuBLAS 默认目录硬编码~~ **已修复（2026-11-20）**：配置/`DSH_CUBLAS_DIR` → exe 目录 → `CUDA_PATH`/`CUDA_HOME` → pip `nvidia/cublas/bin`（LOCALAPPDATA/USERPROFILE/PATH Python）→ PATH；失败时列出候选并提示 `--cublas-dir`/`DSH_CUBLAS_DIR` | 原硬编码私有路径已移除；换机器可自动发现 | 已实现（`include/engine/dll_search.h`） |
 | D5 | `src/cuda.cpp:237-243` | `cuDeviceGet(&dev, 0)` + `CtxCreate`：**永远 0 号卡、单 context** | 多卡机器无法选卡；无 `ENGINE_DEVICE`/`CUDA_VISIBLE_DEVICES` 语义（新增 config 层已在补 `device` 键，但代码未接入） | 设备索引配置化 + 枚举能力（名称/显存/cc）；多卡需 tensor/层切分策略 |
 | D6 | `src/cuda.cpp:261` | `g_info.runtime_version = 12090;` 伪造 CUDA runtime 版本 | 版本相关判断/日志不可信；未来按 runtime 版本分支会出错 | 用 `nvrtcVersion()` 或 `cuDriverGetVersion` 真值 |
 | D7 | `src/cuda.cpp:208-211` | 二次加载 fallback 仍写死 `nvrtc64_120_0.dll`；错误信息也固定该名 | CUDA 12.x 其它 minor / CUDA 13 直接失败 | 按 glob 搜索 `nvrtc64_*.dll` |
@@ -279,7 +279,7 @@
 | `ENGINE_LAYERS` | 0 | 只跑前 N 层（调试） | `src/runner.cpp:1186` |
 | `ENGINE_KEEP_GPU_BUSY` | 0 | WDDM 空闲降频对抗（空转 kernel） | `src/runner.cpp:2231` |
 | `ENGINE_Q35_RAW_A` | 0 | `ssm_a` 按 `-A` 解释的实验开关 | `src/qwen35.cpp:359` |
-| `DSH_NVRTC_PATH` / `DSH_CUBLAS_DIR` | `<PATH>\py312\...` | NVRTC / cuBLAS DLL 目录 | `src/cuda.cpp:101`、`src/cublas.cpp:52` |
+| `DSH_NVRTC_PATH` / `DSH_CUBLAS_DIR` | `<PYTHON_DIR>\...` | NVRTC / cuBLAS DLL 目录 | `src/cuda.cpp:101`、`src/cublas.cpp:52` |
 
 **分组说明**：其余约 60 个变量是调试/导出类，不改变主路径语义，可分为三组：
 1. 诊断打印：`RUNNER_DEBUG`、`ENGINE_PROFILE`、`ENGINE_KPROF`、`ENGINE_DBG_*`（VRAM/LOAD/LOAD2/DEVROUTE/DEVWHY/BIGGEMV/MATVEC/CPULAYER/MOEHASH/LAYERMS/LG/LG2/SCRATCH/Q35LOAD/VOCT…）。

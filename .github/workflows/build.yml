@@ -94,13 +94,23 @@ jobs:
           # The patterns are assembled from pieces so this workflow file itself does
           # not contain machine-specific path literals (the check scans the whole tree).
           D="D:"; U="U:"; C="C:"
+          # C/C++ string literals contain escaped backslashes (a Windows path
+          # written in source has doubled backslashes), which a plain
+          # forward-slash grep misses.  Every pattern is assembled from pieces so
+          # this workflow file itself has no private-path literal.
+          PY="py"; PY="${PY}312"
+          USER_NUM="320"; USER_NUM="${USER_NUM}40"
           failure=0
-          for pat in "${D}/p0" "${D}\\p0" "${U}/AI" "${U}\\AI" "${C}/Users" "${C}\\Users"; do
+          for pat in \
+            "${D}/p0" "${D}\\p0" "${D}\\\\p0" \
+            "${U}/AI" "${U}\\AI" "${U}\\\\AI" \
+            "${C}/Users" "${C}\\Users" "${C}\\\\Users" \
+            "${PY}" "${USER_NUM}"; do
             if out=$(git grep -nF -e "$pat" -- .); then
-              echo "ERROR: machine-specific path found in tracked files:" >&2
+              echo "ERROR: machine-specific path/fragment found in tracked files:" >&2
               echo "$out" >&2
               failure=1
             fi
           done
           if [ "$failure" -ne 0 ]; then exit 1; fi
-          echo "private-path grep: OK (no machine-specific paths in tracked files)"
+          echo "private-path grep: OK (no machine-specific paths or fragments in tracked files)"
