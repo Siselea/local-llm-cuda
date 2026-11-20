@@ -331,3 +331,36 @@ ziglang c++ -std=c++17 -O2 -Wl,--subsystem,windows src/launcher.cpp \
 - `build/test_launcher_realuser.py` **13/13 PASS**（`build/test-launcher-realuser10.log`，真实鼠标/滚轮/拖拽；截图 `launcher-realuser-01..11-*.png`）。
 - 截图：`launcher-12-fullscan-default.png`、`launcher-13-drives-dropdown.png`、`launcher-14-scanning.png`、`launcher-15-scan-done.png`、`launcher-16-dropdown-full-warning.png`（18 项含 ⚠ 37.8G）。
 - 最终 `build/launcher.exe` **705,024 B**、`build/engine.exe` 2,298,368 B（含全盘扫描）；未改 `src/serve.cpp`/内核/mtp.cpp。
+
+---
+
+## 13. 线程自动 + SMT 成对绑核（2026-11-17，配合 prio-quiet 引擎默认）
+
+背景：引擎新默认改为 `win_affinity=2`（SMT 兄弟对绑核）+ `threads=0/auto`（本机 6C/12T → 12 线程），
+实测 CPU 专家层快 8–12%；但旧 launcher 默认把 UI 的 9 线程显式传给引擎，覆盖了新默认。
+
+改动（只动 `src/launcher.cpp`）：
+- **CPU 线程数控件改为下拉**：`自动（跟随引擎默认）`（默认选中，**不传 `--threads`**）+ 显式 1..2×logical；
+  提示「自动 = 不传 --threads，跟随引擎默认（本机 6C/12T → 12 线程）」。
+- `default_thread_count()` 在 SMT 拓扑下改为 **2×物理核（12）**，无 SMT 回退 1.5×；仅作为 UI 展示/显式候选。
+- 性能开关组新增 **「SMT 成对绑核 win_affinity」**（默认开 → `--win-affinity 2`；关 → `--win-affinity 0`），
+  tooltip：「按 SMT 兄弟对绑核，实测 CPU 专家层快 8–12%；关闭用于排查/对比」。
+- `win_affinity` 加入 curated 主面板 key（高级面板不再重复），schema 覆盖仍 100%。
+- 启动摘要显示 `线程 自动 · SMT绑核 开`。
+
+验证：
+- UI 实测（不启引擎）：线程下拉 = `自动（跟随引擎默认）`，提示含 12 线程；SMT 开关默认开；
+  `launcher-effective-args.txt` 摘要「线程 自动 · SMT绑核 开」。
+- `test_launcher.py` 新增 4 项：`threads_default_auto`、`win_affinity_toggle_default_on`、
+  `engine_threads_auto_cli`（日志命令行**无 `--threads`**）、`win_affinity_default_on_cli`（`--win-affinity 2`）；
+  总检查 76→**80 项**。
+- 引擎侧证据：`src/cpu_matvec.cpp` Pool：`win_affinity=2` + SMT2 → `nthreads=2×physical=12`，
+  CPU 专家首次调用打印 `[cpu] pool threads: 12`（0.5B dense 不走 CPU pool；35B CPU 专家路径可见）。
+- 截图：`build/launcher-threads-affinity.png`（1066×720，30 KB，已裁掉底部私有路径区）。
+- **最终 test_launcher：80/80 PASS**（2026-11-17 23:54，`build/test-launcher-affinity7.log`），新增 4 项全过：
+  `threads_default_auto=True`、`win_affinity_toggle_default_on=True`、
+  `engine_threads_auto_cli=True`（0.5B 启动命令行**无 `--threads`**）、
+  `win_affinity_default_on_cli=True`（命令行 `--win-affinity 2`）。
+- 引擎线程数最终证据（CPU-only 微基准，源码同 build/engine.exe；未传 `--threads`）：
+  `[cpu] sched: win_priority=1 worker_rel=2 affinity=2 cpus=0 pairs=6 nthreads=12` +
+  `[cpu] pool threads: 12`；`ENGINE_WIN_AFFINITY=0` 对照 = `[cpu] pool threads: 9`。

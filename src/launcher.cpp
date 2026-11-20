@@ -917,7 +917,8 @@ enum : int {
   IDC_THINKING_LEN = 146,
   IDC_VRAM_AUTO = 147,       // opt-in post-load GPU-layer promotion
   IDC_VRAM_AUTO_WARN = 148,  // red risk note, only visible while it is on
-  IDC_THREADS_EDIT = 150,
+  IDC_THREADS_COMBO = 150,
+  IDC_WIN_AFFINITY = 149,
   IDC_THREADS_HINT = 151,
   IDC_PORT_EDIT = 160,
   IDC_HOST_EDIT = 161,
@@ -1070,7 +1071,9 @@ struct UiState {
   int cpu_int8 = 1;
   int win_priority = 1;
   bool unlimited_tokens = true;
-  int threads = 9;
+  bool threads_auto = true;  // true = do not pass --threads (engine default)
+  int threads = 12;          // explicit fallback / shown default (2 x physical cores)
+  bool win_affinity = true;  // --win-affinity 2 (SMT pair pinning, engine default)
   int port = 7030;
   std::wstring host = L"127.0.0.1";
   bool auto_browser = true;
@@ -1127,8 +1130,13 @@ int default_thread_count() {
   }
   const int logical = logical_cpus();
   int threads = 0;
-  if (physical > 0) threads = physical + physical / 2;  // 1.5x physical
-  else threads = logical * 3 / 4;
+  if (physical > 0) {
+    // Engine default (threads=0/auto + win_affinity=2): 2 x physical cores when
+    // SMT siblings exist (this host: 6C/12T -> 12), otherwise the old 1.5x.
+    threads = logical > physical ? physical * 2 : physical + physical / 2;
+  } else {
+    threads = logical * 3 / 4;
+  }
   if (threads < 1) threads = 1;
   if (threads > logical) threads = logical;
   return threads;
@@ -1294,8 +1302,10 @@ Estimate g_est;
 // Option defaults that are mirrored into the UI state (avoids hard coding)
 // ---------------------------------------------------------------------------
 void sync_state_from_schema() {
-  g_ui.threads = static_cast<int>(opt_int("threads", 0));
-  if (g_ui.threads <= 0) g_ui.threads = default_thread_count();
+  const int schema_threads = static_cast<int>(opt_int("threads", 0));
+  g_ui.threads_auto = schema_threads <= 0;  // engine default = auto
+  g_ui.threads = schema_threads > 0 ? schema_threads : default_thread_count();
+  g_ui.win_affinity = opt_int("win_affinity", 2) == 2;  // engine default: SMT pairs
   g_ui.port = static_cast<int>(opt_int("serve_port", 7030));
   g_ui.host = widen(opt_text("serve_host", "127.0.0.1"));
   g_ui.kv_sel = 0;
@@ -1320,7 +1330,7 @@ const char* const kCuratedKeys[] = {
     "model",          "serve_host",     "serve_port",     "ctx",
     "kv_type",        "gpu_layers",     "threads",        "ssd_stream",
     "dev_route",      "layer_graph_auto", "vram_auto_layers", "cpu_int8",
-    "win_priority",
+    "win_priority",   "win_affinity",
     "default_max_tokens"};
 
 bool is_curated_key(const std::string& key) {
@@ -1373,7 +1383,10 @@ LaunchSpec build_launch_spec(bool write_cfg = true) {
   cmd += L" --ctx " + wnum(ctx);
   cmd += std::wstring(L" --kv-type ") + kKvShort[g_ui.kv_sel];
   cmd += L" --gpu-layers " + wnum(g_ui.gpu_auto ? -1 : g_ui.gpu_layers);
-  cmd += L" --threads " + wnum(g_ui.threads);
+  // Auto threads: pass nothing, the engine computes its default from its
+  // win_affinity/SMT topology (12 on a 6C/12T host).  Explicit N overrides it.
+  if (!g_ui.threads_auto) cmd += L" --threads " + wnum(g_ui.threads);
+  cmd += L" --win-affinity " + wnum(g_ui.win_affinity ? 2 : 0);
   cmd += L" --cpu-int8 " + wnum(g_ui.cpu_int8);
   cmd += L" --win-priority " + wnum(g_ui.win_priority);
   cmd += L" --default-max-tokens " + wnum(g_ui.unlimited_tokens ? 1048576 : 2048);
@@ -1431,7 +1444,9 @@ LaunchSpec build_launch_spec(bool write_cfg = true) {
                  (ctx == 0 ? std::wstring(L"自动") : wnum(ctx)) + L" · KV " +
                  widen(kKvKeys[g_ui.kv_sel]) + L" · GPU层 " +
                  (g_ui.gpu_auto ? std::wstring(L"自动") : wnum(g_ui.gpu_layers)) + L" · 线程 " +
-                 wnum(g_ui.threads) + L" · 高级覆盖 " + wnum(overrides) + L" 项";
+                 (g_ui.threads_auto ? std::wstring(L"自动") : wnum(g_ui.threads)) +
+                 L" · SMT绑核 " + (g_ui.win_affinity ? std::wstring(L"开") : std::wstring(L"关")) +
+                 L" · 高级覆盖 " + wnum(overrides) + L" 项";
   if (g_ui.vram_auto_layers) spec.summary += L" · VRAM 自动加层";
   return spec;
 }
@@ -1469,7 +1484,8 @@ HWND g_win_prio = nullptr;
 HWND g_thinking_len = nullptr;
 HWND g_vram_auto = nullptr;
 HWND g_vram_auto_warn = nullptr;
-HWND g_threads_edit = nullptr;
+HWND g_threads_combo = nullptr;
+HWND g_win_affinity = nullptr;
 HWND g_threads_hint = nullptr;
 HWND g_port_edit = nullptr;
 HWND g_host_edit = nullptr;
@@ -2467,6 +2483,7 @@ bool is_toggle_id(UINT id) {
     case IDC_WIN_PRIORITY:
     case IDC_THINKING_LEN:
     case IDC_VRAM_AUTO:
+    case IDC_WIN_AFFINITY:
     case IDC_AUTO_BROWSER:
       return true;
     default: break;
@@ -2669,7 +2686,18 @@ void create_main_controls() {
                             g_font_small);
 
   g_label_threads = mk_static(g_hwnd, L"CPU 线程数", 0, Role::Normal, 0, g_font);
-  g_threads_edit = mk_edit(g_hwnd, wnum(g_ui.threads), IDC_THREADS_EDIT, ES_NUMBER);
+  g_threads_combo = mk_combo(g_hwnd, IDC_THREADS_COMBO);
+  SetWindowTheme(g_threads_combo, g_dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+  SendMessageW(g_threads_combo, CB_ADDSTRING, 0,
+               reinterpret_cast<LPARAM>(L"自动（跟随引擎默认）"));
+  {
+    const int max_threads = std::max(8, logical_cpus() * 2);
+    for (int n = 1; n <= max_threads; ++n) {
+      const std::wstring text = wnum(n);
+      SendMessageW(g_threads_combo, CB_ADDSTRING, 0,
+                   reinterpret_cast<LPARAM>(text.c_str()));
+    }
+  }
   g_threads_hint = mk_static(g_hwnd, L"", IDC_THREADS_HINT, Role::Dim, SS_ENDELLIPSIS,
                              g_font_small);
 
@@ -2680,6 +2708,7 @@ void create_main_controls() {
   g_win_prio = mk_toggle(g_hwnd, L"高优先级 win_priority", IDC_WIN_PRIORITY);
   g_thinking_len = mk_toggle(g_hwnd, L"不限思考/回复长度", IDC_THINKING_LEN);
   g_vram_auto = mk_toggle(g_hwnd, L"显存自动加层 vram_auto_layers", IDC_VRAM_AUTO);
+  g_win_affinity = mk_toggle(g_hwnd, L"SMT 成对绑核 win_affinity", IDC_WIN_AFFINITY);
   g_vram_auto_warn = mk_static(g_hwnd, L"低显存余量风险：decode 期间可能仅剩 ~80 MiB", IDC_VRAM_AUTO_WARN,
                                Role::Danger, 0, g_font_small);
   ShowWindow(g_vram_auto_warn, SW_HIDE);
@@ -2739,7 +2768,12 @@ void create_main_controls() {
   add_tip(g_label_kv, tip_for("kv_type", L""));
   add_tip(g_kv_combo, tip_for("kv_type", L""));
   add_tip(g_label_threads, tip_for("threads", L""));
-  add_tip(g_threads_edit, tip_for("threads", L""));
+  add_tip(g_threads_combo, tip_for("threads", L"") +
+                               L"\n\n默认「自动」不传 --threads，引擎按自身 win_affinity/SMT "
+                               L"拓扑计算默认线程数（本机 6C/12T -> 12 线程）。显式数字会覆盖引擎默认。");
+  add_tip(g_win_affinity,
+          L"按 SMT 兄弟对绑核（--win-affinity 2），实测 CPU 专家层快 8–12%；关闭用于排查/对比"
+          L"（--win-affinity 0，交给系统调度）。引擎默认开启。");
   add_tip(g_ssd_toggle, tip_for("ssd_stream", L""));
   add_tip(g_ssd_note, tip_for("ssd_stream", L""));
   add_tip(g_dev_route, tip_for("dev_route", L""));
@@ -2824,13 +2858,23 @@ void sync_controls_from_state() {
   toggle_set(g_vram_auto, g_ui.vram_auto_layers);
   ShowWindow(g_vram_auto_warn, g_ui.vram_auto_layers ? SW_SHOW : SW_HIDE);
   toggle_set(g_auto_browser, g_ui.auto_browser);
-  SetWindowTextW(g_threads_edit, wnum(g_ui.threads).c_str());
+  if (g_ui.threads_auto) {
+    SendMessageW(g_threads_combo, CB_SETCURSEL, 0, 0);
+  } else if (g_ui.threads >= 1 &&
+             g_ui.threads <= static_cast<int>(SendMessageW(g_threads_combo, CB_GETCOUNT, 0, 0)) - 1) {
+    SendMessageW(g_threads_combo, CB_SETCURSEL, static_cast<WPARAM>(g_ui.threads), 0);
+  } else {
+    SendMessageW(g_threads_combo, CB_SETCURSEL, 0, 0);
+  }
+  toggle_set(g_win_affinity, g_ui.win_affinity);
   SetWindowTextW(g_port_edit, wnum(g_ui.port).c_str());
   SetWindowTextW(g_host_edit, g_ui.host.c_str());
-  SetWindowTextW(g_threads_hint,
-                 (L"0 = 自动；本机默认 " + wnum(default_thread_count()) +
-                  L" 线程（1.5×物理核，跑满会抢掉桌面响应）")
-                     .c_str());
+  const std::wstring threads_hint =
+      g_ui.threads_auto
+          ? std::wstring(L"自动：不传 --threads，跟随引擎默认（本机 6C/12T → 12 线程）")
+          : (L"显式 " + wnum(g_ui.threads) + L" 线程（覆盖引擎默认；物理核 " +
+             wnum(default_thread_count() / 2) + L"）");
+  SetWindowTextW(g_threads_hint, threads_hint.c_str());
   sync_advanced_from_state();
   update_kv_hint();
 }
@@ -2839,7 +2883,6 @@ void sync_controls_from_state() {
 // Presets
 // ---------------------------------------------------------------------------
 void apply_preset(int kind) {
-  const int def_threads = default_thread_count();
   if (kind == 0) {  // 最快
     g_ui.gpu_auto = true;
     g_ui.ctx_slot = 1;
@@ -2850,7 +2893,8 @@ void apply_preset(int kind) {
     g_ui.cpu_int8 = 1;
     g_ui.win_priority = 1;
     g_ui.unlimited_tokens = true;
-    g_ui.threads = def_threads;
+    g_ui.threads_auto = true;
+    g_ui.win_affinity = true;
     g_ui.ssd = false;
     g_ui.preset_note = L"已应用「最快」：全部权重进显存（自动分层）、f32 KV、高优先级、逐层 CUDA Graph";
   } else if (kind == 1) {  // 最省显存
@@ -2864,7 +2908,8 @@ void apply_preset(int kind) {
     g_ui.cpu_int8 = 1;
     g_ui.win_priority = 1;
     g_ui.unlimited_tokens = true;
-    g_ui.threads = def_threads;
+    g_ui.threads_auto = true;
+    g_ui.win_affinity = true;
     g_ui.ssd = false;
     g_ui.preset_note = L"已应用「最省显存」：KV q4_0、GPU 专家层 0（MoE 专家全部走 CPU）、ctx 4096";
   } else {  // 平衡
@@ -2877,7 +2922,8 @@ void apply_preset(int kind) {
     g_ui.cpu_int8 = 1;
     g_ui.win_priority = 1;
     g_ui.unlimited_tokens = true;
-    g_ui.threads = def_threads;
+    g_ui.threads_auto = true;
+    g_ui.win_affinity = true;
     g_ui.ssd = false;
     g_ui.preset_note = L"已应用「平衡」：自动放置、KV q8_0、ctx 8192";
   }
@@ -3431,8 +3477,8 @@ int layout_content(bool apply, bool scroll_visible) {
     const int labelW = S(140);
     const int rowH = S(26);
     place(g_label_threads, M, y + S(3), labelW, S(22));
-    place(g_threads_edit, M + labelW, y, S(88), rowH);
-    place(g_threads_hint, M + labelW + S(98), y + S(4), contentW - labelW - S(98), S(22));
+    place(g_threads_combo, M + labelW, y, S(190), rowH);
+    place(g_threads_hint, M + labelW + S(200), y + S(4), contentW - labelW - S(200), S(22));
     y += rowH + S(10);
 
     const int gap = S(16);
@@ -3440,7 +3486,7 @@ int layout_content(bool apply, bool scroll_visible) {
     const int cellH = S(32);
     HWND toggles[] = {g_ssd_toggle, g_dev_route,   g_layer_graph,
                       g_cpu_int8,   g_win_prio,    g_thinking_len,
-                      g_vram_auto};
+                      g_vram_auto,  g_win_affinity};
     const int toggle_count = static_cast<int>(sizeof(toggles) / sizeof(toggles[0]));
     for (int i = 0; i < toggle_count; ++i) {
       const int col = i % 2, row = i / 2;
@@ -4217,14 +4263,6 @@ void on_advanced_control_changed(int ctrl_id, int code) {
 }
 
 void on_edit_changed(int ctrl_id) {
-  if (ctrl_id == IDC_THREADS_EDIT) {
-    wchar_t buf[64] = {0};
-    GetWindowTextW(g_threads_edit, buf, 64);
-    long long v = 0;
-    if (parse_ll(buf, &v) && v >= 0 && v <= 4096) g_ui.threads = static_cast<int>(v);
-    update_args_summary();
-    return;
-  }
   if (ctrl_id == IDC_PORT_EDIT) {
     wchar_t buf[64] = {0};
     GetWindowTextW(g_port_edit, buf, 64);
@@ -4324,6 +4362,24 @@ void on_command(int id, int code, HWND ctrl) {
         ShowWindow(g_vram_auto_warn, g_ui.vram_auto_layers ? SW_SHOW : SW_HIDE);
       update_args_summary();
       layout();  // the red risk note appears/disappears (page height changes)
+      return;
+    case IDC_WIN_AFFINITY:
+      g_ui.win_affinity = toggle_flip(g_win_affinity);
+      update_args_summary();
+      return;
+    case IDC_THREADS_COMBO:
+      if (code == CBN_SELCHANGE) {
+        const int sel = static_cast<int>(
+            SendMessageW(g_threads_combo, CB_GETCURSEL, 0, 0));
+        g_ui.threads_auto = (sel <= 0);
+        if (!g_ui.threads_auto) g_ui.threads = sel;
+        const std::wstring hint =
+            g_ui.threads_auto
+                ? std::wstring(L"自动：不传 --threads，跟随引擎默认（本机 6C/12T → 12 线程）")
+                : (L"显式 " + wnum(g_ui.threads) + L" 线程（覆盖引擎默认）");
+        SetWindowTextW(g_threads_hint, hint.c_str());
+        update_args_summary();
+      }
       return;
     case IDC_AUTO_BROWSER:
       g_ui.auto_browser = toggle_flip(g_auto_browser);
