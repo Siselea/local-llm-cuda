@@ -15,7 +15,7 @@
 # symbol soup.  This script therefore prefills a *real* multi-token prompt and
 # compares 8-16 greedy tokens, id by id, with llama.cpp.
 #
-# The expected ids below were captured from llama.cpp (U:/llama) via
+# The expected ids below were captured from llama.cpp (see docs/reports/) via
 #   POST /completion {"prompt": ..., "n_predict": n, "temperature": 0,
 #                     "cache_prompt": false, "n_probs": 1}
 # and read back from completion_probabilities[].id (llama-server, same GGUF file).

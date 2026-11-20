@@ -16,6 +16,7 @@
 - [ ] `bash tools/smoke_models.sh` → 四模型通过
 - [ ] `bash tools/gen_regression.sh` → 10/10
 - [ ] `bash tools/verify_generality.sh` → GREEN
+- [ ] `bash tools/verify_serve.sh` → SERVE VERIFY GREEN
 - [ ] 仅文档/CI 改动（可不跑上述四套，请在下方说明）
 
 命令与结果摘要（必填）：

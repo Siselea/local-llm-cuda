@@ -121,7 +121,7 @@ for b in build/test_gen.pre.exe build/test_gen_pre.exe build/test_gen_pre_opt.ex
 done
 say
 say "############ llama.cpp ground truth command ############"
-say "  U:/llama/llama-server.exe -m \"$M9\" -c 512 -ngl 999 --host 127.0.0.1 --port 8081"
+say "  ${LLAMA_DIR:-<llama.cpp>}/llama-server.exe -m \"$M9\" -c 512 -ngl 999 --host 127.0.0.1 --port 8081"
 say "  curl -s -H 'Content-Type: application/json' -d '{\"prompt\":\"The capital of France is\",\"n_predict\":10,\"temperature\":0,\"cache_prompt\":false}' http://127.0.0.1:8081/completion"
 say "  -> {\"content\":\" Paris.\\nThe capital of France is Paris.\"}"
 say

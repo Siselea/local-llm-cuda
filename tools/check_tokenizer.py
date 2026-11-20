@@ -3,7 +3,7 @@
 
 Modes:
   # find which llama.cpp pre-tokenizer regex the GGUF pre name maps to
-  python tools/check_tokenizer.py candidates --model <m.gguf> [--llama-tokenize U:/llama/llama-tokenize.exe]
+  python tools/check_tokenizer.py candidates --model <m.gguf> [--llama-tokenize <llama-tokenize.exe>]
 
   # validate the C++ tokenizer (build/test_tokenizer.exe) against the oracle:
   python tools/check_tokenizer.py cpp --model <m.gguf> --exe build/test_tokenizer.exe
@@ -37,7 +37,7 @@ try:
 except Exception:
     pass
 
-DEFAULT_LLAMA_TOKENIZE = "U:/llama/llama-tokenize.exe"
+DEFAULT_LLAMA_TOKENIZE = os.environ.get("LLAMA_TOKENIZE", "llama-tokenize.exe")
 
 
 # Deterministic mixed corpus.  Exercises every branch of the GPT-2/Qwen

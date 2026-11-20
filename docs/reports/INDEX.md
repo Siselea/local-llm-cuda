@@ -34,6 +34,8 @@
 | [UTILIZATION-REPORT.md](UTILIZATION-REPORT.md) | 利用率与流水线气泡取证（UTILIZATION-REPORT） | GPU/CPU 利用率测量报告（含 CONTAMINATED 标注的历史数据说明）。 |
 | [WEBUI-LAUNCHER-REPORT.md](WEBUI-LAUNCHER-REPORT.md) | llama.cpp webui + Win32 launcher + 模型扫描（2026-11-15） | llama.cpp webui + Win32 launcher：全盘模型扫描/缓存、GUI 交互与真实用户验收。 |
 | [WIN-PRIORITY-REPORT.md](WIN-PRIORITY-REPORT.md) | Windows 调度优先级 + auto-margin 换层 — 实测报告（WIN-PRIORITY） | Windows 进程/线程优先级实测报告（win_priority 的真实收益）。 |
+| [THREAD-AFFINITY-REPORT.md](THREAD-AFFINITY-REPORT.md) | 线程数 × SMT 成对绑核 — 实测报告（THREAD-AFFINITY） | 12 线程 SMT 成对绑核 vs 9 线程：CPU 专家层 +8–12%，及 8×2 配置扫描。 |
+| [MOE-GAP-REPORT.md](MOE-GAP-REPORT.md) | 35B MoE decode 与 llama.cpp 差距 — 取证报告（MOE-GAP） | 同模型同 GPU 层数下，llama.cpp 与自研引擎 decode 差距的逐层归因。 |
 
 ## 已清理 / removed during repository cleanup
 

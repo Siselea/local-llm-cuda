@@ -250,13 +250,14 @@ pyref/                    Python 参考实现（IR/GGUF/safetensors 解析 + pla
 
 ## 测试与 CI
 
-本地四套验证（在仓库根目录执行）（需要模型文件；先 `export MODEL_DIR=<你的模型目录>`，脚本内可 `PY=` 覆盖 Python）：
+本地五套验证（在仓库根目录执行）（需要模型文件；先 `export MODEL_DIR=<你的模型目录>`，脚本内可 `PY=` 覆盖 Python）：
 
 ```bash
 bash tools/verify.sh              # 主验证：单元测试 + IR/plan 对拍 + 生成一致性（ALL GREEN 为通过）
 bash tools/smoke_models.sh        # 四个真实模型冒烟（需自备模型）
 bash tools/gen_regression.sh      # 多 token 生成回归：与 llama.cpp greedy 逐 token 对拍
 bash tools/verify_generality.sh   # 配置优先级/自适应放置/优雅失败/校准缓存
+bash tools/verify_serve.sh        # HTTP 服务端到端（默认 0.5B@7031）：API/SSE/优雅退出
 ```
 
 其它测试/验收脚本（HTTP、长上下文、分词器、35B e2e、webui 真实浏览器等）见
@@ -283,6 +284,11 @@ GitHub Actions（`.github/workflows/`）：
 - [`docs/SERVE.md`](docs/SERVE.md) — HTTP 服务 API、SSE、llama.cpp 兼容细节
 - [`docs/CPU-INT8.md`](docs/CPU-INT8.md) — CPU int8/AVX2 量化内核说明
 - [`docs/WEBUI.md`](docs/WEBUI.md) — 聊天 UI 来源、离线属性、服务端兼容点
+- [`docs/SERVE-STABILITY-FIXES.md`](docs/SERVE-STABILITY-FIXES.md) — 复读兜底 / think-budget / MTP serve 接线
+- [`docs/RUST_FEASIBILITY.md`](docs/RUST_FEASIBILITY.md) — Rust 优化可行性评估（Q4_K 逐位对拍：Rust 慢 1.34–1.55×，无收益）
+- [`docs/RUST-PROBE-REPORT.md`](docs/RUST-PROBE-REPORT.md) — Rust 工具链/内核探针的完整实测数据
+- [`docs/BENCH-35B-VS-LLAMACPP.md`](docs/BENCH-35B-VS-LLAMACPP.md) — 35B 与 llama.cpp 的同条件 benchmark
+- [`rust-probe/README.md`](rust-probe/README.md) — Rust 可行性原型（不参与 `build.sh`）
 - [`docs/reports/INDEX.md`](docs/reports/INDEX.md) — **开发报告总索引**（性能/验证/根因分析）
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — 构建/验证/代码风格/PR 要求
 - [`docs/images/`](docs/images/) — README 截图（已裁掉私有路径）

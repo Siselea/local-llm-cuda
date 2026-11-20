@@ -10,14 +10,14 @@
 # Usage: bash tools/verify_tokenizer.sh [--quick]
 #   --quick: skip the llama-tokenize oracle comparison (self-test only)
 #
-# llama-tokenize is taken from $LLAMA_TOKENIZE or U:/llama/llama-tokenize.exe.
+# llama-tokenize is taken from $LLAMA_TOKENIZE (default: llama-tokenize.exe on PATH).
 # Without it, oracle checks are skipped (self-test still runs).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 PY="${PY:-python}"
 EXE=build/test_tokenizer.exe
-LLAMA_TOKENIZE="${LLAMA_TOKENIZE:-U:/llama/llama-tokenize.exe}"
+LLAMA_TOKENIZE="${LLAMA_TOKENIZE:-llama-tokenize.exe}"
 QUICK=0
 [ "${1:-}" = "--quick" ] && QUICK=1
 

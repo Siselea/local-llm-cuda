@@ -69,6 +69,9 @@
 | `serve_35b_e2e.sh [model] [port]` | **35B 端到端验收**（7030）：test_gen greedy 参考、中文单轮、多轮 messages、stream=true SSE、300/500 token 中等 prompt、`/tokenize` 中文往返、与 test_gen 逐 token 对拍、`/shutdown` 优雅退出+显存释放；要求 GPU 干净（>2 GB 占用会拒绝启动） |
 | `verify_http.sh [port]` | **HTTP 层纯逻辑单测**（不加载模型/不用 GPU）：keep-alive、128 KiB POST、chunked 流、CORS、404/400、HTTP/1.0 close、pipelined、`/shutdown`（`tests/test_http.cpp` + `tools/verify_http.py`） |
 | `verify_serve.sh [model] [port]` | **HTTP 服务端到端验收**（默认 qwen2.5-0.5b@7031）：启动/启动行、`/health` `/v1/models` `/props` `/`、`/tokenize`+`/detokenize`、chat 非流式/SSE、`/v1/completions`、llama.cpp `/completion`、404/400、与 `test_gen` 的 greedy 逐 token 对拍、`/shutdown` 优雅退出+端口释放 |
+| `serve_stability_check.py --port <p> [--tag 35b] [--json out.json]` | **稳定性实机检查**（2026-11-17）：两轮 `你好 / 帮我写1000字小说`（期望 `finish_reason=repetition`、不再跑到 cap）+ 三条对照（你好/介绍杭州/写 Python，期望不误杀）+ 一个需要思考的问题（think-budget 到点后干净重答，检查无规划文本残留） |
+| `serve_mtp_check.py --port <p> --tag off --save base.json` / `--tag on --baseline base.json` | **MTP serve 验证**：同一 greedy prompt 在 `--mtp` 开/关两个 server 下逐 token 对比（投机解码必须 bit-exact）+ tok/s；加载失败会直接报错 |
+| `tests/test_serve_guard.cpp`（构建：`ziglang c++ -std=c++17 -O2 -Iinclude tests/test_serve_guard.cpp -o build/test_serve_guard.exe`） | **repeat guard 单测 24 项**：真实复读模式（句×28/字符级/交错 5 句循环/变体句）+ 不误杀（正常故事/英文/对话/思考表头/markdown/表格/Python 代码） |
 | `serve_webui_probe.py --url <base> [--turns 3] [--log <serve.log>]` | **llama.cpp webui 行为探针**（2026-11-16 新增）：按 webui 真实请求体（`stream:true, cache_prompt:true, max_tokens:-1, samplers=..., timings_per_token:true`）发多轮中文请求，量**首字 delta 延迟**、验证 `delta.content` 里的 `<think>`/`</think>` 与最终回答、解析 `timings` 与日志 `[new N, cached M]` |
 | `webui_e2e.py --url <base> --turns 3 [--messages "a|b|c"]` | **真实浏览器验收**（2026-11-16）：headless Edge + CDP 驱动 llama.cpp webui —— 真打字、点发送、流式轮询、每轮截图、读会话标题/DOM；`e2e_report.json` 记录首字延迟、总耗时、渲染文本。用于"像真实用户一样"的端到端验收 |
 | `serve_drift_probe.py --url <base> [--turns 3] [--greedy] [--temp/--top-k/--top-p/--min-p]` | **思考漂移探针**：按 webui 参数跑多轮对话并统计思考段"同一句话重复次数"，输出 `DRIFT DETECTED` / `NO DRIFT`；`--greedy` 用 temp=0 对照 |
@@ -193,3 +196,21 @@ bash tools/run_class_gpu_probe.sh
 > 说明：`util_bin/`、`util_results*/` 是本地测量产物，已在 `.gitignore` 中排除；
 > `tools/utilization_report.py` 只依赖 Python 标准库，可对采样结果重新出表。
 
+
+### 2026-11-17/20 轮新增（线程绑核 / serve 稳定性 / 发布集成）
+
+| 工具 | 用途 |
+|---|---|
+| `thread_scan.py [--reps 6] [--iters 150]` | CPU host-GEMV 的线程数 × `win_affinity` 扫描（默认 4..12 × {0,2}），轮转消除漂移，输出 min/p25/median/max 与 GB/s；`THREAD-AFFINITY-REPORT.md` 的数据来源 |
+| `thread_e2e.sh` | 35B 端到端 decode A/B：旧 9 线程/OS vs 新 12 线程/SMT 成对 vs 10 线程，记录 ms/token、`[layerms]`、placement 与 token md5；需 35B 模型和空闲 GPU |
+| `bench_35b_engine.sh <tag> [0|1] [budget] [ctx] [kv] [max_tokens]` | 启动 `engine serve` 的两轮真实对话 benchmark（含 GPU 采样与 JSON 输出）；`MODEL_DIR` 必填 |
+| `moe_gap_probe.sh` | 同模型同 GPU 层数对比 llama-bench vs 自研引擎 decode，并给出逐层归因；`MODEL_DIR` + `LLAMA_BENCH` |
+| `genreg_case_probe.sh` | 重跑 gen_regression 的 35B 单例并保留完整 stderr，区分 OOM/loader 错误与真实 token 差异 |
+| `window_round.sh [1..5|all]` | 安静窗口的一键收尾流程：build → verify → gen_regression → 线程 e2e → MoE gap |
+| `serve_twoturn_bench.py` | 两轮真实对话（你好 → 写 1000 字小说）的采样/延迟/token 统计，供 serve 稳定性与 llama.cpp 对比 |
+| `serve_stability_check.py` / `serve_mtp_check.py` | serve 复读/think-budget 实机检查 / MTP 开关逐 token 对拍（见 `docs/SERVE-STABILITY-FIXES.md`） |
+| `monitor_session.py` | 被动监控 llama.cpp server 的 GPU/功耗/槽位与 prefill/decode 速率，输出 CSV |
+| `tests/test_launcher.py` | launcher 80 项 GUI/参数/启动停止验收（`MODEL_DIR=... python tests/test_launcher.py`，需 GPU） |
+
+这些脚本都是诊断/验收用，**不参与 `build.sh`**；`verify.sh` 只跑其中的 serve guard 单测
+（`tests/test_serve_guard.cpp`）。

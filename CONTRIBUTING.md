@@ -25,7 +25,7 @@ bash build.sh
 
 ## 2. 跑验证（PR 必须全过）
 
-四套引擎验证（需要自备测试模型，设置 `MODEL_DIR` 指向模型目录）：
+五套引擎验证（需要自备测试模型，设置 `MODEL_DIR` 指向模型目录）：
 
 ```bash
 export MODEL_DIR=<你的模型目录>
@@ -33,16 +33,19 @@ bash tools/verify.sh              # 单元测试 + G0 IR 对拍 + M2 plan 对拍
 bash tools/smoke_models.sh        # 四模型冒烟（0.5B / Coder / 9B / 35B）
 bash tools/gen_regression.sh      # 多 token 生成回归，与 llama.cpp greedy 逐 token 一致
 bash tools/verify_generality.sh   # 配置优先级 / 自适应放置 / 优雅失败 / 校准缓存
+bash tools/verify_serve.sh        # HTTP 服务端到端（默认 0.5B@7031）：API/SSE/优雅退出
 ```
 
 Launcher 相关改动（`src/launcher.cpp`、`src/model_scan.cpp`）还应跑：
 
 ```bash
+MODEL_DIR=<你的模型目录> python tests/test_launcher.py   # 80 项 GUI/args/启动停止验收（需 GPU）
 bash tools/verify_serve.sh        # HTTP 服务端到端
 bash tools/webui_e2e.py ...       # 真实浏览器（可选）
 ```
 
-PR 描述里贴出四条命令的结果摘要（PASS/FAIL 行），不要只写“本地跑过了”。
+`tests/test_serve_guard.cpp` 的 repeat-guard 单测已包含在 `verify.sh` 中（构建后自动执行）。
+PR 描述里贴出五条命令的结果摘要（PASS/FAIL 行），不要只写“本地跑过了”。
 
 ## 3. 代码风格
 

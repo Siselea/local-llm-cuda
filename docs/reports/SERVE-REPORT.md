@@ -53,7 +53,7 @@
 ### 1.2 正确性证据
 
 **（a）与 llama.cpp 官方分词器逐 token 对拍**（`tools/check_tokenizer.py cpp`，
-llama-tokenize = `U:/llama/llama-tokenize.exe` b12128，与 GGUF 同一 tokenizer）：
+llama-tokenize = `<LLAMA_DIR>/llama-tokenize.exe` b12128，与 GGUF 同一 tokenizer）：
 
 ```
 pre-tokenizer  : 'qwen35' (implemented)

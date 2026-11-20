@@ -264,7 +264,7 @@ ENGINE_Q35_LOG_A=1 ENGINE_Q35_HF_BCAST=1 ./build/test_gen.exe \
 # 期望回到旧错误输出：gen: 279 6511 314 9338 11 279 6511 314 279 6511
 #   -> " the capital of France, the capital of the capital"
 
-# --- llama.cpp ground truth 自取（U:/llama，可选）---
+# --- llama.cpp ground truth 自取（<LLAMA_DIR>，可选）---
 #   llama-server -m <gguf> -ngl 0 -c 1024 --port 8123
 #   POST /completion {"prompt":"The capital of France is","n_predict":12,
 #                     "temperature":0,"cache_prompt":false,"n_probs":1}

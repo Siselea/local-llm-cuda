@@ -692,10 +692,13 @@ def main():
     except Exception:
         pass
     ns_paths = [m.get("path", "") for m in ns_json.get("models", [])]
+    model_root = os.path.normcase(os.path.abspath(MODEL_DIR)).rstrip("\\/")
+    def under_model_dir(p):
+        q = os.path.normcase(os.path.abspath(p))
+        return q == model_root or q.startswith(model_root + os.sep)
     checks["no_scan_only_model_dir"] = (ns_json.get("source") == "no-scan" and
                                         len(ns_paths) >= 5 and
-                                        all(p.replace("/", "\\").lower().startswith("d:\\p0\\models")
-                                            for p in ns_paths))
+                                        all(under_model_dir(p) for p in ns_paths))
     print("[0] scan: progress=%s cache=%s cache_read=%.3fs no_scan=%s" % (
         checks["scan_progress_reported"], checks["scan_cache_written"],
         cache_seconds, checks["no_scan_only_model_dir"]))
