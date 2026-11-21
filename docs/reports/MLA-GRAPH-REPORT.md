@@ -182,6 +182,44 @@ gen + 409600 B logits 逐字节相同（Coder 的 CPU 层同样走这条图）�
 > 热状态）会让同一二进制的绝对值漂移 ±2 ms 量级（例如 Coder 默认档在 14:05 的批次
 > 里是 41.0，在 15:47 的批次里是 38.3，代码相同）。所有结论都来自同批交错的中位差。
 
+## 6c. 35B CPU 层 GPU 段：逐 kernel 分解 + 双 stream 结构性重叠
+
+`ENGINE_KPROF`（单 decode token，默认图全开）：GPU 总时间 **12.86 ms / wall 39.47 ms
+⇒ GPU 只忙 32.6%**，即 GPU 大量空闲、CPU 是瓶颈。CPU 驻留层（24 层）每层 GPU 段：
+
+| kernel | µs/层 | 说明 |
+|---|---|---|
+| 共享专家 gate/up/down（`gemv_f32` ×3，50 µs/次） | 75.5 | 120 calls/token = 3×40 层 |
+| CPU 层 tail `add_three_inplace`（24 calls × 73 µs） | 73.3 | 含队列排空尾 |
+| 共享专家加进 `xout_`（`add_inplace`） | 23.8 | |
+| `moe_shared_gate`（sigmoid 门） | 23.5 | |
+| `silu_mul` | 7.5 | |
+| `rmsnorm4`（ln2） | 6.0 | |
+| `zero_fill`（xout_） | 3.5 | |
+| **小计（shared 块 + ln2 + tail）** | **~213** | |
+| attention/mixer（在 q35 层图里，kprof 不可见） | ~50–60 | 由 sync 反推 |
+| **合计 ≈ 264 µs/层 = `[acc]` sync 0.264 ms/层（8.3 ms/token）** ✓ 账本闭合 | | |
+
+**结构性机会**：共享专家块（134 µs/层）只依赖 `hn_` 和固定权重，与 routed 专家/host GEMV
+无关；host GEMV 每层 615 µs，窗口足够完全藏住。实现 `cpu_dual_stream`（默认开）：
+共享专家块在**第二条 stream** 上提交，只等主 stream 到 norms/router 的 event
+（`cuStreamWaitEvent`），与 router 往返 + host GEMV 并发；主流在 `add3` 前 join。
+
+| 35B，同二进制交错中位（15 步） | 配置 | 结果 |
+|---|---|---|
+| `cpu_layer_ffn_graph` 单独（5 轮） | off 38.04 → on 37.36 | **−0.68 ms** |
+| `cpu_dual_stream` 单独（5 轮） | off 33.82 → on **32.76** | **−1.06 ms**（每轮都为正：−0.77/−1.00/−1.42/−1.04/−2.09） |
+| 两者合计（3 轮 vs 两者都关） | off 33.98 → on **32.90** | **−1.08 ms**（两者的收益大部分重叠） |
+
+账本：CPU 层 1.225 → 1.157 ms/layer，其中 sync 0.400 → 0.326；launches 240/token
+（CPU 48 / GPU 192），多出的 24 次 host sync 是 join（每次 ~2–5 µs）。
+**bit-exact**：35B 6 次运行（默认×2 / dual-off / ffn-graph-off / 两者都关 / 改动前二进制）
+gen 全同；Coder 4/4 用例 gen + 409600 B logits 逐字节相同。**五套验证：FIVE GREEN**。
+
+剩余 sync ~0.33 ms/层 = mixer graph + router gemm + 两个 D2H 拷贝 + 队列排空。再往下就是
+跨层流水（把 add3 延后、让下一层的 mixer 与当前 host GEMV 重叠），需要改层间依赖结构，
+属于下一阶段。
+
 ## 7. 失败/负面尝试记录
 
 1. **`quant_reuse_` 不变量 bug**（§2.3）：先手动在 replay 后清 `qc_ptr_`，后改为
