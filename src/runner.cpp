@@ -568,7 +568,28 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   xs8_i8_ = cuda::Buffer((kDp4aMaxElems / 32) * 4);
   if (debug_) std::fprintf(stderr, "[dbg] weights loaded, scratch=%zu\n", scratch_floats_);
   if (scratch_floats_) dequant_scratch_ = cuda::Buffer(scratch_floats_ * 4);
-  if (container_ == Container::Gguf) load_qtensor("output.weight", lm_head_qt_);
+  if (container_ == Container::Gguf) {
+    // Tied-embedding GGUFs have no output.weight: llama.cpp's converter omits it
+    // when the HF config has tie_word_embeddings=true (Gemma family, several small
+    // Qwen/Llama checkpoints), and the embedding matrix doubles as the LM head.
+    // Keep it quantized instead of materialising a multi-GB f32 copy when the
+    // vocabulary is large; F32/F16 embeddings fall through to lm_head_f32() below.
+    bool has_output_weight = false;
+    {
+      auto g = std::static_pointer_cast<gguf::Model>(gguf_);
+      for (const auto& t : g->tensors)
+        if (t.name == "output.weight") {
+          has_output_weight = true;
+          break;
+        }
+    }
+    if (has_output_weight) {
+      load_qtensor("output.weight", lm_head_qt_);
+    } else {
+      std::fprintf(stderr, "[load] tied embeddings: using token_embd.weight as lm_head\n");
+      load_qtensor("token_embd.weight", lm_head_qt_);
+    }
+  }
   if (!lm_head_qt_.valid) w_lm_ = upload(lm_head_f32());
   (void)0;
 
