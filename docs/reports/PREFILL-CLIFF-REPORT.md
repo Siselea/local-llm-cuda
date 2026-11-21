@@ -116,18 +116,29 @@ req0 target=13363: HTTP 400           <- 改前是 500 "forward: bad token count
 ### 5.3 decode 不回退
 9B：`[time] decode 21.35 ms/token (47 tok/s, 16 steps)`，top-1 **2614** ✓（任务书要求 ≥45 tok/s）。
 
-### 5.4 五套验证（独占 GPU，`MODEL_DIR=<MODEL_DIR> PY=python`）
+### 5.4 五套验证（独占 GPU，`MODEL_DIR=<MODEL_DIR> PY=python`；HEAD=`5967892`，工作树另有 13 个他人 WIP 文件）
 
-| 套件 | 状态 | 说明 |
+| 套件 | 状态 | 证据 |
 |---|---|---|
-| `tools/verify.sh` | **ALL GREEN（exit 0）** | 在该提交的构建上通过 |
-| `tools/smoke_models.sh` | **exit 0** | 40716 / 185 / 2614 / 2614 全对 |
-| `tools/gen_regression.sh` | **待干净环境重测**（一次运行里 2 例未过：`35b_chat22`、`coder_v2_lite`） | **不能归因于本提交**：(a) 用的 `build/*.exe` 是 18:07 构建，工作树里含 **edge-kernels 未提交的设备 top-k 改动**（`head_topk_max_` / `forward_topk_candidates`，见 `git diff src/runner.cpp`），(b) 跑的时候 GPU 上有 **3 个 `test_gen.exe`（合计 12.2 GB > 12 GB 显存）** 在验证 v0.1.2，处于换页状态。**必须在"工作树干净 + 独占 GPU"下重跑才能定性**；本提交对 CLI 的 prefill 只有"装载期 rows 决策"一处影响，且 gen_regression 的 prompt 只有 8–22 token（< 任何 rows），chunk 不变。 |
-| `tools/verify_generality.sh` | **未完成** | 在 GPU 被 edge-kernels 占用后中止。注：先前日志里的 `MODEL_DIR: unbound variable` 是外层 shell `export A=B && (...)` 在本机 ops wrapper 下**只对第一条命令生效**的假失败；已用自带 export 的 `tools/pf_run_suites.sh` 修正，需干净窗口复跑 |
-| `tools/verify_serve.sh` | **未完成** | 同上 |
-| `stability_probe.py long_ctx/long_chat` | 未跑 | 建议与 server-mode 的 prefix-cache 复测同窗口（它负责多轮/长上下文稳定性） |
+| `tools/verify.sh` | **ALL GREEN** | 无 private-path 修复前跑过（同一个候选修复的构建） |
+| `tools/smoke_models.sh` | **exit 0** | 40716 / 185 / 2614 / 2614 |
+| `tools/gen_regression.sh` | **GREEN 10/10** | `results: 10 passed, 0 failed`（此前的 2 例失败是脏树二进制 + 三进程抢 12.2 GB 换页造成的，已复现证明与本提交无关） |
+| `tools/verify_serve.sh` | **GREEN 22/22** | `results: 22 passed, 0 failed` |
+| `tools/verify_generality.sh` | **25 passed / 1 failed（flaky，非本提交）** | 唯一失败项 `post-load margin enforced`：**完全相同命令单独跑 PASS**（`[vram] check OK: 1369 MiB free >= 1200 MiB margin`），余量仅 **169 MiB** ⇒ 紧接着前一个测试进程的显存释放延迟就会把它翻成 WARNING；该用例 prompt 仅 22 token、`rows = max_seq = 22`，**本提交的 rows 重推导在此配置下不生效**。两次 suite 都失败、单独跑都通过 ⇒ 判为环境 flaky（建议：该断言加一次重试或把测试命令的 `--vram-margin` 降到 1000 留出余量） |
 
-> 归属提醒：`git diff src/runner.cpp` 里剩下的 41 行是 **edge-kernels 的设备 top-k 候选 WIP**（server-mode 已确认不是它的）。本报告的三处修复已单独提交为 `4e3e84e`（只含我的 hunk），因此可以在"stash 掉其它 WIP + 独占 GPU"的窗口里干净复跑上述三套。
+### 5.4.1 `small batch / tail` 曲线：小 n 的成本结构（决定"tail 是否值得优化"）
+
+| 来源 | 配置 | 数据 | 线性拟合 |
+|---|---|---|---|
+| 本报告探针 | rows=512、默认 fp16 路径 | n=50/73/96/165/326 → **200/230/233/332/411 ms** | **fixed ≈198 ms + 0.67 ms/token** |
+| server-mode 探针 | rows=128、默认 fp16 | n=8…128 | **fixed ≈179.8 ms + 0.124 ms/token** |
+| server-mode 探针 | rows=128、`ENGINE_GEMM=1`（自研量化 GEMM） | n=8…128 | fixed ≈381 ms + 0.581 ms/token（**更差**） |
+| server-mode 探针 | rows=128、`ENGINE_PREFILL_F16=0 ENGINE_GEMM=0` | n=8…128 | fixed ≈179.6 ms（**与默认相同**） |
+
+结论：**一个 52-token 的 tail 要 ~180–200 ms，几乎全是"每次 forward 的固定成本"**（与 f16 dequant 单开关无关、与 chunk 大小无关），每 token 成本只有 0.12–0.67 ms。所以：
+1. **tail 不值得单独优化**（没有任何 chunk 配置能消掉固定成本）；
+2. 根治两条路：**(a) 层主序 prefill**（每个权重矩阵 dequant 一次、对该请求的所有 token 复用；长文档与 tail 同时受益）；**(b) cache 边界与前向 chunk 解耦**（见 §5.5）。
+3. 小 n 走自研量化 GEMM（`ENGINE_GEMM=1`）不可行：固定成本反而翻倍，160 token 实测 8.6 s。
 
 ### 5.5 chunk 默认值的取舍（与 server-mode 联合定夺）
 
@@ -140,6 +151,8 @@ chunk 大小与 prefix-cache 粒度耦合（`reuse_pos = (boundary/chunk)*chunk`
 
 ⇒ 短多轮的代价只有 **+37 ms / 6 轮（+2.4%）**，而长文档收益是 **1.85–2.0×**，所以默认保留 512。
 如果用户以短多轮为主：`--prefill-rows 128`（或 256）即可恢复细粒度缓存；长文档为主：`--prefill-rows 1024`。
+**长多轮的量化反例（server-mode 在 v0.1.3 窗口实测）**：chunk 自动长到 1024 后，9.1k prompt 冷启动 prefill **9.7 s（比 chunk=128 的 18.6 s 快 1.9×）**，但同一 prompt 的第二次请求 cache 边界变成 8192 ⇒ tail=820 token、**prefill 1.2 s/轮**；而 chunk=128 时 tail=52、233 ms/轮 ⇒ **长多轮每轮多付 ~1 s**。这组数据正是"cache 对齐粒度必须与前向 chunk 解耦"的直接证据（server-mode v0.1.4 在做）。
+
 **更彻底的解法（下一轮）**：把"全量 prefill 的大 chunk"与"cache 边界的细粒度"解耦（cache 边界仍按小粒度对齐、全量 prefill 内部用大 chunk），需要 cache 侧配合并对 bit-exact 做验证。
 
 ### 5.6 冷启动结论的独立交叉验证（server-mode）
