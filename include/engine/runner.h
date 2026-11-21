@@ -560,6 +560,11 @@ class DenseRunner {
   void* dq_q5k_f16_ = nullptr;
   void* dq_q6k_f16_ = nullptr;
   void* dq_q8_0_f16_ = nullptr;
+  // x8 variants: one warp per super-block, 8 values per lane, 16 B stores (measured
+  // 1.5-1.7x over the per-block kernels with a bit-identical fp16 slab).
+  void* dq_q4k_f16_x8_ = nullptr;
+  void* dq_q5k_f16_x8_ = nullptr;
+  void* dq_q6k_f16_x8_ = nullptr;
   cuda::Buffer mq_, mkva_, mckv_, mckvn_, mkpe_, mkn_, mv_, mk_, mout_;
   void* k_ropestrided_ = nullptr;
   void* k_split2_ = nullptr;

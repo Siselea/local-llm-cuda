@@ -22,6 +22,7 @@
 | [HOSTLAYER-35B-REPORT.md](HOSTLAYER-35B-REPORT.md) | hostlayer-35b 交付报告（2026-11-15） | 35B CPU 专家层调度与主机侧带宽分析。 |
 | [KV-LONGCTX-REPORT.md](KV-LONGCTX-REPORT.md) | KV cache 量化 + 长上下文 attention + 上下文上限自适应（KV-LONGCTX-REPORT） | KV 量化与长上下文报告：q8_0/q4_0 KV、ctx 自适应与长上下文实测。 |
 | [LONGCTX-REPORT.md](LONGCTX-REPORT.md) | 长上下文（4k / 2k 预填）报告：一个必然崩溃的 bug + 修复后的数据 | 长上下文（2048/4k/8k）填充与性能实测。 |
+| [DEQUANT-X8.md](DEQUANT-X8.md) | 反量化内核提速（DEQUANT-X8） | 一个 warp 一个 super-block + 16B 向量化 store：181–207 GB/s → **303–308 GB/s（1.48–1.70×）**，fp16 slab 与旧内核**逐字节一致**；真实 prefill 4.4k −4.4%、13.4k −2.6%；五套全绿。 |
 | [FUSED-GEMM-PROTO.md](FUSED-GEMM-PROTO.md) | fused dequant+GEMM 最小原型（负结果 + 修正判断） | 单内核 fused（shared dequant + mma.m16n8k16）数值正确（rel_l2≤7e-6）但 naive 版慢 50×；实测 dequant 是计算瓶颈（115 GB/s）而非流量，修正"tail 190→85 ms"为"~190→140-150 ms"，建议先做层主序 + 反量化提速。 |
 | [LAYER-MAJOR-PREFILL-PLAN.md](LAYER-MAJOR-PREFILL-PLAN.md) | 层主序 prefill 设计（LAYER-MAJOR-PREFILL-PLAN） | 设计文档：把 chunk-major 改成 layer-major（每权重矩阵 dequant 一次），预期长文档 −8~−10%；tail 用「小 n CUDA graph」而不是层主序。 |
 | [MTP-IMPL-REPORT.md](MTP-IMPL-REPORT.md) | MTP 投机解码 实施报告（MTP-IMPL） | MTP 投机解码实现报告（实验特性，默认关闭）。 |

@@ -373,6 +373,9 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   dq_q4k_f16_ = mod_->kernel("dequant_q4k_f16");
   dq_q5k_f16_ = mod_->kernel("dequant_q5k_f16");
   dq_q6k_f16_ = mod_->kernel("dequant_q6k_f16");
+  dq_q4k_f16_x8_ = mod_->kernel("dequant_q4k_f16_x8");
+  dq_q5k_f16_x8_ = mod_->kernel("dequant_q5k_f16_x8");
+  dq_q6k_f16_x8_ = mod_->kernel("dequant_q6k_f16_x8");
   dq_q8_0_f16_ = mod_->kernel("dequant_q8_0_f16");
   struct VramReport {
     ~VramReport() {
@@ -3650,12 +3653,19 @@ void DenseRunner::matmul(const QTensor& w, int n_tokens, cuda::Buffer& in, cuda:
   static const bool want_f16 = prefill_f16_;
   const bool want_acc16 = want_f16 && prefill_f16_acc_;
   if (want_f16 && n_tokens > 1) {
+    // x8 variants: one warp per super-block, 8 values/lane and a 16 B store.  Measured
+    // ~305 GB/s vs 181-207 GB/s for the per-block kernels, with a bit-identical fp16
+    // slab (so the generated tokens cannot change).  ENGINE_DQ_OLD=1 forces the old
+    // kernels for A/B.
+    static const bool dq_old = ENGINE_ENV_ON("ENGINE_DQ_OLD");
     void* f16fn = nullptr;
+    void* f16x8 = nullptr;
     int f16_threads = 128;
-    if (w.type == "Q4_K") f16fn = dq_q4k_f16_;
-    else if (w.type == "Q5_K") f16fn = dq_q5k_f16_;
-    else if (w.type == "Q6_K") f16fn = dq_q6k_f16_;
+    if (w.type == "Q4_K") { f16fn = dq_q4k_f16_; f16x8 = dq_q4k_f16_x8_; }
+    else if (w.type == "Q5_K") { f16fn = dq_q5k_f16_; f16x8 = dq_q5k_f16_x8_; }
+    else if (w.type == "Q6_K") { f16fn = dq_q6k_f16_; f16x8 = dq_q6k_f16_x8_; }
     else if (w.type == "Q8_0") { f16fn = dq_q8_0_f16_; f16_threads = 32; }
+    if (dq_old) f16x8 = nullptr;
     const long long macs = static_cast<long long>(n_tokens) * w.n_out * w.n_in;
     if (f16fn && macs >= prefill_f16_min_macs_ && scratch_floats_ > 0 &&
         dequant_scratch_.data() != nullptr) {
@@ -3684,7 +3694,10 @@ void DenseRunner::matmul(const QTensor& w, int n_tokens, cuda::Buffer& in, cuda:
         void* po = dequant_scratch_.data();
         long long nb = nblk;
         void* a[] = {&ps, &po, &nb};
-        cuda::launch(f16fn, static_cast<int>(nblk), 1, 1, f16_threads, 1, 1, 0, a);
+        if (f16x8)
+          cuda::launch(f16x8, static_cast<int>((nblk + 7) / 8), 1, 1, 256, 1, 1, 0, a);
+        else
+          cuda::launch(f16fn, static_cast<int>(nblk), 1, 1, f16_threads, 1, 1, 0, a);
         if (want_acc16 && k_f16tof32_) {
           // f16 accumulate: write an fp16 tile then widen it into the f32 activation
           // buffer (the tile is contiguous, the destination is strided by n_out).
