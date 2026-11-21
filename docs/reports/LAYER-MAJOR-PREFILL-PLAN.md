@@ -62,7 +62,8 @@ for layer in layers:                      # 外层
 
 1. **状态顺序**：KV cache 位置、SSM/conv 递归状态必须按 token 顺序推进 ⇒ chunk 循环必须保持**从小到大**，不能并行。层主序天然满足（每层内按 chunk 顺序跑）。
 2. **hidden state 常驻**：层主序需要把全部 token 的 hidden state 留在显存（层与层之间传递）：9B 13.4k token × 4096 × 4 B = **220 MB**；1.6k = 26 MB。可接受（当前 ctx=32768 时装载后实测还有 4.1 GB 空闲）。
-3. **bit-exact 可保持**：只要 **chunk 边界与大小不变**，每个 GEMM 的 M 参数就不变（cuBLAS 选核/累加顺序只依赖形状）⇒ 层主序只是"同一批 GEMM 换了个执行顺序"，结果应逐位一致。这是本方案最重要的性质：**不需要动 cache 对齐、不需要重新验证数值语义**，用现成的 `gen_regression`（10/10）+ 逐 token 对拍（`ENGINE_SPLIT_PREFILL`）即可验收。
+3. **token 级一致可保持**：只要 **chunk 边界与大小不变**，每个 GEMM 的 M 参数就不变（cuBLAS 选核/累加顺序只依赖形状）⇒ 层主序只是"同一批 GEMM 换了个执行顺序"，**贪心输出应逐 token 一致**。
+   ⚠ 注意：本机 logits 本身**不是逐位确定**的——相同输入/相同状态的两次 forward 之间实测有 ~7.6e-4（max|diff|）的差异（cuBLAS split-K / atomics 求和顺序；2026-11-21 server-mode 实测）。所以验收判据是 **"ids 顺序一致 + 数值差 ≤ host 噪声量级"**，而不是"逐字节 logits 比对"。用现成的 `gen_regression`（10/10）+ 逐 token 对拍（`ENGINE_SPLIT_PREFILL`）验收即可。
 4. **FFN 才有收益**：一层内部对 chunk 的批量化只对"无 token 间依赖"的部分成立。attention（q/k/v/o）在 token 间是因果依赖（但每个矩阵仍是独立的 GEMM，也可以在 chunk 之间批量化，因为 attention 的输入只依赖上一层输出，不依赖同层其它矩阵）⇒ 实际上**整层都可以层主序**，只要保持 chunk 之间的顺序。
 
 ### 2.3 两个落地变体
@@ -123,7 +124,7 @@ for layer in layers:                      # 外层
 ### 3.3 真正的杠杆：fused dequant + GEMM（不落 fp16 镜像）
 
 把"dequant 到 fp16 scratch → cuBLAS 再读"改成 **tile 级 fused kernel**：读量化权重 tile（全模型总流量 6.1 GB）→ 在 shared memory 里 dequant 成 fp16 tile → 直接 HMMA。流量 30 GB → 6.1 GB，固定成本预期 130 ms → **~25–35 ms**：
-- **tail**：52-token prefill 从 ~190 ms → 预期 **~80–90 ms**（剩下的是 conv/attention/head 等其它固定项）；
+- **tail**：52-token prefill 从 ~190 ms → 预期 **~140–150 ms**。⚠ 2026-11-21 的原型实测修正了原来的"~85 ms"：`FUSED-GEMM-PROTO.md` 证明 dequant **计算**本身（~95 ms）不是流量、fused 也省不掉，fused 只去掉镜像写读（~74 ms 的一部分），naive 版实测慢 50×；要拿到这 ~1.3× 需要调优版内核；
 - **长文档**：每个 chunk 的固定成本同样从 ~130 ms → ~30 ms；13.4k（14 个 chunk）再省 `14 × 100 ms ≈ 1.4 s / 16 s ≈ 9%`；
 - **与层主序可叠加**：层主序消除"每 chunk 一次 dequant"，fused 消除"每次 dequant 的镜像写读"，两者叠加后长文档的固定成本从 14×130 ms=1.82 s 降到 ~14×30 ms=0.42 s（约 −9% 总时长），tail 也受益。
 
@@ -139,7 +140,7 @@ for layer in layers:                      # 外层
 | ④ （可选）层主序 V2 / 35B MoE 适配 | +1 天 | 35B 长 prompt prefill 不退化 |
 
 **风险**：
-- bit-exact 前提是"chunk 边界不变"——若将来 server-mode 的 cache 解耦需要改变前向 chunk，必须重新对拍（届时保持"同一次请求内 chunk 序列一致"即可）。
+- token 级一致的前提是"chunk 边界不变"——若将来 cache 解耦改变前向 chunk，必须重新对拍（判据：ids 顺序一致 + 数值差 ≤ host 噪声，不是逐位比对）。
 - MLA（Coder）与 MoE（35B）路径的中间张量与 dense 不同，V1 首版只对 dense（9B/0.5B）启用，其余走原路径（自动回退，由 `ir_.moe.n_expert==0 && ir_.attn.variant!="mla"` 门控）。
 - 需要 instrument 确认固定成本的精确拆分（dequant vs launch vs 其他）：在 `matmul` 里加 `ENGINE_PROF_PREFILL_FIXED=1` 的累计计时（dequant 总时间 / cuBLAS 调用次数 / host 时间）——这一步很便宜，建议和 ① 一起做。
 

@@ -20,6 +20,8 @@
 #include "engine/config.h"
 #include "engine/runner.h"
 
+#include "fused_gemm_proto.h"
+
 namespace {
 
 std::vector<int> parse_ids(const std::string& s) {
@@ -54,6 +56,12 @@ runner::Container detect_container(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Prototype bench (test-only): fused Q5_K dequant+GEMM vs dequant->fp16->cuBLAS.
+  for (int i = 1; i < argc; ++i)
+    if (std::strcmp(argv[i], "--bench-fused-gemm") == 0) {
+      fused_proto::run_bench();
+      return 0;
+    }
   engine::config::Config& cfg = engine::config::Config::get();
   // test_gen specific options: --ids "<a,b,c>" and --n <count>; everything else
   // goes through the shared config parser.
