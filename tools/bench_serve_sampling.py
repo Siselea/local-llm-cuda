@@ -15,7 +15,7 @@ and are printed as a median table.
 
 Usage:
   python tools/bench_serve_sampling.py --before build/engine_before_sampler.exe \
-      --after build/engine_after_sampler.exe --model D:/p0/models/Qwen3.5-9B-Q5_K_M.gguf
+      --after build/engine_after_sampler.exe --model <MODEL_DIR>/Qwen3.5-9B-Q5_K_M.gguf
 """
 from __future__ import annotations
 
@@ -184,7 +184,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--before", required=True)
     ap.add_argument("--after", required=True)
-    ap.add_argument("--model", default="D:/p0/models/Qwen3.5-9B-Q5_K_M.gguf")
+    ap.add_argument("--model",
+                    default=(os.environ.get("MODEL_DIR") or ".") + "/Qwen3.5-9B-Q5_K_M.gguf")
     ap.add_argument("--port", type=int, default=7041)
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--gpu-layers", default="-1")

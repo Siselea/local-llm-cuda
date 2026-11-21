@@ -66,7 +66,7 @@ build/bench_sampler.exe 248320 400
 $PY -m ziglang c++ -std=c++17 -O2 -Iinclude src/... src/serve.cpp src/main.cpp -o build/engine_before_sampler.exe   # 改前源码
 $PY -m ziglang c++ -std=c++17 -O2 -Iinclude src/... src/serve.cpp src/main.cpp -o build/engine_after_sampler.exe    # 改后源码
 $PY tools/bench_serve_sampling.py --before build/engine_before_sampler.exe \
-    --after build/engine_after_sampler.exe --model D:/p0/models/Qwen3.5-9B-Q5_K_M.gguf --trials 5
+    --after build/engine_after_sampler.exe --model "${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf" --trials 5
 ```
 
 ## webui 实际参数证据（用户默认路径）
