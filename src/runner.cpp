@@ -150,6 +150,14 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   prefill_rows_ = static_cast<int>(cfg.get_int("prefill_rows"));
   if (prefill_rows_ < 1) prefill_rows_ = 1;
   rows_ = static_cast<size_t>(max_seq_ < prefill_rows_ ? max_seq_ : prefill_rows_);
+  // Never let the prefill chunk reach the whole context.  A chunk == ctx means the
+  // activation buffers are sized for every position at once (on the 9B at ctx 4096 that
+  // pushed startup usage to ~9.7 GB of 12 GB), and it makes serve's startup prewarm
+  // skip itself (its "chunk + 16 > ctx" condition) -- and ctx 4096 is the launcher
+  // default.  Cap at 3/4 of the context (and never below 512 so tiny contexts still
+  // prefill more than one token at a time).
+  const size_t ctx_chunk_cap = static_cast<size_t>(std::max(512, max_seq_ * 3 / 4));
+  if (rows_ > ctx_chunk_cap) rows_ = ctx_chunk_cap;
   if (rows_ < 1) rows_ = 1;
   // Fit the prefill chunk to the real budget.  Shrinking is the hard requirement;
   // growing matters just as much for speed: every chunk re-dequantises the whole
@@ -174,10 +182,9 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
              free_now;
     };
     while (rows_ > 32 && !fits(rows_)) rows_ >>= 1;
-    const int grow_cap = static_cast<int>(cfg.get_int("prefill_rows_max"));
-    while (rows_ < static_cast<size_t>(max_seq_) && static_cast<int>(rows_) < grow_cap &&
-           fits(rows_ * 2))
-      rows_ *= 2;
+    const size_t grow_cap =
+        std::min<size_t>(static_cast<size_t>(cfg.get_int("prefill_rows_max")), ctx_chunk_cap);
+    while (rows_ * 2 <= grow_cap && fits(rows_ * 2)) rows_ *= 2;
     if (static_cast<int>(rows_) < want_rows)
       std::fprintf(stderr,
                    "[ctx] prefill chunk reduced %d -> %zu rows so activations+KV fit "
@@ -586,10 +593,9 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
     };
     const int want_rows = static_cast<int>(rows_);
     while (rows_ > 32 && free_now < need_for(rows_)) rows_ >>= 1;
-    const int grow_cap = static_cast<int>(engine::config::get_int("prefill_rows_max"));
-    while (rows_ < static_cast<size_t>(max_seq_) && static_cast<int>(rows_) < grow_cap &&
-           free_now >= need_for(rows_ * 2))
-      rows_ *= 2;
+    const size_t grow_cap = std::min<size_t>(
+        static_cast<size_t>(engine::config::get_int("prefill_rows_max")), ctx_chunk_cap);
+    while (rows_ * 2 <= grow_cap && free_now >= need_for(rows_ * 2)) rows_ *= 2;
     if (static_cast<int>(rows_) != want_rows)
       std::fprintf(stderr,
                    "[ctx] prefill chunk %d -> %zu rows by actual free VRAM (free=%.0f MiB "
