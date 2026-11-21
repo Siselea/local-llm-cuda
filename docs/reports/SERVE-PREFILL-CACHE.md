@@ -194,3 +194,50 @@ webui 默认 top_k=20 路径正常（采样候选优化生效）。
 build.sh **OK**、verify **ALL GREEN**、smoke_models **PASS**、gen_regression **10/10 GREEN**、
 verify_generality **26/26 GREEN**、verify_serve 0.5B **22/22** / 9B **21/21 GREEN**、
 test_sampler **PASS**。
+
+
+## 9. v0.1.4：cache 对齐粒度与前向 chunk 解耦（2026-11-21 19:30）
+
+### 9.1 实现
+`serve_cache_align`（CLI `--cache-align`，默认 **128**；`0` = 旧行为=对齐到 prefill chunk）：
+`reuse_pos = (boundary / cache_align) * cache_align`，其余 snapshot/restore/start_from 逻辑不变。
+缓存路径的历史前向可能出现 **partial chunk**（长度不是 rows_ 的倍数），这是本轮 bit-exact
+验证的重点路径。只改 `serve.cpp` + `config.cpp`（一行配置），不碰 runner.cpp。
+
+### 9.2 bit-exact 硬门槛（先验证再上默认）
+9B ctx32768、greedy（temp=0/top_k=1）、5 轮增长对话（每轮 +~2k token，历史到 8.3k），
+`cache_prompt=false`（整段 prefill） vs `cache_prompt=true`（缓存路径）逐 token 对比：
+
+| 轮 | prompt | 整段 prefill | 缓存 prefill | new/reused | tokens |
+|---|---|---|---|---|---|
+| 1 | 24 | 234 ms | 163 ms | 24 / 0 | SAME |
+| 2 | 2092 | 1670 ms | 1672 ms | 2092 / 0 | SAME |
+| 3 | 4162 | 3520 ms | 2030 ms | 2114 / 2048 | SAME |
+| 4 | 6229 | 5731 ms | 2406 ms | 2133 / 4096 | SAME |
+| 5 | 8291 | 8281 ms | 2771 ms | 2147 / 6144 | SAME |
+
+⇒ **PREFIX CACHE GREEN**（含 partial chunk 路径），与对齐 128 的显式 `--cache-align 128`
+结果相同；默认值置 128 后再跑一遍仍 GREEN。
+
+### 9.3 A/B：turn-2 省多少（9B ctx32768，~5.8k prompt，3 次交错）
+
+| align | turn1 prefill | turn2 prompt | turn2 new | turn2 prefill | turn2 wall |
+|---|---|---|---|---|---|
+| 0（旧） | 5191 ms | 5814 | **694** | **832 ms** | 1.21 s |
+| 128（新默认） | 5331 ms | 5814 | **54** | **210 ms** | **0.59 s** |
+
+⇒ **每轮省 622 ms prefill（−75%）、wall −0.62 s（−51%）**；长文档首次 prefill 不变
+（大 chunk 仍在）。短/中多轮（历史 ≥128）也开始能命中缓存（旧对齐 1024 时 <1024 历史完全
+用不上缓存）。
+
+### 9.4 验证
+- `tools/serve_prefix_cache_check.py --filler-repeat 100 --turns 5`：GREEN（默认 128）；
+- 五套验证（`build.sh` 重建后的 engine.exe，19:32–19:45）：
+  `verify` **ALL GREEN**、`smoke_models` **PASS**、`gen_regression` **10/10 GREEN**、
+  `verify_generality` **26/26 GREEN**、`verify_serve` 0.5B **22/22** / 9B **21/21 GREEN**、
+  `test_sampler` **PASS**；`build.sh` **OK**。
+- 浏览器 e2e：9B serve（默认 cache_align=128）3 轮真打字+真鼠标全部完成，
+  截图 `build/logs/e2e_v014/01–03_done.png`。
+- 工作树口径：验证开始时 `HEAD=2aa850e dirty=14`，结束时 `HEAD=b6efdc1 dirty=15`
+  （**其他 agent 在此期间提交/改文件**；build.sh 在 19:32 产生 engine.exe 后未再重建，
+  所有 suite 跑的都是同一份二进制；本项改动只有 serve.cpp/config.cpp 的 cache-align hunk）。

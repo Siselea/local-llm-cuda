@@ -397,6 +397,12 @@ const OptionDef kDefs[] = {
      "serve: multi-turn prefix KV cache (reuse the shared conversation prefix instead of "
      "re-prefilling the whole chat every request; hybrid models also snapshot/restore the "
      "recurrent SSM state). --prefix-cache=0 disables it"},
+    {"serve_cache_align", "ENGINE_SERVE_CACHE_ALIGN", "cache-align", true, false,
+     Type::Int, "128", 0, 1 << 20,
+     "serve: prefix-cache snapshot alignment in tokens (0 = follow --prefill-rows). "
+     "A small alignment (e.g. 128) keeps the large prefill chunk for long prompts while "
+     "multi-turn cache hits only re-prefill the new tokens; cached vs full-prefill "
+     "outputs are verified token-for-token identical"},
     {"serve_repeat_guard", "ENGINE_SERVE_REPEAT_GUARD", "repeat-guard", true, false,
      Type::Int, "2", 0, 2,
      "serve: degenerate-loop guard level: 0=off, 1=sentence level (3 identical "

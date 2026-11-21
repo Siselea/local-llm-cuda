@@ -223,11 +223,17 @@ llama.cpp b6000 的 webui 只读取 `choices[0].delta.content`（它自己在客
 架构还会把 SSM 的 conv/rec 状态快照一并恢复），**只 prefill 新增 token**（上一轮回答 + 新提问 +
 生成提示），不再整段重算历史。要点：
 
-- **逐 token 一致（硬验收）**：快照/切分点对齐到 prefill chunk 边界（serve 默认把
-  `prefill_rows` 钉在 128），缓存路径与 `cache_prompt=false` 的整段 prefill 走**完全相同**的
-  chunk 序列，所以 logits 逐位一致；`tools/serve_prefix_cache_check.py` 实测 8 轮贪心 token
-  序列全部 SAME。
-- **粒度**：一轮最多多 prefill <128 token 的历史（对齐余量），其余历史全部命中。
+- **逐 token 一致（硬验收）**：缓存路径与 `cache_prompt=false` 的整段 prefill 必须产出
+  **逐 token 相同**的结果；`tools/serve_prefix_cache_check.py` 实测（9B ctx32768、5 轮、历史
+  长到 8.3k token、greedy）所有轮次 SAME。
+- **缓存对齐粒度与前向 chunk 解耦**（`serve_cache_align` / `--cache-align`，默认 **128**）：
+  快照点落在 128 token 网格上，而前向 chunk 仍用 `--prefill-rows`（serve 默认 512、按显存
+  生长到 1024）。这样长 prompt 首次 prefill 走大 chunk（9B 9k prompt 约 9.7 s），而多轮
+  命中时一轮最多只多 prefill <128 token 的历史（对齐余量）。若对齐到 chunk 本身（旧行为，
+  `--cache-align 0`），9.1k 对话每轮会多 prefill 最多 ~1023 token（实测 1.2 s/轮）；
+  解耦后同一场景第二轮 prefill 832 ms → **210 ms**（−75%），整轮 wall 1.21 s → 0.59 s。
+  解耦后缓存路径的历史前向可能出现 partial chunk，这是逐 token 一致性验证覆盖的路径。
+- `--cache-align 0` = 旧行为（对齐到当前 prefill chunk）；`/props.prefix_cache.align` 可观测。
 - `cache_prompt:false` 可对单个请求关闭（llama.cpp webui 默认发 `true`）；`--prefix-cache=0`
   全局关闭（A/B 对比用）。
 - 状态快照 62.8 MiB（35B，31 个线性层 rec+conv），单槽，直接复用 mtp 投机解码的 rollback

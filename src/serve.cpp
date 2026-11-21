@@ -218,6 +218,7 @@ struct ServerState {
   std::string model_name;
   bool thinking_aware = false;  // chat template opens a <think> block
   PrefixCache pc;
+  int cache_align = 0;          // prefix-cache snapshot alignment (0 = prefill chunk)
   int no_limit_tokens = 1024;   // reply cap for max_tokens <= 0 (webui sends -1)
   int think_budget = 512;       // force </think> after N thinking tokens (0 = off)
   int repeat_guard = 2;         // loop guard level: 0 off, 1 sentences, 2 +chars/phrases
@@ -291,12 +292,18 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
     if (hid.size() <= ids.size() && std::equal(hid.begin(), hid.end(), ids.begin()))
       boundary = static_cast<int>(hid.size());
   }
-  // Align the cache point to a prefill-chunk boundary.  forward() chunks long
-  // prompts in fixed rows_; splitting at a multiple of that size makes the cached
-  // request run exactly the same chunk sequence as a full prefill (same batch
-  // shapes / kernels => bit-exact logits, not just "close").
+  // Cache point alignment.  forward() chunks long prompts in rows_ tokens; the
+  // snapshot point used to be aligned to rows_ too, which with the large serve
+  // chunk (512-1024) makes a multi-turn cache hit re-prefill up to rows_-1 extra
+  // history tokens every turn (measured 820 tokens / 1.2 s on a 9.1k chat).
+  // `serve_cache_align` (default 128; 0 = follow the prefill chunk) decouples them: the snapshot
+  // stays on a fine grid (e.g. 128) while forward() still uses the large chunk for
+  // long prompts.  The cached path may then run a partial history chunk; that is
+  // verified token-for-token against the full-prefill path
+  // (tools/serve_prefix_cache_check.py --filler-repeat ...).
   const int chunk_rows = std::max(1, model.prefill_chunk());
-  const int reuse_pos = (boundary / chunk_rows) * chunk_rows;
+  const int cache_align = st.cache_align > 0 ? st.cache_align : chunk_rows;
+  const int reuse_pos = (boundary / cache_align) * cache_align;
   const bool cacheable = st.pc.enabled && gp.prefix_cache && reuse_pos > 0 &&
                          reuse_pos < static_cast<int>(ids.size());
   int start_from = 0;
@@ -947,6 +954,8 @@ void handle_props(const ServerState& st, http::Conn& conn) {
   w.begin_obj();
   w.key("enabled");
   w.boolean(st.pc.enabled);
+  w.key("align");
+  w.integer(st.cache_align);
   w.key("state_supported");  // hybrid model: recurrent state snapshot needed
   w.boolean(st.model->prefix_state_supported());
   w.key("state_bytes");
@@ -2015,6 +2024,8 @@ int run(const Options& opts) {
       engine::config::Config::get().set("prefill_rows_max", "1024",
                                         engine::config::Source::Cli, &perr);
   }
+  st.cache_align = static_cast<int>(engine::config::get_int("serve_cache_align"));
+  if (st.cache_align < 0) st.cache_align = 0;
   st.pc.enabled = engine::config::get_bool("serve_prefix_cache");
   st.no_limit_tokens = static_cast<int>(engine::config::get_int("serve_no_limit_tokens"));
   if (st.no_limit_tokens <= 0) st.no_limit_tokens = 1024;
@@ -2077,11 +2088,13 @@ int run(const Options& opts) {
                                : "requested but not available on this model",
                 st.mtp_k);
   std::printf("[serve] prefix-cache: %s (state snapshot: %s, %.1f MiB/slot, prefill chunk %d, "
-              "no-limit cap %d tok)\n",
+              "cache align %s, no-limit cap %d tok)\n",
               st.pc.enabled ? "on" : "off",
               st.model->prefix_state_supported() ? "hybrid SSM+KV" : "KV only",
               static_cast<double>(st.model->prefix_state_bytes()) / 1048576.0,
-              st.model->prefill_chunk(), st.no_limit_tokens);
+              st.model->prefill_chunk(),
+              st.cache_align > 0 ? std::to_string(st.cache_align).c_str() : "chunk",
+              st.no_limit_tokens);
   std::printf("[serve] sampling: temp=%.2f top_k=%d top_p=%.2f | sampler: bounded candidates "
               "(cap %d; top_k=0 -> top-%d approx) | think budget: %s%d tokens "
               "| repeat guard: level %d\n",
