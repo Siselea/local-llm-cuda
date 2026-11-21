@@ -10,10 +10,10 @@
 #   bash tools/coder_serve_chat.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
-MODEL_DIR="${MODEL_DIR:-D:/p0/models}"
+MODEL_DIR="${MODEL_DIR:?set MODEL_DIR to the directory holding the .gguf models}"
 MODEL="${1:-$MODEL_DIR/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf}"
 PORT="${2:-7040}"
-PY="${PY:-D:/p0/py312/python.exe}"
+PY="${PY:-python}"
 export PYTHONIOENCODING=utf-8   # served text can contain any byte sequence
 ENGINE=./build/engine.exe
 LOG=build/logs/coder_serve_chat.log

@@ -4,7 +4,8 @@
 #   REPS=5 bash build/ab35_dual.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M="${M:-D:/p0/models/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf}"
+: "${MODEL_DIR:?set MODEL_DIR to the directory holding the .gguf models}"
+M="${M:-${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf}"
 BIN="${BIN:-./build/test_gen.exe}"
 N="${N:-15}"
 REPS="${REPS:-5}"

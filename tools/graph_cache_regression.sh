@@ -14,10 +14,10 @@
 #
 # Configs are passed as environment assignments (prefix), never as CLI flags.
 #
-#   MODEL_DIR=D:/p0/models bash tools/graph_cache_regression.sh
+#   MODEL_DIR=/path/to/models bash tools/graph_cache_regression.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
-MODEL_DIR="${MODEL_DIR:-D:/p0/models}"
+MODEL_DIR="${MODEL_DIR:?set MODEL_DIR to the directory holding the .gguf models}"
 GEN=./build/test_gen.exe
 [ -x "$GEN" ] || { echo "missing $GEN (run bash build.sh)"; exit 1; }
 mkdir -p build/logs

@@ -7,7 +7,8 @@
 # Each line: base ms | new ms | delta | top-1 | gen md5 of the two runs (must match).
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M="${M:-D:/p0/models/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf}"
+: "${MODEL_DIR:?set MODEL_DIR to the directory holding the .gguf models}"
+M="${M:-${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf}"
 BASE="${BASE:-./build/test_gen_ek_base.exe}"
 NEW="${NEW:-./build/test_gen.exe}"
 IDS="${IDS:-549,6077,280,7239}"

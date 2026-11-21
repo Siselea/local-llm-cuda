@@ -7,7 +7,8 @@
 #   bash build/bit35_cpuffn.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M="${M:-D:/p0/models/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf}"
+: "${MODEL_DIR:?set MODEL_DIR to the directory holding the .gguf models}"
+M="${M:-${MODEL_DIR}/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf}"
 NEW="${NEW:-./build/test_gen.exe}"
 OLD="${OLD:-./build/test_gen_ek_base.exe}"
 N="${N:-16}"

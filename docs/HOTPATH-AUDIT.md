@@ -47,7 +47,7 @@
 | `gemv_shape_key()`（仅校准缓存命中时） | 46 ns | 不在默认路径 |
 | `choose_gemv` 类型名比较 | ~1 ns（-O2 折叠） | 不是问题 |
 
-> 复现：`D:/p0/py312/python.exe -m ziglang c++ -std=c++17 -O2 tools/bench_host.cpp -o build/bench_host.exe && ./build/bench_host.exe`
+> 复现：`python -m ziglang c++ -std=c++17 -O2 tools/bench_host.cpp -o build/bench_host.exe && ./build/bench_host.exe`
 > （该文件是**新增的独立小工具**，`build.sh` 未引用；不属于引擎代码。）
 
 ---
@@ -302,7 +302,7 @@ layer_graph_mode_`（runner.cpp ≈2396）三者皆 false ⇒ 每层 `cublas::ge
 
 ```bash
 # 1) 主机微基准（不占 GPU）
-D:/p0/py312/python.exe -m ziglang c++ -std=c++17 -O2 tools/bench_host.cpp -o build/bench_host.exe
+python -m ziglang c++ -std=c++17 -O2 tools/bench_host.cpp -o build/bench_host.exe
 ./build/bench_host.exe
 
 # 2) 逐层主机开销（GPU 窗口空闲时；注意 §8 的打印成本）

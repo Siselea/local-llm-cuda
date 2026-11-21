@@ -16,7 +16,8 @@
 #   bash tools/coder_bitexact.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
-M="${M:-D:/p0/models/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf}"
+: "${MODEL_DIR:?set MODEL_DIR to the directory holding the .gguf models}"
+M="${M:-${MODEL_DIR}/DeepSeek-Coder-V2-Lite-Instruct-Q5_K_M.gguf}"
 BASE="${BASE:-./build/test_gen_ek_base.exe}"
 NEW="${NEW:-./build/test_gen.exe}"
 mkdir -p build/logs
