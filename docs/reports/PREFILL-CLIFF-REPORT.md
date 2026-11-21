@@ -124,7 +124,7 @@ req0 target=13363: HTTP 400           <- 改前是 500 "forward: bad token count
 | `tools/smoke_models.sh` | **exit 0** | 40716 / 185 / 2614 / 2614 |
 | `tools/gen_regression.sh` | **GREEN 10/10** | `results: 10 passed, 0 failed`（此前的 2 例失败是脏树二进制 + 三进程抢 12.2 GB 换页造成的，已复现证明与本提交无关） |
 | `tools/verify_serve.sh` | **GREEN 22/22** | `results: 22 passed, 0 failed` |
-| `tools/verify_generality.sh` | **25 passed / 1 failed（flaky，非本提交）** | 唯一失败项 `post-load margin enforced`：**完全相同命令单独跑 PASS**（`[vram] check OK: 1369 MiB free >= 1200 MiB margin`），余量仅 **169 MiB** ⇒ 紧接着前一个测试进程的显存释放延迟就会把它翻成 WARNING；该用例 prompt 仅 22 token、`rows = max_seq = 22`，**本提交的 rows 重推导在此配置下不生效**。两次 suite 都失败、单独跑都通过 ⇒ 判为环境 flaky（建议：该断言加一次重试或把测试命令的 `--vram-margin` 降到 1000 留出余量） |
+| `tools/verify_generality.sh` | **25 passed / 1 failed（flaky，非本提交）** | 唯一失败项 `post-load margin enforced`：**完全相同命令单独跑 PASS**（`[vram] check OK: 1369 MiB free >= 1200 MiB margin`），余量仅 **169 MiB** ⇒ 紧接着前一个测试进程的显存释放延迟就会把它翻成 WARNING；该用例 prompt 仅 22 token、`rows = max_seq = 22`，**本提交的 rows 重推导在此配置下不生效**。两次 suite 都失败、单独跑都通过 ⇒ 判为环境 flaky。**已修（`dcdf23a`）**：该断言改用 `has_retry()`——失败后等 2 s 重跑一次同一命令，**断言本身不放松**（仍要求 `check OK`），并在日志里标注 `(retry 1/1 due to VRAM release latency)` + 打印检查前的 GPU 显存与失败时的 `[vram]` 账本。重试逻辑已用 mock（fail-then-pass / fail-forever）离线验证。 |
 
 ### 5.4.1 `small batch / tail` 曲线：小 n 的成本结构（决定"tail 是否值得优化"）
 
