@@ -301,6 +301,8 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
                          reuse_pos < static_cast<int>(ids.size());
   int start_from = 0;
   bool cache_hit = false;
+  double restore_ms = 0.0, save_ms = 0.0, chunk_ms = 0.0, tail_ms = 0.0;
+  int chunk_tokens = 0;
   if (cacheable && st.pc.have_state &&
       st.pc.state_ids.size() <= static_cast<size_t>(reuse_pos)) {
     const int n = static_cast<int>(st.pc.state_ids.size());
@@ -308,7 +310,10 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
     while (lcp < n && ids[static_cast<size_t>(lcp)] == st.pc.state_ids[static_cast<size_t>(lcp)])
       ++lcp;
     if (lcp == n && n > 0) {
-      if (st.model->prefix_state_restore(0)) {
+      const auto t_r0 = Clock::now();
+      const bool restored = st.model->prefix_state_restore(0);
+      restore_ms = ms_since(t_r0);
+      if (restored) {
         start_from = n;
         cache_hit = true;
       } else {
@@ -329,11 +334,17 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
     //    prefill would for the same absolute positions.
     if (reuse_pos > start_from) {
       const std::vector<int> chunk(ids.begin() + start_from, ids.begin() + reuse_pos);
+      const auto t_c0 = Clock::now();
       model.forward(chunk, start_from, /*last_row_only=*/true);
+      chunk_ms = ms_since(t_c0);
+      chunk_tokens = static_cast<int>(chunk.size());
     }
     // 2) snapshot the recurrent state at the aligned cache point for the next turn.
     if (st.pc.enabled && gp.prefix_cache) {
-      if (model.prefix_state_save(0)) {
+      const auto t_s0 = Clock::now();
+      const bool saved = model.prefix_state_save(0);
+      save_ms = ms_since(t_s0);
+      if (saved) {
         st.pc.have_state = true;
         st.pc.state_ids.assign(ids.begin(), ids.begin() + reuse_pos);
       } else {
@@ -344,7 +355,9 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
     // 3) remainder (history tail + generation prompt): always prefilled; its last
     //    row is the logits.  Its chunks are the canonical ones as well.
     const std::vector<int> tail(ids.begin() + reuse_pos, ids.end());
+    const auto t_t0 = Clock::now();
     logits = model.forward(tail, reuse_pos, /*last_row_only=*/true);
+    tail_ms = ms_since(t_t0);
     out.cache_hit_tokens = start_from;
     out.prefilled_tokens = static_cast<int>(ids.size()) - start_from;
     st.pc.last_hit_tokens = start_from;
@@ -357,6 +370,14 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
     st.pc.prefilled_tokens += static_cast<uint64_t>(out.prefilled_tokens);
   }
   out.prefill_ms = ms_since(t_pre0);
+  static const bool pf_trace = std::getenv("ENGINE_SERVE_PREFILL_TRACE") != nullptr;
+  if (pf_trace)
+    std::fprintf(stderr,
+                 "[serve] prefill-trace: total=%.1f ms = restore=%.1f + save=%.1f + "
+                 "chunk=%.1f(%d tok) + tail=%.1f(%d tok) [cached=%d prefilled=%d]\n",
+                 out.prefill_ms, restore_ms, save_ms, chunk_ms, chunk_tokens, tail_ms,
+                 static_cast<int>(ids.size()) - reuse_pos, out.cache_hit_tokens,
+                 out.prefilled_tokens);
   const int vocab = model.vocab();
   if (static_cast<int>(logits.size()) < vocab)
     throw std::runtime_error("model returned fewer logits than the vocabulary");
@@ -2074,6 +2095,81 @@ int run(const Options& opts) {
                  "model vocabulary\n",
                  st.tk.vocab_size(), st.model->vocab());
   std::fflush(stdout);
+
+  // ---- post-load VRAM guard ------------------------------------------------
+  // The loader degrades (halves the prefill chunk) when free VRAM drops below the
+  // margin.  In the worst case the driver starts paging and decode collapses from
+  // ~25 tok/s to 3-4 tok/s, which is much worse than failing fast: refuse to start
+  // unless the operator explicitly allows oversubscription.
+  if (!engine::config::get_bool("allow_oversubscribe")) {
+    const size_t margin_bytes =
+        static_cast<size_t>(engine::config::get_int("vram_margin_mb")) << 20;
+    const cuda::MemInfo mem = cuda::mem_info();
+    if (mem.free_bytes < margin_bytes) {
+      std::fprintf(stderr,
+                   "[serve] ERROR: only %.0f MiB VRAM free after load, below the %zu MiB "
+                   "margin: the CUDA driver will page and decode can collapse to a few "
+                   "tok/s. Lower --ctx / --gpu-layers, free VRAM, or pass "
+                   "--allow-oversubscribe to start anyway.\n",
+                   static_cast<double>(mem.free_bytes) / 1048576.0, margin_bytes >> 20);
+      return 1;
+    }
+  }
+
+  // ---- post-load self-warmup -----------------------------------------------
+  // The first user request otherwise pays the lazy CUDA-graph captures (canonical
+  // prefill chunk + decode graph) plus the first-touch driver/page-in cost: measured
+  // as +4..23 s on request #1 (and every *new* tail token-count n used to pay its
+  // own prefill-graph capture - that part needs the runner-side bucket fix).
+  // Warm the canonical chunk and the decode graph once here, then reset the KV/SSM
+  // state so request #1 starts from a clean cache.  ENGINE_NO_PREWARM=1 disables.
+  if (std::getenv("ENGINE_NO_PREWARM") == nullptr) {
+    const int chunk = std::max(1, st.model->prefill_chunk());
+    std::string warm_text;
+    for (int i = 0; i < 48; ++i) warm_text += "你好，世界。";
+    const std::vector<int> warm_ids = st.tk.encode(warm_text, false, true);
+    // Best-effort only: a degraded placement (e.g. --vram-margin huge with
+    // --allow-oversubscribe) can shrink rows_/ctx to the point where the warmup
+    // does not fit; never let the warmup prevent the server from starting.
+    if (chunk < 16 || st.ctx < chunk + 16 ||
+        static_cast<int>(warm_ids.size()) < chunk + 8) {
+      std::printf("[serve] prewarm   : skipped (chunk=%d ctx=%d warm_tokens=%zu)\n", chunk,
+                  st.ctx, warm_ids.size());
+    } else {
+      // Save the clean (position 0) recurrent state first: reset_kv_and_states() is
+      // private to the runner, but the public prefix-state API covers exactly the
+      // part warmup would corrupt (SSM conv/rec).  KV rows written by the warmup are
+      // simply overwritten because request #1 always prefills from position 0.
+      const bool ssm_state = st.model->prefix_state_supported();
+      bool state_saved = false;
+      if (ssm_state)
+        state_saved = st.model->prefix_state_save(0);
+      if (ssm_state && !state_saved)
+        std::fprintf(stderr, "[serve] WARN: prewarm could not snapshot the clean state\n");
+      try {
+      const auto t_w0 = Clock::now();
+      const std::vector<int> head(warm_ids.begin(), warm_ids.begin() + chunk);
+      st.model->forward(head, 0, /*last_row_only=*/true);  // canonical prefill chunk
+      const double chunk_ms = ms_since(t_w0);
+      const auto t_t1 = Clock::now();
+      const std::vector<int> tail(warm_ids.begin() + chunk, warm_ids.begin() + chunk + 8);
+      st.model->forward(tail, chunk, /*last_row_only=*/true);  // small-tail bucket
+      const double tail_ms = ms_since(t_t1);
+      const auto t_d0 = Clock::now();
+      st.model->forward({warm_ids[0]}, chunk + 8, /*last_row_only=*/true);  // decode graph
+      const double dec_ms = ms_since(t_d0);
+      if (ssm_state) st.model->prefix_state_restore(0);
+      std::printf("[serve] prewarm   : %d-token prefill %.0f ms, 8-token tail %.0f ms, "
+                  "1-token decode %.0f ms (graphs captured, KV/SSM reset)\n",
+                  chunk, chunk_ms, tail_ms, dec_ms);
+      std::fflush(stdout);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "[serve] WARN: prewarm failed (%s); continuing without prewarm\n",
+                     e.what());
+      }
+    }
+  }
 
   http::Server server(opts.host, opts.port);
   server.set_handler([&st](const http::Request& req, http::Conn& conn) {

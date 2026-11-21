@@ -323,6 +323,37 @@ llama.cpp webui 默认发 `max_tokens:-1`。以前按 ctx 上限（4096）生成
 
 ---
 
+### 5.6 启动自检与 prefill 诊断（2026-11-21 新增）
+
+**加载后 VRAM 守卫（默认开）**：模型加载完成后若**剩余显存 < `vram_margin_mb`（默认 1200 MiB）**，
+serve 直接 `ERROR` 退出并提示 "the CUDA driver will page and decode can collapse to a few tok/s"，
+而不是 WARN + 降级 chunk 继续跑。原因是实测：显存超订时 WDDM 换页会把 decode 从 ~25 tok/s
+拖到 3–4 tok/s、长上下文请求从 0.65 s 拖到 22–43 s，比启动失败更难排查。
+確有需要（例如已知会换页但只想先起来）可加 `--allow-oversubscribe` 强制启动。
+> 注意这是**第二道防线**：`--vram-margin` 很大时 placement 规划阶段通常就会先拒绝
+> （`[placement] ERROR: model does not fit ...`），post-load guard 覆盖的是 placement 之后
+> 才增长的显存（graph 捕获/其它进程）。无论哪一道，都是"明确报错退出"而不是带病启动。
+日志：`[serve] ERROR: only N MiB VRAM free after load, below the M MiB margin: ...`。
+
+**装载后自预热（默认开）**：模型加载完成后先跑一次 128-token 哑 prefill + 8-token tail +
+1-token decode（捕获 canonical CUDA graph/首次触碰），再用 `prefix_state_save/restore`
+复位 SSM 状态，保证用户请求 #1 从干净缓存开始。`ENGINE_NO_PREWARM=1` 关闭。
+实测代价：启动约 +0.44 s；收益：冷启动首请求约 −0.5 s（**不是**冷启动的根治——
+首请求大头仍是首次触碰权重的 page-in）。
+
+**prefill 四段计时**：`ENGINE_SERVE_PREFILL_TRACE=1` 时每个请求在日志打一行：
+
+```
+[serve] prefill-trace: total=... ms = restore=... + save=... + chunk=...(N tok) + tail=...(M tok) [cached=X prefilled=Y]
+```
+
+用于区分"前缀缓存恢复/快照"与"实际 prefill 计算"的成本（实测 cache-hit 的
+restore=0.6 ms、save=0.6 ms；长上下文慢点定位见 `docs/reports/SERVE-PREFILL-CACHE.md`）。
+
+> 更正记录：2026-11-21 早前把 9.1k prompt 的 22–43 s 归因为"按 token 数懒捕获 CUDA graph"
+> 是**错误**的（`prefill_graph` 配置默认 false）；独占 GPU 复测该请求仅 **0.65 s**，
+> 旧数据被判定为跨进程显存超订/WDDM 换页污染，已撤回。
+
 ## 6. 已知限制（如实）
 
 1. **首字延迟仍受 prefill 速度限制（已大幅改善）**：35B 的 pp 仍是 48–55 tok/s 量级
