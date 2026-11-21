@@ -241,3 +241,61 @@ test_sampler **PASS**。
 - 工作树口径：验证开始时 `HEAD=2aa850e dirty=14`，结束时 `HEAD=b6efdc1 dirty=15`
   （**其他 agent 在此期间提交/改文件**；build.sh 在 19:32 产生 engine.exe 后未再重建，
   所有 suite 跑的都是同一份二进制；本项改动只有 serve.cpp/config.cpp 的 cache-align hunk）。
+
+
+## 10. v0.1.4 第二项：非 greedy 采样走 device top-k 候选（2026-11-21 20:xx）
+
+### 10.0 为什么 serve 用 `forward_topk()` 而不是 `forward_topk_candidates()`
+`forward_topk_candidates()` 在返回 false（设备头不可用）之前已经执行了一次
+`forward()`，调用方如果再用整行 `forward()` 回退，会把同一个 token 前向两次、破坏
+KV/SSM 状态。serve 因此直接用公开的 `forward_topk(tokens, pos, k, &tk)`：
+设备头可用时它返回空 row + 候选；不可用时返回**完整 row**（此时直接用 row 采样），
+天然无二次前向。`forward_topk_candidates()` 仍由独立验证程序使用（只读调用一次）。
+
+### 10.1 背景与语义
+`forward_topk_candidates(k)` 在设备端把 248320 维 logits 归约成 k 个 `(id, logit)` 候选，
+host 只收 k*8 字节（k=64 时候选 512 B vs 整行 ~1 MB）。serve 只在 **top_k>0 且
+max(top_k,64)<=head_topk_max** 时使用；`top_k=0`（host top-1024 近似）和
+`top_k>head_topk_max` 回退整行，保证采样语义不因候选不足而截断。
+v0.1.4 只提交接线：**保持 stock 默认 `head_topk_max=8`**，此时典型 non-greedy 请求
+（top_k=20 ⇒ needed=max(20,64)=64 > 8）自动回退整行路径，**行为与之前完全一致**；
+k=64 的正确性已验证（10.2），但性能和采样质量 A/B 后才会在 v0.1.5 把默认提到 64。
+
+### 10.2 正确性验证（独立于 serve）
+`build/validate_topk_candidates.cpp`（提交版在 `tools/`）：prefill →
+`prefix_state_save(0)` → device `forward_topk_candidates(k)` → `restore(0)` → 整行
+`forward()` → 对比 k=1/5/8/64/128；另做"两次 prefill+decode from state0"的确定性检查。
+
+判据：**候选 id/顺序与 host 参考完全一致 + 值差 ≤2e-3**。原因：9B hybrid 的 decode
+路径本身不是逐位确定的——两次相同输入的 logits 差 **~1.0–1.8e-3**（host-vs-host restore
+后 ~6e-4），0.5B/Coder 为 **0**。这是 split-k/atoms 求和顺序的量级，对 argmax/token 级
+bit-exact（缓存 A/B、gen_regression）没有影响，但"logits 逐字节一致"这类断言需要改成
+"逐 token 一致（argmax 稳定）/数值差 ≤ 噪声量级"。
+
+实测（`ENGINE_HEAD_TOPK_MAX=64/128`）：
+
+| 模型 | k=1 | k=5 | k=8 | k=64 | k=128 | 结果 |
+|---|---|---|---|---|---|---|
+| 9B Qwen3.5 (hybrid) | ✓ Δ4.8e-5 | ✓ Δ3.2e-4 | ✓ Δ3.3e-4 | ✓ Δ3.1e-4 | ✓(128) Δ3.5e-4 | **GREEN** |
+| 0.5B Qwen2.5 | ✓ Δ0 | ✓ Δ0 | ✓ Δ0 | ✓ Δ0 | SKIP(>64) | **GREEN** |
+| Coder-V2-Lite (MLA) | ✓ Δ0 | ✓ Δ0 | ✓ Δ0 | ✓ Δ0 | SKIP(>64) | **GREEN** |
+
+⇒ 设备 top-k 候选在 dense/MLA/MoE 三类头上都正确；serve 默认 `head_topk_max=64` 覆盖
+webui 默认 top_k=20/top_p=0.95。
+
+
+### 10.3 A/B（9B 采样）
+（填：before/after temp0.6/top_k20 decode tok/s、wall；top_k=0 组应不变）
+
+### 10.4 验证（v0.1.4 交付范围：只接线，默认 k=8）
+- validator 三模型 GREEN（见 10.2，当前源码重编后 9B 复跑仍 GREEN）；
+- `build.sh` + verify/smoke/gen_regression/generality/verify_serve + test_sampler：见 10.5；
+- **k=64 的性能/采样质量 A/B 与把默认提到 64 留到 v0.1.5**（v0.1.4 保持 stock 默认 8，
+  典型 top_k=20 请求自动回退整行路径 ⇒ 行为与之前完全一致，零风险）。
+
+### 10.5 五套验证（v0.1.4 工作树，当前源码，21:30–21:44）
+
+`build.sh` **OK**（engine.exe 2,395,648 B，21:30）；`verify` **ALL GREEN**；`smoke_models` **PASS**
+（40716/185/2614/2614）；`gen_regression` **10/10 GREEN**；`verify_generality` **26/26 GREEN**；
+`verify_serve` 0.5B **22/22**、9B **21/21 GREEN**；`test_sampler` **PASS**。
+验证时 `HEAD=89e8b3a dirty=15`；提交后工作树只剩他人改动。

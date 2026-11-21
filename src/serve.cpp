@@ -649,16 +649,51 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
         break;
       }
     } else {
-      auto row = model.forward({cur}, pos, /*last_row_only=*/true);
-      ++pos;
-      if (static_cast<int>(row.size()) < vocab) {
-        out.finish_reason = "error";
-        break;
+      // Prefer the device top-k head: only k candidate (id,logit) pairs cross PCIe
+      // instead of the full 248320-float row (1 MB D2H avoided).  Only used when the
+      // request needs no more candidates than the head produces
+      // (top_k>0 and max(top_k,64) <= head_topk_max); top_k=0 keeps the host
+      // top-1024 path.  Anything unexpected falls back to the full logits row.
+      static const int dev_cand_k = []() {
+        int k = static_cast<int>(engine::config::get_int("head_topk_max"));
+        if (k < 2) k = 64;
+        if (k > 128) k = 128;
+        return k;
+      }();
+      const int needed = gp.top_k > 0 ? std::max(gp.top_k, 64) : 0;
+      if (needed > 0 && needed <= dev_cand_k) {
+        // forward_topk() returns {} + candidates when the device head is active, or the
+        // full row when it is not.  Doing the fallback from its return value avoids a
+        // second forward() (forward_topk_candidates() runs the pipeline before it can
+        // report "unavailable", so calling it and then forward() again would process the
+        // same token twice and corrupt the KV/SSM state).
+        runner::DenseRunner::TopKResult tk;
+        auto row = model.forward_topk({cur}, pos, dev_cand_k, &tk);
+        ++pos;
+        if (row.empty() && static_cast<int>(tk.idx.size()) >= std::max(1, gp.top_k)) {
+          next = sampler.sample_external(tk.idx, tk.val, context, vocab);
+        } else if (!row.empty()) {
+          if (static_cast<int>(row.size()) < vocab) {
+            out.finish_reason = "error";
+            break;
+          }
+          next = sampler.sample_bounded(row, context);
+        } else {
+          out.finish_reason = "error";
+          break;
+        }
+      } else {
+        auto row = model.forward({cur}, pos, /*last_row_only=*/true);
+        ++pos;
+        if (static_cast<int>(row.size()) < vocab) {
+          out.finish_reason = "error";
+          break;
+        }
+        // sample directly from the moved-in row: no second 1 MB copy, and the
+        // candidate set is selected inside the sampler (top_k>0: exact top-k;
+        // top_k=0: top-1024 approximation, see /props.sampling and docs/CONFIG.md).
+        next = sampler.sample_bounded(row, context);
       }
-      // sample directly from the moved-in row: no second 1 MB copy, and the
-      // candidate set is selected inside the sampler (top_k>0: exact top-k;
-      // top_k=0: top-1024 approximation, see /props.sampling and docs/CONFIG.md).
-      next = sampler.sample_bounded(row, context);
     }
   }
   if (spec_active) model.spec_end();
@@ -1020,6 +1055,16 @@ void handle_props(const ServerState& st, http::Conn& conn) {
   w.str("approx-top-1024");
   w.key("greedy");
   w.str("exact argmax over the full vocabulary (unchanged)");
+  w.key("device_candidates");
+  w.begin_obj();
+  w.key("enabled");
+  w.boolean(engine::config::get_bool("head_topk") &&
+            engine::config::get_int("head_topk_max") >= 2);
+  w.key("k");
+  w.integer(static_cast<int>(engine::config::get_int("head_topk_max")));
+  w.key("scope");
+  w.str("non-greedy requests with top_k>0 and max(top_k,64)<=k; full-row fallback otherwise");
+  w.end_obj();
   w.key("notes");
   w.str("non-greedy: repetition penalty/top_k/top_p/min_p/temperature are evaluated on "
         "the candidate set; top_p/min_p probabilities are renormalised over it; with "

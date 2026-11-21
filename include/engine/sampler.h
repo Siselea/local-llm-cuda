@@ -74,6 +74,13 @@ class Sampler {
   // The logits vector is not modified.  `logits.size()` must equal the vocabulary.
   int sample_bounded(const std::vector<float>& logits, const std::vector<int>& recent_ids);
 
+  // Device-top-k entry point: the caller already has the candidate ids and their raw
+  // logits (e.g. runner::forward_topk_candidates).  Runs the same chain as
+  // sample_bounded() on that set; `vocab` is only needed for penalty bookkeeping.
+  // Returns -1 for an empty set.
+  int sample_external(const std::vector<int>& ids, const std::vector<float>& logits,
+                      const std::vector<int>& recent_ids, int vocab);
+
   // Candidate-set cap for the top_k == 0 path (clamped to [64, 1'000'000]).
   void set_candidate_cap(int cap);
   int candidate_cap() const { return candidate_cap_; }
@@ -95,6 +102,10 @@ class Sampler {
 
   // Build the candidate id list for sample_bounded() (host selection).
   void select_candidates(const std::vector<float>& logits);
+  // Shared sampler chain over cand_/cand_val_ after candidate selection + penalty.
+  // `fallback_logits` (optional) is the full row used for the degenerate-sum argmax.
+  int sample_chain(const std::vector<float>* fallback_logits, int fallback_vocab);
+
   // Apply repetition penalty to cand_val_ (candidate logits) in place.
   void penalise_candidates(const std::vector<int>& recent_ids, int vocab);
 

@@ -321,6 +321,16 @@ llama.cpp webui 默认发 `max_tokens:-1`。以前按 ctx 上限（4096）生成
   前 64 的 token 才会引入顺序差异（概率可忽略）。单测 `tests/test_sampler.cpp` 覆盖
   greedy 一致、top_k 精确、top_k=0 截断（对比整词表实现）、penalty、外部候选、可复现性。
 
+**device top-k 候选（2026-11-21 新增，v0.1.4 仅接线）**：解码头可在设备端直接产出 top-k
+候选（`head_topk_max`，**stock 默认 8**；v0.1.5 会用 A/B 后把它默认提到 64），非 greedy 请求在
+`top_k>0 && max(top_k,64) <= head_topk_max` 时只把候选 `(id, logit)` 拷回 host
+（省掉整行 248320×4 B ≈1 MB D2H + host 扫描），其余请求（`top_k=0`、`top_k>64`、
+设备头不可用）**自动回退整行路径**。`/props.sampling.device_candidates` 暴露
+`{enabled,k,scope}`。正确性判据：候选 id/顺序与 host 参考完全一致、值差 ≤ 解码路径本身的
+调用间数值噪声（实测 host-vs-host max|diff| ~7.6e-4，split-k/atomics 求和顺序）；
+独立验证 `build/validate_topk_candidates.cpp`（先 prefill、save/restore SSM、再 device vs
+full-row 对比，不依赖 serve）。
+
 **webui 实际参数（证据）**：bundle 里请求体默认
 `temperature:0.6, top_k:20, top_p:.95, min_p:0`（`getConfig()` 还会把 llama.cpp 旧默认
 `0.8/40/0.95/0.05` 一次性迁移到 `0.6/20/0.95/0`）——所以 webui 主路径是 `top_k=20`

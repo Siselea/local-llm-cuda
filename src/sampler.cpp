@@ -352,6 +352,10 @@ int Sampler::sample_bounded(const std::vector<float>& logits,
   if (cand_.empty()) return argmax(logits);
   penalise_candidates(recent_ids, vocab);
 
+  return sample_chain(&logits, vocab);
+}
+
+int Sampler::sample_chain(const std::vector<float>* fallback_logits, int fallback_vocab) {
   // ---- 1) top_k: keep at most k candidates (candidate list is already bounded) ----
   const int k = params_.top_k;
   if (k > 0 && k < static_cast<int>(cand_.size())) {
@@ -442,7 +446,16 @@ int Sampler::sample_bounded(const std::vector<float>& logits,
     scores_[i] = static_cast<float>(v);
     sum += v;
   }
-  if (!(sum > 0.0)) return argmax(logits);
+  if (!(sum > 0.0)) {
+    if (!fallback_logits) {
+      int best = 0;
+      for (size_t i = 1; i < cand_val_.size(); ++i)
+        if (cand_val_[i] > cand_val_[static_cast<size_t>(best)]) best = static_cast<int>(i);
+      return cand_.empty() ? -1 : cand_[static_cast<size_t>(best)];
+    }
+    (void)fallback_vocab;
+    return argmax(*fallback_logits);
+  }
   double u = rng_.uniform() * sum;
   for (size_t i = 0; i < cand_.size(); ++i) {
     u -= scores_[i];
@@ -451,5 +464,14 @@ int Sampler::sample_bounded(const std::vector<float>& logits,
   return cand_.back();
 }
 
+int Sampler::sample_external(const std::vector<int>& ids,
+                             const std::vector<float>& logits,
+                             const std::vector<int>& recent_ids, int vocab) {
+  if (ids.empty() || ids.size() != logits.size() || vocab <= 0) return -1;
+  cand_ = ids;
+  cand_val_ = logits;
+  penalise_candidates(recent_ids, vocab);
+  return sample_chain(nullptr, vocab);
+}
 }  // namespace sampler
 }  // namespace engine
