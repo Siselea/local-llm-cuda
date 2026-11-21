@@ -558,6 +558,31 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   if (!lm_head_qt_.valid) w_lm_ = upload(lm_head_f32());
   (void)0;
 
+  // Re-derive the prefill chunk from the ACTUAL free VRAM: the weights and the KV
+  // cache are resident by now, so this check cannot be fooled by the optimistic
+  // pre-load estimate (which ignored cuBLAS workspaces / context / fragmentation) nor
+  // by another process sharing the GPU.  The old order allocated the activation
+  // buffers first and only then printed "Prefill chunk halved" -- by which time the
+  // device was already over-committed and the driver started paging (measured: the
+  // first prefill of such a process ran 12x slow).
+  {
+    const size_t free_now = cuda::mem_info().free_bytes;
+    const size_t need_margin = vram_margin_bytes_ + (64ull << 20);
+    const int want_rows = static_cast<int>(rows_);
+    while (rows_ > 32 && free_now < activation_bytes(static_cast<int>(rows_)) + need_margin)
+      rows_ >>= 1;
+    const int grow_cap = static_cast<int>(engine::config::get_int("prefill_rows_max"));
+    while (rows_ < static_cast<size_t>(max_seq_) && static_cast<int>(rows_) < grow_cap &&
+           free_now >= activation_bytes(static_cast<int>(rows_ * 2)) + need_margin)
+      rows_ *= 2;
+    if (static_cast<int>(rows_) != want_rows)
+      std::fprintf(stderr,
+                   "[ctx] prefill chunk %d -> %zu rows by actual free VRAM (free=%.0f MiB "
+                   "after weights+KV, act(%zu)=%.0f MiB, margin=%.0f MiB)\n",
+                   want_rows, rows_, free_now / 1048576.0, rows_,
+                   activation_bytes(static_cast<int>(rows_)) / 1048576.0,
+                   need_margin / 1048576.0);
+  }
   // Activation rows are capped at the prefill chunk size (rows_) instead of the KV
   // length: at --ctx 131072 the historical `rows = max_seq_` sizing asked for
   // logits_ = max_seq*vocab*4 = 130 TB.  forward() prefills the prompt in chunks of

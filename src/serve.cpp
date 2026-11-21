@@ -1978,11 +1978,20 @@ int run(const Options& opts) {
   // fine (a turn only re-prefills the new tokens + <128 history tokens) while both
   // the cached and the full-prefill path still use identical absolute chunk
   // boundaries (bit-exact).  Explicit --prefill-rows / ENGINE_PREFILL_ROWS wins.
+  // Serve default prefill chunk: 512 tokens (was 128).  128 keeps the prefix-cache
+  // snapshot granularity fine, but it costs every prefill a full-model dequant pass and
+  // a fixed per-chunk overhead: measured on the 9B (exclusive GPU, prefix cache off),
+  // a 2.4-3.6k prompt runs 592 tok/s at 128 vs 1023-1103 tok/s at 512, and an 11-13k
+  // prompt 454 vs 750 tok/s.  A 512-token boundary means a multi-turn request may
+  // re-prefill up to 511 extra history tokens (~0.5 s at 1k tok/s); the exact value can
+  // still be overridden with --prefill-rows.  1024 is the growth cap so long documents
+  // can use the largest chunk the VRAM budget allows (the loader re-derives rows from
+  // the actual free VRAM before allocating activations).
   if (!engine::config::was_set("prefill_rows")) {
     std::string perr;
-    engine::config::Config::get().set("prefill_rows", "128", engine::config::Source::Cli, &perr);
+    engine::config::Config::get().set("prefill_rows", "512", engine::config::Source::Cli, &perr);
     if (!engine::config::was_set("prefill_rows_max"))
-      engine::config::Config::get().set("prefill_rows_max", "128",
+      engine::config::Config::get().set("prefill_rows_max", "1024",
                                         engine::config::Source::Cli, &perr);
   }
   st.pc.enabled = engine::config::get_bool("serve_prefix_cache");
@@ -2023,11 +2032,19 @@ int run(const Options& opts) {
     std::fprintf(stderr, "[serve] hint: try a smaller --ctx (e.g. --ctx 2048)\n");
     return 1;
   }
-  if (opts.ctx <= 0) {
-    // ctx 0 = auto: the loader derived the largest length that fits.  Report the
-    // real value so /props, the request limit checks and the startup line agree.
-    st.ctx = st.model->ctx();
-    std::printf("[serve] auto ctx   : %d tokens (derived from free VRAM)\n", st.ctx);
+  {
+    // The loader may clamp the requested ctx (ctx_auto, kv_type budget) or reduce it
+    // while fitting the prefill chunk.  Always take the REAL ctx from the model: the
+    // prompt-length checks must reject an over-long prompt with 400 instead of letting
+    // forward() throw "bad token count" (observed as HTTP 500 for an 11k prompt when
+    // ctx 32768 had been clamped to 8053).
+    const int real_ctx = st.model->ctx();
+    if (real_ctx != st.ctx)
+      std::printf("[serve] ctx clamp  : requested %d -> %d tokens (VRAM budget)\n", st.ctx,
+                  real_ctx);
+    st.ctx = real_ctx;
+    if (opts.ctx <= 0)
+      std::printf("[serve] auto ctx   : %d tokens (derived from free VRAM)\n", st.ctx);
   }
   const double load_ms = ms_since(t_load0);
   std::printf("[serve] model ready: vocab=%d ctx=%d load=%.1f s\n", st.model->vocab(), st.ctx,
