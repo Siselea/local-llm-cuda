@@ -104,6 +104,11 @@ const OptionDef kDefs[] = {
      "(ENGINE_CPU_LAYER_GRAPH opts in; measured neutral-to-negative on this VM)"},
     {"mla_no_graph", "ENGINE_MLA_NO_GRAPH", "mla-no-graph", false, false, Type::Bool, "false",
      0, 0, "disable CUDA Graph for MLA models (default keeps the historical rule)"},
+    {"mla_attn_graph", "ENGINE_NO_MLA_ATTN_GRAPH", "no-mla-attn-graph", false, true, Type::Bool,
+     "true", 0, 0,
+     "per-layer CUDA graph for the deepseek2 MLA attention segment (ln1 norm + attention "
+     "+ ln2 norm) on decode; measured 18 WDDM submissions per layer collapse into one "
+     "cuGraphLaunch (~10 us on this host vs ~180 us for the 18 bare launches)"},
     {"prefill_f32", "ENGINE_PREFILL_F32", "prefill-f32", false, false, Type::Bool, "true",
      0, 0, "keep f32 weight mirrors for batched prefill (auto-disabled on MoE / low VRAM)"},
     // ---------------- KV cache precision / long context ----------------

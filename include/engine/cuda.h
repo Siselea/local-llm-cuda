@@ -141,6 +141,10 @@ class Graph {
   Graph& operator=(const Graph&) = delete;
   void capture_begin();
   void capture_end();
+  // Abandon an in-progress recording so the stream is usable again after a failed
+  // capture (an exception thrown inside the recorded sequence would otherwise leave
+  // the stream in capture mode).  A no-op when the stream is not capturing.
+  void capture_abort();
   void launch();
   bool ready() const { return exec_ != nullptr; }
 

@@ -1674,32 +1674,19 @@ void DenseRunner::run_layer_body(int layer, int n_tokens, int start_pos) {
     }
   };
   tick();
-  rms(x_, L.ln1, hn_);
-  if (layer == 0) {
-    if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
-      cuda::stream_sync();
-      std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
-      hn_.download(h.data(), h.size() * 4);
-      std::ofstream f(std::string(dp) + "_hn0.f32", std::ios::binary);
-      f.write(reinterpret_cast<const char*>(h.data()), static_cast<std::streamsize>(h.size() * 4));
-    }
-  }
   if (L.is_mla) {
-    if (ENGINE_ENV_ON("ENGINE_PROFILE") && layer < 3 && n_tokens == 1) {
-      cuda::sync();
-      const auto t0 = std::chrono::steady_clock::now();
-      run_mla_attention(layer, n_tokens, start_pos);
-      cuda::sync();
-      std::fprintf(stderr, "[attn-prof] layer %d mla %.2f ms\n", layer,
-                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                       .count());
+    // MLA attention segment = ln1 norm + attention + ln2 norm.  Decode records it as a
+    // single per-layer CUDA graph (see run_mla_attn_graph): the whole segment is
+    // GEMV/small-kernel only (matvec_f32 falls back to the gemv_f32 kernel for
+    // n_tokens <= 4), so ~13 WDDM submissions become one cuGraphLaunch.  Coder is a MoE
+    // model, so the whole-pipeline graph is disabled and this is its only graph
+    // coverage.  Prefill and the diagnostic switches keep the plain sequence.
+    if (mla_attn_graph_ && !no_graph_cfg_ && n_tokens == 1 && !graph_capture_ &&
+        mla_attn_graph_ok(layer)) {
+      run_mla_attn_graph(layer);
     } else {
-      const auto mp0 = std::chrono::steady_clock::now();
-      run_mla_attention(layer, n_tokens, start_pos);
-      g_prof_mla_ms +=
-          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mp0).count();
+      mla_attn_segment(layer, n_tokens, start_pos);
     }
-    rms(x_, L.ln2, hn_);
     if (L.is_moe) {
       const auto ep0 = std::chrono::steady_clock::now();
       run_moe(layer, n_tokens);
@@ -1735,6 +1722,17 @@ void DenseRunner::run_layer_body(int layer, int n_tokens, int start_pos) {
     }
     add(x_, down_, static_cast<long long>(n_tokens) * hidden_);
     return;
+  }
+  rms(x_, L.ln1, hn_);
+  if (layer == 0) {
+    if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
+      cuda::stream_sync();
+      std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
+      hn_.download(h.data(), h.size() * 4);
+      std::ofstream f(std::string(dp) + "_hn0.f32", std::ios::binary);
+      f.write(reinterpret_cast<const char*>(h.data()),
+              static_cast<std::streamsize>(h.size() * 4));
+    }
   }
   const bool batch_f32 = L.has_f32 && n_tokens > 1;
   if (L.is_quant && !batch_f32) {
@@ -2689,8 +2687,17 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   // cuMemcpyHtoD calls are synchronous and on WDDM they flush the queue, so issuing
   // them for every CPU layer cost a hidden wait per layer.
   if (!all_idx.empty() && gpu_n > 0) {
-    d_idx_.upload(all_idx.data(), all_idx.size() * 4);
-    d_w_.upload(all_w.data(), all_w.size() * 4);
+    // Pinned staging + async copies: a synchronous cuMemcpyHtoD flushes the WDDM queue,
+    // which cost two queue flushes per host-routed GPU layer (Coder).  The staging
+    // buffers are members and are only rewritten by the next run_moe call, which is
+    // always preceded by a stream sync, so the async source stays valid.
+    const size_t route_bytes = all_idx.size() * 4;
+    d_idx_pin_.resize(route_bytes);
+    d_w_pin_.resize(route_bytes);
+    std::memcpy(d_idx_pin_.data(), all_idx.data(), route_bytes);
+    std::memcpy(d_w_pin_.data(), all_w.data(), route_bytes);
+    d_idx_.upload_async(d_idx_pin_.data(), route_bytes);
+    d_w_.upload_async(d_w_pin_.data(), route_bytes);
   }
   const int* d_idx_base = static_cast<const int*>(d_idx_.data());
   const float* d_w_base = static_cast<const float*>(d_w_.data());
@@ -4015,6 +4022,8 @@ void DenseRunner::load_config_snapshot() {
   prefill_f16_acc_ = cfg.get_bool("prefill_f16_acc");
   prefill_graph_ = cfg.get_bool("prefill_graph");
   layer_graph_ = cfg.get_bool("layer_graph");
+  mla_attn_graph_ = cfg.get_bool("mla_attn_graph");
+  no_graph_cfg_ = cfg.get_bool("no_graph");
   layer_graph_auto_ = cfg.get_bool("layer_graph_auto");
   no_bm_ = cfg.get_bool("no_bm");
   no_shared_ = cfg.get_bool("no_shared");
@@ -4234,6 +4243,115 @@ void DenseRunner::apply_auto_vram_layers() {
                  static_cast<long long>(vram_margin_floor_bytes_ >> 20), promoted,
                  promoted == 1 ? "" : "s");
   }
+}
+
+// ---- deepseek2 MLA: per-layer CUDA graph for the decode attention segment --------
+// The segment is kernel-only on decode: the four projections use the quantized GEMV
+// path (L.mla_quant) and the fp32 k/v expansion calls matvec_f32_ptr, which selects the
+// gemv_f32 *kernel* for n_tokens <= 4 (cuBLAS is only used for batched prefill).  It can
+// therefore be recorded exactly like the qwen35 mixer graphs, replacing ~13 WDDM
+// submissions per layer with one cuGraphLaunch.  This is Coder's only graph coverage:
+// it is a MoE model, so the whole-pipeline graph stays disabled.
+bool DenseRunner::mla_attn_graph_ok(int layer) const {
+  const auto& L = layers_[layer];
+  if (!L.is_mla) return false;
+  // f32 mirrors go through cuBLAS even on decode -> not capturable.
+  if (!L.mla_quant) return false;
+  // The "global" q layout keeps a cuBLAS q projection.  The global/perhead k-v split
+  // layouts are all GEMV + launch kernels, so both are fine.
+  if (mla_q_global_) return false;
+  // Diagnostics take host synchronisations inside the segment (and the dump code cannot
+  // run during capture), so they fall back to the plain path.
+  // ENGINE_PIPE_PROF is allowed: it only prints the launch counter between pipeline
+  // calls (outside the captured segment), so the graph can stay on and the counter
+  // difference shows the launch-count reduction.  The dump/profiling switches do
+  // synchronise inside the segment and KPROF's events would become graph nodes, so
+  // those keep the plain path.
+  if (ENGINE_ENV_ON("ENGINE_DUMP") || ENGINE_ENV_ON("ENGINE_DUMP_MLA") ||
+      ENGINE_ENV_ON("ENGINE_PROFILE") || ENGINE_ENV_ON("ENGINE_KPROF"))
+    return false;
+  return true;
+}
+
+// Plain sequence: ln1 norm -> MLA attention (which also adds the output projection into
+// x_) -> ln2 norm.  Used by prefill and whenever the graph path is disabled.
+void DenseRunner::mla_attn_segment(int layer, int n_tokens, int start_pos) {
+  auto& L = layers_[layer];
+  rms_raw(x_.data(), L.ln1.data(), hn_.data(), n_tokens, hidden_);
+  if (layer == 0) {
+    if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
+      cuda::stream_sync();
+      std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
+      hn_.download(h.data(), h.size() * 4);
+      std::ofstream f(std::string(dp) + "_hn0.f32", std::ios::binary);
+      f.write(reinterpret_cast<const char*>(h.data()),
+              static_cast<std::streamsize>(h.size() * 4));
+    }
+  }
+  if (ENGINE_ENV_ON("ENGINE_PROFILE") && layer < 3 && n_tokens == 1) {
+    cuda::sync();
+    const auto t0 = std::chrono::steady_clock::now();
+    run_mla_attention(layer, n_tokens, start_pos);
+    cuda::sync();
+    std::fprintf(stderr, "[attn-prof] layer %d mla %.2f ms\n", layer,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                     .count());
+  } else {
+    const auto mp0 = std::chrono::steady_clock::now();
+    run_mla_attention(layer, n_tokens, start_pos);
+    g_prof_mla_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mp0).count();
+  }
+  rms_raw(x_.data(), L.ln2.data(), hn_.data(), n_tokens, hidden_);
+}
+
+// Record the segment without executing it.  The caller runs the plain sequence for the
+// current token first, so recording cannot change the state it captures.
+void DenseRunner::capture_mla_attn_graph(int layer) {
+  auto& L = layers_[layer];
+  cuda::stream_sync();
+  auto g = std::make_unique<cuda::Graph>();
+  const long long cap_c0 = cuda::g_launch_calls;
+  try {
+    g->capture_begin();
+    graph_capture_ = true;
+    mla_attn_segment(layer, 1, 0);
+    graph_capture_ = false;
+    g->capture_end();
+    if (ENGINE_ENV_ON("ENGINE_DBG_MLA_CAP"))
+      std::fprintf(stderr, "[mla-cap] layer %d recorded %lld launches\n", layer,
+                   cuda::g_launch_calls - cap_c0);
+  } catch (const std::exception& e) {
+    graph_capture_ = false;
+    g->capture_abort();
+    // Never retry in this process: a half-recorded stream would poison later work.
+    mla_attn_graph_ = false;
+    std::fprintf(stderr, "[mla-graph] disabled: %s\n", e.what());
+    return;
+  }
+  // Recording never executed the kernels, and replay does not advance
+  // cuda::g_launch_calls; docs/GRAPH-INVARIANTS.md invariant 1 keeps the int8 staging
+  // cache honest via cuda::g_graph_launches, so no manual cache reset is needed here.
+  L.mla_attn_graph = std::move(g);
+  L.mla_attn_graph_state = 2;
+  if (ENGINE_ENV_ON("ENGINE_DBG_GRAPH"))
+    std::fprintf(stderr, "[graph] layer %d mla attention captured\n", layer);
+}
+
+// Replay the layer's attention segment, or execute it once and record it.
+void DenseRunner::run_mla_attn_graph(int layer) {
+  auto& L = layers_[layer];
+  if (L.mla_attn_graph_state == 2 && L.mla_attn_graph) {
+    static int replay_dbg = 0;
+    if (ENGINE_ENV_ON("ENGINE_DBG_MLA_CAP") && replay_dbg++ < 6)
+      std::fprintf(stderr, "[mla-cap] replay layer %d\n", layer);
+    // Replay executes the recorded kernels without advancing cuda::g_launch_calls; the
+    // quant_reuse_ cache is kept honest by cuda::g_graph_launches (invariant 1).
+    L.mla_attn_graph->launch();
+    return;
+  }
+  mla_attn_segment(layer, 1, 0);
+  capture_mla_attn_graph(layer);
 }
 
 void DenseRunner::run_mla_attention(int layer, int n_tokens, int start_pos) {

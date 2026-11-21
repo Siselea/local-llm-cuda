@@ -227,6 +227,11 @@ class DenseRunner {
     std::unique_ptr<cuda::Graph> attn_graph[3];
     int attn_graph_state[3] = {0, 0, 0};   // 0 = run normally, 1 = capture pending, 2 = replay
     int attn_graph_bucket = 0;
+    // deepseek2 MLA: the decode attention segment (ln1 norm + attention + ln2 norm) as
+    // one per-layer CUDA graph.  Valid only when the MLA projections are all quantized
+    // (matmul GEMV path) and the q layout is not the cuBLAS "global" variant.
+    std::unique_ptr<cuda::Graph> mla_attn_graph;
+    int mla_attn_graph_state = 0;   // 0 = execute + record on the first decode call, 2 = replay
   };
 
   // ---- MTP / speculative decoding internals --------------------------------
@@ -267,6 +272,10 @@ class DenseRunner {
   void run_layer(int layer, int n_tokens, int start_pos);
   void run_layer_body(int layer, int n_tokens, int start_pos);
   cuda::PinnedBuffer hn_pin_, xout_pin_, rl_pin_, logits_pin_;
+  // pinned staging for the per-layer MoE routing tables (d_idx_/d_w_ are uploaded
+  // asynchronously from here; a synchronous cuMemcpyHtoD flushed the WDDM queue once
+  // per host-routed GPU layer)
+  cuda::PinnedBuffer d_idx_pin_, d_w_pin_;
   cuda::Buffer moe_host_part_;
   void start_clock_warmer();
   void stop_clock_warmer();
@@ -345,6 +354,12 @@ class DenseRunner {
   void run_gemv_plan(const GemvChoice& c, const QTensor& w, cuda::Buffer& in,
                      cuda::Buffer& out);
   void run_mla_attention(int layer, int n_tokens, int start_pos);
+  // ln1 norm + MLA attention + ln2 norm for one layer; split out so the decode path can
+  // record it as a per-layer CUDA graph (see the three helpers below).
+  void mla_attn_segment(int layer, int n_tokens, int start_pos);
+  bool mla_attn_graph_ok(int layer) const;
+  void run_mla_attn_graph(int layer);
+  void capture_mla_attn_graph(int layer);
   void run_pipeline(int n_tokens, int start_pos, bool last_row_only = false);
   // qwen35 hybrid stack
   void load_q35_linear(int i, LayerW& w);
@@ -460,6 +475,8 @@ class DenseRunner {
   bool vram_extend_ = true;    // config: measured VRAM check may extend GPU residency
   bool q35_cpu_layer_graph_ = true;  // per-layer CUDA graph for CPU-placed qwen35 MoE layers
   bool head_topk_ = true;      // config: reduce logits on the device for decode
+  bool mla_attn_graph_ = true; // config: per-layer CUDA graph for the MLA attention segment
+  bool no_graph_cfg_ = false;  // config: --no-graph disables every capture path
   bool rms4_ = true;           // config: vectorised rmsnorm kernel
   // impl of forward()/forward_topk(); topk_k > 0 selects the device top-k head
   std::vector<float> forward_impl(const std::vector<int>& tokens, int start_pos,

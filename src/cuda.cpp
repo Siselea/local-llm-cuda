@@ -560,6 +560,12 @@ void Graph::capture_end() {
   check(g_driver.StreamEndCapture(g_stream, &graph_), "cuStreamEndCapture");
   check(g_driver.GraphInstantiate(&exec_, graph_, 0), "cuGraphInstantiate");
 }
+void Graph::capture_abort() {
+  if (!g_driver.StreamEndCapture || !g_stream) return;
+  void* g = nullptr;
+  if (g_driver.StreamEndCapture(g_stream, &g) == CUDA_SUCCESS && g && g_driver.GraphDestroy)
+    g_driver.GraphDestroy(g);
+}
 void Graph::launch() {
   check(g_driver.GraphLaunch(exec_, g_stream), "cuGraphLaunch");
   ++g_graph_launches;
