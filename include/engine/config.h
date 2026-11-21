@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -146,3 +147,17 @@ void apply_win_priority();
 
 }  // namespace config
 }  // namespace engine
+
+// ---------------------------------------------------------------------------
+// Cached environment lookups for decode hot paths.
+// std::getenv() measures 2.13 us/call on this host (the CRT walks the whole environment
+// block) and the decode path evaluated ~30 of them per layer => >2 ms/token.  The
+// environment cannot change after start-up, so each call site caches its own answer on
+// first use.  Values are identical to the uncached ones (bit-exact behaviour); plain
+// getenv() is still fine for load-time / one-shot diagnostics.
+#ifndef ENGINE_ENV_ON
+#define ENGINE_ENV_ON(name) \
+  ([]() -> bool { static const bool v = std::getenv(name) != nullptr; return v; }())
+#define ENGINE_ENV_STR(name) \
+  ([]() -> const char* { static const char* const v = std::getenv(name); return v; }())
+#endif

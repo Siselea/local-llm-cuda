@@ -280,7 +280,7 @@ void DenseRunner::run_ffn(int layer, int n_tokens) {
   auto& L = layers_[layer];
   rms_buf(x_, L.ln2, hn_, n_tokens, hidden_);
   if (layer == 0 && std::getenv("ENGINE_DUMP") && std::getenv("ENGINE_DUMP_Q35")) {
-    const char* dp = std::getenv("ENGINE_DUMP");
+    const char* dp = ENGINE_ENV_STR("ENGINE_DUMP");
     cuda::stream_sync();
     std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
     hn_.download(h.data(), h.size() * 4);
@@ -320,7 +320,7 @@ void DenseRunner::run_q35_linear_attn(int layer, int n_tokens, int start_pos) {
   const bool kDbg = debug_;
   auto dump = [&](cuda::Buffer& buf, const char* tag, int rows) {
     if (layer != 0 || graph_capture_) return;
-    const char* dp = std::getenv("ENGINE_DUMP");
+    const char* dp = ENGINE_ENV_STR("ENGINE_DUMP");
     if (!dp) return;
     cuda::stream_sync();
     std::vector<float> h(static_cast<size_t>(rows) * hidden_);
@@ -354,9 +354,9 @@ void DenseRunner::run_q35_linear_attn(int layer, int n_tokens, int start_pos) {
   // why the single-token smoke tests stayed green while real text collapsed.
   // ENGINE_Q35_RAW_A / ENGINE_Q35_LOG_A / ENGINE_Q35_HF_BCAST override for A/B.
   const bool gguf_sem = container_ == Container::Gguf;
-  static const bool force_log_a = std::getenv("ENGINE_Q35_LOG_A") != nullptr;
-  static const bool force_raw_a = std::getenv("ENGINE_Q35_RAW_A") != nullptr;
-  static const bool force_hf_bcast = std::getenv("ENGINE_Q35_HF_BCAST") != nullptr;
+  static const bool force_log_a = ENGINE_ENV_ON("ENGINE_Q35_LOG_A");
+  static const bool force_raw_a = ENGINE_ENV_ON("ENGINE_Q35_RAW_A");
+  static const bool force_hf_bcast = ENGINE_ENV_ON("ENGINE_Q35_HF_BCAST");
   const bool raw_a = force_raw_a || (gguf_sem && !force_log_a);
   const int kh_mode = (!force_hf_bcast && gguf_sem) ? 1 : 0;
   long long hsz = static_cast<long long>(n_tokens) * hidden_;
@@ -373,8 +373,8 @@ void DenseRunner::run_q35_linear_attn(int layer, int n_tokens, int start_pos) {
   const bool fused_ssm = ssm_fuse_ && gd_delta_128_ && n_tokens == 1 && k_gdprep_ &&
                          k_gddelta128f_ && KD == 128 && VD == 128;
   // bisection aids for A/B on the two halves of the fused chain
-  static const bool prep_only = std::getenv("ENGINE_SSM_PREP_ONLY") != nullptr;
-  static const bool delta_only = std::getenv("ENGINE_SSM_DELTA_ONLY") != nullptr;
+  static const bool prep_only = ENGINE_ENV_ON("ENGINE_SSM_PREP_ONLY");
+  static const bool delta_only = ENGINE_ENV_ON("ENGINE_SSM_DELTA_ONLY");
   const bool fused_prep = fused_ssm && !delta_only;
   const bool fused_delta = fused_ssm && !prep_only;
   if (fused_prep) {
@@ -429,7 +429,7 @@ void DenseRunner::run_q35_linear_attn(int layer, int n_tokens, int start_pos) {
   }
   }  // !fused_prep
   if (layer == 0 && std::getenv("ENGINE_DUMP_Q35") && std::getenv("ENGINE_DUMP")) {
-    const char* dp = std::getenv("ENGINE_DUMP");
+    const char* dp = ENGINE_ENV_STR("ENGINE_DUMP");
     cuda::stream_sync();
     auto dump_t = [&](cuda::Buffer& buf, const char* tag, int rows, int cols) {
       std::vector<float> h(static_cast<size_t>(rows) * cols);
@@ -572,7 +572,7 @@ void DenseRunner::run_q35_linear(int layer, int n_tokens, int start_pos) {
   run_q35_linear_attn(layer, n_tokens, start_pos);
   run_ffn(layer, n_tokens);
   if (layer == 0 && !graph_capture_) {
-    const char* dp = std::getenv("ENGINE_DUMP");
+    const char* dp = ENGINE_ENV_STR("ENGINE_DUMP");
     if (dp) {
       cuda::stream_sync();
       std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
@@ -590,11 +590,11 @@ void DenseRunner::run_q35_attn_attn(int layer, int n_tokens, int start_pos) {
   (void)start_pos;
   auto& L = layers_[layer];
   static const int kDumpLayer = []() {
-    const char* e = std::getenv("ENGINE_DUMP_LAYER");
+    const char* e = ENGINE_ENV_STR("ENGINE_DUMP_LAYER");
     return e ? std::atoi(e) : -1;
   }();
   auto dump = [&](cuda::Buffer& buf, const char* tag, int rows) {
-    const char* dp = std::getenv("ENGINE_DUMP");
+    const char* dp = ENGINE_ENV_STR("ENGINE_DUMP");
     if (!dp || layer != kDumpLayer || graph_capture_) return;
     cuda::stream_sync();
     std::vector<float> h(static_cast<size_t>(rows) * hidden_);
@@ -680,11 +680,11 @@ void DenseRunner::run_q35_attn(int layer, int n_tokens, int start_pos) {
   run_q35_attn_attn(layer, n_tokens, start_pos);
   run_ffn(layer, n_tokens);
   static const int kDumpLayer = []() {
-    const char* e = std::getenv("ENGINE_DUMP_LAYER");
+    const char* e = ENGINE_ENV_STR("ENGINE_DUMP_LAYER");
     return e ? std::atoi(e) : -1;
   }();
   if (layer == kDumpLayer && !graph_capture_) {
-    const char* dp = std::getenv("ENGINE_DUMP");
+    const char* dp = ENGINE_ENV_STR("ENGINE_DUMP");
     if (dp) {
       cuda::stream_sync();
       std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
@@ -748,7 +748,7 @@ void DenseRunner::run_q35_attn_graph(int layer, int start_pos) {
     capture_attn_graph(layer, bucket);
     L.attn_graph[static_cast<size_t>(bucket)]->launch();
   }
-  if (std::getenv("ENGINE_DBG_GRAPH_SYNC")) {
+  if (ENGINE_ENV_ON("ENGINE_DBG_GRAPH_SYNC")) {
     cuda::stream_sync();
     std::fprintf(stderr, "[graph] replay layer %d bucket %d st=%d ok\n", layer, bucket,
                  L.attn_graph_state[static_cast<size_t>(bucket)]);
@@ -776,7 +776,7 @@ void DenseRunner::capture_attn_graph(int layer, int bucket) {
   g->capture_end();
   L.attn_graph[static_cast<size_t>(bucket)] = std::move(g);
   L.attn_graph_state[static_cast<size_t>(bucket)] = 2;
-  if (std::getenv("ENGINE_DBG_GRAPH"))
+  if (ENGINE_ENV_ON("ENGINE_DBG_GRAPH"))
     std::fprintf(stderr, "[graph] layer %d attn bucket %d captured\n", layer, bucket);
 }
 
@@ -799,7 +799,7 @@ void DenseRunner::capture_gpu_layer_graph(int layer, int bucket) {
   L.layer_graph_ready = true;
   L.layer_graph_state = 2;
   L.layer_graph_bucket = bucket;
-  if (std::getenv("ENGINE_DBG_GRAPH"))
+  if (ENGINE_ENV_ON("ENGINE_DBG_GRAPH"))
     std::fprintf(stderr, "[graph] layer %d full bucket %d captured\n", layer, bucket);
 }
 
@@ -822,7 +822,7 @@ void DenseRunner::prepare_graph_scratch() {
 void DenseRunner::capture_decode_graphs() {
   if (ir_.ssm.variant == "none") return;   // only the qwen35 hybrid stack is wired up
   const int ne = ir_.moe.n_expert;
-  const bool force_all = std::getenv("ENGINE_GRAPH_FORCE") != nullptr;
+  const bool force_all = ENGINE_ENV_ON("ENGINE_GRAPH_FORCE");
   if (ne <= 0 && !force_all) return;
   prepare_graph_scratch();
   // Default: lazy capture (the first decode token runs the plain path, the second
@@ -831,14 +831,14 @@ void DenseRunner::capture_decode_graphs() {
   // access on replay even for a single-node graph (isolated on the 9B model), while the
   // identical capture executed from inside a forward pass works.  Keep the pre-capture
   // path behind ENGINE_GRAPH_PRECAPTURE for diagnostics only.
-  if (!std::getenv("ENGINE_GRAPH_PRECAPTURE")) return;
-  const bool dev_ready = dev_route_default_ || std::getenv("ENGINE_DEV_ROUTE") != nullptr;
-  const bool skip_cpu = std::getenv("ENGINE_NO_CPU_LAYER_GRAPH") != nullptr;
-  const bool skip_gpu = std::getenv("ENGINE_NO_GPU_LAYER_GRAPH") != nullptr;
-  const bool full_gpu = std::getenv("ENGINE_GPU_FULL_LAYER_GRAPH") != nullptr;
-  const bool selftest = std::getenv("ENGINE_GRAPH_SELFTEST") != nullptr;
+  if (!ENGINE_ENV_ON("ENGINE_GRAPH_PRECAPTURE")) return;
+  const bool dev_ready = dev_route_default_ || ENGINE_ENV_ON("ENGINE_DEV_ROUTE");
+  const bool skip_cpu = ENGINE_ENV_ON("ENGINE_NO_CPU_LAYER_GRAPH");
+  const bool skip_gpu = ENGINE_ENV_ON("ENGINE_NO_GPU_LAYER_GRAPH");
+  const bool full_gpu = ENGINE_ENV_ON("ENGINE_GPU_FULL_LAYER_GRAPH");
+  const bool selftest = ENGINE_ENV_ON("ENGINE_GRAPH_SELFTEST");
   const int only = [&]() {
-    const char* e = std::getenv("ENGINE_GRAPH_ONLY_LAYER");
+    const char* e = ENGINE_ENV_STR("ENGINE_GRAPH_ONLY_LAYER");
     return e ? std::atoi(e) : -1;
   }();
   auto selftest_one = [&](int l) {

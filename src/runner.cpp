@@ -19,6 +19,7 @@
 #include "engine/kernels.h"
 #include "engine/st.h"
 
+
 namespace runner {
 
 int DenseRunner::attn_warps_for_ctx(int ctx_len) {
@@ -923,8 +924,13 @@ void DenseRunner::run_attn(LayerW& L, int n_tokens, int start_pos, cuda::Buffer&
   }
 }
 
+namespace prof_acc {
+void dump();
+}
+
 DenseRunner::~DenseRunner() {
   cuda::kprof_dump();
+  prof_acc::dump();
 }
 
 std::vector<float> DenseRunner::debug_mla_cache(int layer) {
@@ -1454,6 +1460,93 @@ double g_prof_mla_ms = 0.0, g_prof_moe_ms = 0.0;
 double g_prof_router_ms = 0.0, g_prof_experts_ms = 0.0, g_prof_shared_ms = 0.0;
 double g_prof_skip_ms = 0.0, g_prof_active_ms = 0.0;
 
+// ---- per-token accounting (ENGINE_PROF_ACC=1) --------------------------------
+// WHY: the historical 35B ledger was built from ENGINE_DBG_LAYERMS, which writes 40
+// lines/token to an unbuffered stderr.  On this host that costs ~10 ms/token, so the
+// sum of the per-layer lines can never be reconciled with the decoded-token wall clock
+// (measured: 32.1 ms of layer lines inside a 43.1 ms token).  This accumulator keeps
+// the very same segments in memory and dumps them ONCE at exit: a handful of
+// steady_clock reads per layer, no I/O in the hot path.
+namespace prof_acc {
+int warm_left = 4;   // decode tokens skipped before counting (graph capture / page-in)
+static const bool on = std::getenv("ENGINE_PROF_ACC") != nullptr;
+bool warm_init = false;
+inline bool counting(int n_tokens) {
+  if (!warm_init) {
+    warm_init = true;
+    const char* e = std::getenv("ENGINE_PROF_ACC_SKIP");
+    if (e) warm_left = std::atoi(e);
+  }
+  return on && n_tokens == 1 && warm_left <= 0;
+}
+inline void tick_warm(int n_tokens) {
+  if (on && n_tokens == 1 && warm_left > 0) --warm_left;
+}
+double token_ms = 0, pre_ms = 0, pipe_ms = 0, head_gpu_ms = 0, head_copy_ms = 0;
+double layers_ms = 0, cpu_ms = 0, gpu_ms = 0, gemv_ms = 0;
+double moe_ms = 0, moe_pre_ms = 0, moe_route_ms = 0, moe_tail_ms = 0;
+double cpu_sync_ms = 0, cpu_launch_ms = 0, gpu_sync_ms = 0, gpu_launch_ms = 0;
+long long tokens = 0, layers = 0, cpu_layers = 0, gpu_layers = 0;
+long long cpu_syncs = 0, cpu_launches = 0, gpu_syncs = 0, gpu_launches = 0;
+
+inline double since(std::chrono::steady_clock::time_point a) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a)
+      .count();
+}
+void dump() {
+  if (!on || tokens <= 0) return;
+  const double per = static_cast<double>(tokens);
+  const double wall = token_ms / per, pre = pre_ms / per, pipe = pipe_ms / per;
+  const double gpuh = head_gpu_ms / per, hcopy = head_copy_ms / per;
+  const double lsum = layers_ms / per, cpu = cpu_ms / per, gpu = gpu_ms / per;
+  const double gemv = gemv_ms / per;
+  const double csync = cpu_sync_ms / per, claunch = cpu_launch_ms / per;
+  const double gsync = gpu_sync_ms / per, glaunch = gpu_launch_ms / per;
+  const double ncpu = static_cast<double>(cpu_layers) / per;
+  const double ngpu = static_cast<double>(gpu_layers) / per;
+  std::fprintf(stderr, "\n[acc] ===== per decode token (n=%lld, %lld layers) =====\n", tokens,
+               layers / tokens);
+  std::fprintf(stderr, "[acc] wall                %7.3f ms\n", wall);
+  std::fprintf(stderr, "[acc]   pre (embed/upload/setpos) %7.3f ms\n", pre);
+  std::fprintf(stderr, "[acc]   pipeline          %7.3f ms\n", pipe);
+  std::fprintf(stderr, "[acc]     sum(run_layer) %7.3f   -> loop/other %7.3f\n", lsum,
+               pipe - lsum - gpuh);
+  std::fprintf(stderr, "[acc]     head in pipeline (final norm + lm_head + topk) %7.3f\n",
+               gpuh);
+  std::fprintf(stderr, "[acc]   head copy (topk/logits D2H + sync) %7.3f ms\n", hcopy);
+  std::fprintf(stderr, "[acc]   accounted %7.3f ms   UNACCOUNTED %7.3f ms\n",
+               pre + pipe + hcopy, wall - pre - pipe - hcopy);
+  std::fprintf(stderr, "[acc] layers: %lld total | CPU %.2f layers x %.3f ms = %.3f | GPU %.2f x %.3f = %.3f\n",
+               layers / tokens, ncpu, ncpu > 0 ? cpu / ncpu : 0.0, cpu, ngpu,
+               ngpu > 0 ? gpu / ngpu : 0.0, gpu);
+  std::fprintf(stderr,
+               "[acc]   CPU sub: pre(router+D2H+shared enqueue) %.3f  route(host) %.3f  "
+               "tail(upload+add3+host part) %.3f  gemv %.3f  sync %.3f  launch %.3f  rest %.3f ms/layer\n",
+               ncpu > 0 ? moe_pre_ms / per / ncpu : 0.0,
+               ncpu > 0 ? moe_route_ms / per / ncpu : 0.0,
+               ncpu > 0 ? moe_tail_ms / per / ncpu : 0.0, ncpu > 0 ? gemv / ncpu : 0.0,
+               ncpu > 0 ? csync / ncpu : 0.0, ncpu > 0 ? claunch / ncpu : 0.0,
+               ncpu > 0 ? (cpu - gemv - csync - claunch) / ncpu : 0.0);
+  std::fprintf(stderr, "[acc]   run_moe total %.3f ms/token (%.3f ms/layer over %.2f layers)\n",
+               moe_ms / per, ncpu + ngpu > 0 ? moe_ms / per / (ncpu + ngpu) : 0.0, ncpu + ngpu);
+  std::fprintf(stderr, "[acc]   CPU layer parts: host GEMV %.3f ms/layer (%6.2f%%)  sync %.3f ms/layer (%5.1f%%)  launch %.3f ms/layer (%4.1f%%)  other %.3f ms/layer\n",
+               ncpu > 0 ? gemv / ncpu : 0.0, cpu > 0 ? 100.0 * gemv / cpu : 0.0,
+               ncpu > 0 ? csync / ncpu : 0.0, cpu > 0 ? 100.0 * csync / cpu : 0.0,
+               ncpu > 0 ? claunch / ncpu : 0.0, cpu > 0 ? 100.0 * claunch / cpu : 0.0,
+               ncpu > 0 ? (cpu - gemv - csync - claunch) / ncpu : 0.0);
+  std::fprintf(stderr, "[acc]   GPU layer parts: sync %.3f ms/layer  launch %.3f ms/layer  other %.3f ms/layer\n",
+               ngpu > 0 ? gsync / ngpu : 0.0, ngpu > 0 ? glaunch / ngpu : 0.0,
+               ngpu > 0 ? (gpu - gsync - glaunch) / ngpu : 0.0);
+  std::fprintf(stderr, "[acc] per token: launches %lld (CPU %lld / GPU %lld)  syncs %lld (CPU %lld / GPU %lld)\n",
+               (cpu_launches + gpu_launches) / tokens, cpu_launches / tokens,
+               gpu_launches / tokens, (cpu_syncs + gpu_syncs) / tokens, cpu_syncs / tokens,
+               gpu_syncs / tokens);
+  std::fprintf(stderr,
+               "[acc] CPU-layer overhead total = %7.3f ms/token (sync %.3f + launch %.3f + other %.3f)\n",
+               cpu - gemv, csync, claunch, cpu - gemv - csync - claunch);
+}
+}  // namespace prof_acc
+
 void DenseRunner::run_layer(int layer, int n_tokens, int start_pos) {
   auto& L = layers_[layer];
   // Per-layer graph: only fully GPU-resident layers can be captured (no host sync).
@@ -1461,12 +1554,12 @@ void DenseRunner::run_layer(int layer, int n_tokens, int start_pos) {
   layer_graph_mode_ = layer_graph_env;
   bool gpu_only =
       !L.is_moe || L.q_experts.size() == static_cast<size_t>(ir_.moe.n_expert) * 3;
-  if (std::getenv("ENGINE_LG_DENSE_ONLY")) gpu_only = !L.is_moe;
+  if (ENGINE_ENV_ON("ENGINE_LG_DENSE_ONLY")) gpu_only = !L.is_moe;
   if (layer_graph_env && n_tokens == 1 && gpu_only && !L.is_linear) {
-    if (std::getenv("ENGINE_DBG_LG"))
+    if (ENGINE_ENV_ON("ENGINE_DBG_LG"))
       std::fprintf(stderr, "[lg] layer %d %s\n", layer,
                    L.layer_graph_ready ? "replay" : "capture");
-    static const bool recapture = std::getenv("ENGINE_LG_RECAPTURE") != nullptr;
+    static const bool recapture = ENGINE_ENV_ON("ENGINE_LG_RECAPTURE");
     if (recapture) L.layer_graph.reset(new cuda::Graph());
     if (!L.layer_graph_ready || recapture) {
       if (!L.layer_graph) L.layer_graph = std::make_unique<cuda::Graph>();
@@ -1489,11 +1582,11 @@ void DenseRunner::run_layer(int layer, int n_tokens, int start_pos) {
   // expert FFN stays on the host), GPU-resident qwen35 MoE layers capture the whole
   // layer (device routing keeps it host-sync free).
   if (layer_graph_auto_ && n_tokens == 1 && !graph_capture_ &&
-      !std::getenv("ENGINE_DUMP") && !std::getenv("ENGINE_DUMP_EVERY") &&
-      !std::getenv("ENGINE_DUMP_LAYER") && q35_layer_graph_ok(layer)) {
+      !ENGINE_ENV_ON("ENGINE_DUMP") && !ENGINE_ENV_ON("ENGINE_DUMP_EVERY") &&
+      !ENGINE_ENV_ON("ENGINE_DUMP_LAYER") && q35_layer_graph_ok(layer)) {
     // Diagnostic: force the attention-graph path for models without MoE layers so the
     // qwen35 capture path can be exercised on the fast-loading 9B model.
-    const bool force_all = std::getenv("ENGINE_GRAPH_FORCE") != nullptr;
+    const bool force_all = ENGINE_ENV_ON("ENGINE_GRAPH_FORCE");
     if (force_all) {
       run_q35_attn_graph(layer, start_pos);
       return;
@@ -1506,10 +1599,10 @@ void DenseRunner::run_layer(int layer, int n_tokens, int start_pos) {
     // the first execution (inside the prefill), so only the launch saving remains.
     const bool cpu_layer = ne > 0 && L.cpu_begin == 0 && q35_cpu_layer_graph_;
     const bool gpu_layer = ne > 0 && L.cpu_begin == ne &&
-                           std::getenv("ENGINE_NO_GPU_LAYER_GRAPH") == nullptr &&
-                           (dev_route_default_ || std::getenv("ENGINE_DEV_ROUTE") != nullptr);
+                           !ENGINE_ENV_ON("ENGINE_NO_GPU_LAYER_GRAPH") &&
+                           (dev_route_default_ || ENGINE_ENV_ON("ENGINE_DEV_ROUTE"));
     const bool gpu_layer_attn =
-        ne > 0 && L.cpu_begin == ne && std::getenv("ENGINE_NO_GPU_LAYER_GRAPH") == nullptr;
+        ne > 0 && L.cpu_begin == ne && !ENGINE_ENV_ON("ENGINE_NO_GPU_LAYER_GRAPH");
     if (cpu_layer || gpu_layer_attn) {
       if (gpu_layer && std::getenv("ENGINE_GPU_FULL_LAYER_GRAPH")) {
         run_gpu_layer_graph(layer, start_pos);   // whole layer (needs device routing)
@@ -1566,7 +1659,7 @@ void DenseRunner::run_layer_body(int layer, int n_tokens, int start_pos) {
     cuda::launch(k_bias_, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
   };
 
-  static const bool kProf = std::getenv("ENGINE_PROFILE") != nullptr;
+  static const bool kProf = ENGINE_ENV_ON("ENGINE_PROFILE");
   static double t_qkv = 0, t_attn = 0, t_ffn = 0;
   static int n_prof = 0;
   std::chrono::steady_clock::time_point tp0;
@@ -1583,7 +1676,7 @@ void DenseRunner::run_layer_body(int layer, int n_tokens, int start_pos) {
   tick();
   rms(x_, L.ln1, hn_);
   if (layer == 0) {
-    if (const char* dp = std::getenv("ENGINE_DUMP")) {
+    if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
       cuda::stream_sync();
       std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
       hn_.download(h.data(), h.size() * 4);
@@ -1592,7 +1685,7 @@ void DenseRunner::run_layer_body(int layer, int n_tokens, int start_pos) {
     }
   }
   if (L.is_mla) {
-    if (std::getenv("ENGINE_PROFILE") && layer < 3 && n_tokens == 1) {
+    if (ENGINE_ENV_ON("ENGINE_PROFILE") && layer < 3 && n_tokens == 1) {
       cuda::sync();
       const auto t0 = std::chrono::steady_clock::now();
       run_mla_attention(layer, n_tokens, start_pos);
@@ -1710,7 +1803,7 @@ void DenseRunner::run_layer_body(int layer, int n_tokens, int start_pos) {
   add(x_, down_, static_cast<long long>(n_tokens) * hidden_);
   tock(t_ffn);
   if (layer == 0) {
-    if (const char* dp = std::getenv("ENGINE_DUMP")) {
+    if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
       cuda::stream_sync();
       std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
       x_.download(h.data(), h.size() * 4);
@@ -1823,10 +1916,12 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
   int n_layer = ir_.n_layer;
   if (layers_override_ > 0) n_layer = layers_override_;
   if (n_layer > ir_.n_layer) n_layer = ir_.n_layer;
-  static const bool pipe_prof = std::getenv("ENGINE_PIPE_PROF") != nullptr;
+  static const bool pipe_prof = ENGINE_ENV_ON("ENGINE_PIPE_PROF");
   cuda::Event pev0, pev1;
   double cpu_launch_ms = 0.0;
   const auto pipe_t0 = std::chrono::steady_clock::now();
+  const bool acc_on = prof_acc::counting(n);
+  double acc_layers = 0.0;
   for (int l = 0; l < n_layer; ++l) {
     if (pipe_prof) pev0.record();
     const auto lt0 = std::chrono::steady_clock::now();
@@ -1837,7 +1932,7 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
     const double layer_act0 = g_prof_active_ms;
     run_layer(l, n, start_pos);
     {
-      static const bool kLayerMs = std::getenv("ENGINE_DBG_LAYERMS") != nullptr;
+      static const bool kLayerMs = ENGINE_ENV_ON("ENGINE_DBG_LAYERMS");
       if (kLayerMs && n <= 2) {
         const bool layer_cpu = layers_[l].is_moe && layers_[l].cpu_begin == 0 &&
                                ir_.moe.n_expert > 0;
@@ -1852,9 +1947,33 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
                      cuda::g_launch_ms - layer_lm0, g_prof_active_ms - layer_act0);
       }
     }
-    cpu_launch_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lt0).count();
+    const double layer_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lt0)
+            .count();
+    cpu_launch_ms += layer_ms;
+    if (acc_on) {
+      const auto& LW = layers_[l];
+      const bool is_cpu = ir_.moe.n_expert > 0 && LW.is_moe && LW.cpu_begin == 0;
+      acc_layers += layer_ms;
+      if (is_cpu) {
+        prof_acc::cpu_ms += layer_ms;
+        prof_acc::cpu_sync_ms += cuda::g_sync_ms - layer_sm0;
+        prof_acc::cpu_launch_ms += cuda::g_launch_ms - layer_lm0;
+        prof_acc::cpu_syncs += cuda::g_sync_calls - layer_sc0;
+        prof_acc::cpu_launches += cuda::g_launch_calls - layer_lc0;
+        ++prof_acc::cpu_layers;
+      } else {
+        prof_acc::gpu_ms += layer_ms;
+        prof_acc::gpu_sync_ms += cuda::g_sync_ms - layer_sm0;
+        prof_acc::gpu_launch_ms += cuda::g_launch_ms - layer_lm0;
+        prof_acc::gpu_syncs += cuda::g_sync_calls - layer_sc0;
+        prof_acc::gpu_launches += cuda::g_launch_calls - layer_lc0;
+        ++prof_acc::gpu_layers;
+      }
+      ++prof_acc::layers;
+    }
     if (pipe_prof) pev1.record();
-    if (const char* dp = std::getenv("ENGINE_DUMP_EVERY")) {
+    if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP_EVERY")) {
       cuda::stream_sync();
       std::vector<float> h(static_cast<size_t>(n) * hidden_);
       x_.download(h.data(), h.size() * 4);
@@ -1865,7 +1984,7 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
               static_cast<std::streamsize>(h.size() * 4));
     }
     if (l == 0) {
-      if (const char* dp = std::getenv("ENGINE_DUMP")) {
+      if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
         cuda::stream_sync();
         std::vector<float> h(static_cast<size_t>(n) * hidden_);
         x_.download(h.data(), h.size() * 4);
@@ -1875,6 +1994,7 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
       }
     }
   }
+  const auto acc_head0 = std::chrono::steady_clock::now();
   if (pipe_prof) {
     cuda::sync();
     const double wall =
@@ -1896,7 +2016,7 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
                static_cast<size_t>(last_row_only ? (n - 1) * hidden_ : 0);
     rms_raw(px, w_final_norm_.data(), hn_.data(), rows, hidden_);
   }
-  if (const char* dp = std::getenv("ENGINE_DUMP")) {
+  if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
     if (rows == 1) {
       cuda::stream_sync();
       std::vector<float> h(static_cast<size_t>(hidden_));
@@ -1906,7 +2026,7 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
               static_cast<std::streamsize>(h.size() * 4));
     }
   }
-  static const bool skip_lmhead = std::getenv("ENGINE_SKIP_LMHEAD") != nullptr;
+  static const bool skip_lmhead = ENGINE_ENV_ON("ENGINE_SKIP_LMHEAD");
   if (!skip_lmhead && rows == 1 && lm_head_qt_.valid) {
     matmul(lm_head_qt_, 1, hn_, logits_);
   } else if (rows == 1) {
@@ -1940,6 +2060,10 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
     int nc = nb * kk;
     void* a2[] = {&ppv, &ppi, &nc, &kk, &poi, &pov};
     cuda::launch(k_topkfinal_, 1, 1, 1, 256, 1, 1, 0, a2);
+  }
+  if (acc_on) {
+    prof_acc::layers_ms += acc_layers;
+    prof_acc::head_gpu_ms += prof_acc::since(acc_head0);
   }
 }
 
@@ -1977,6 +2101,8 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
   }
 
   const auto fwd_t_entry = std::chrono::steady_clock::now();
+  const auto acc_t_entry = std::chrono::steady_clock::now();
+  prof_acc::tick_warm(n);
   std::vector<float> x(static_cast<size_t>(n) * hidden_);
   const bool lazy_embed = !embed_raw_.empty();
   const int row_blocks = lazy_embed ? hidden_ / embed_be_ : 0;
@@ -1999,7 +2125,7 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
   // Async so the token loop does not pay a WDDM queue flush before the first kernel
   // (x outlives every stream operation: forward() synchronises on the logits copy).
   x_.upload_async(x.data(), x.size() * 4);
-  if (const char* dp = std::getenv("ENGINE_DUMP")) {
+  if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
     std::ofstream f(std::string(dp) + "_emb.f32", std::ios::binary);
     f.write(reinterpret_cast<const char*>(x.data()),
             static_cast<std::streamsize>(x.size() * 4));
@@ -2029,9 +2155,11 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
     return {};
   }
   const auto fwd_t_pre = std::chrono::steady_clock::now();
+  const bool acc_tok = prof_acc::counting(n);
+  if (acc_tok) prof_acc::pre_ms += prof_acc::since(acc_t_entry);
 
-  static const bool kProfFwd = std::getenv("ENGINE_PROFILE") != nullptr;
-  static const bool kProfK = std::getenv("ENGINE_KPROF") != nullptr;
+  static const bool kProfFwd = ENGINE_ENV_ON("ENGINE_PROFILE");
+  static const bool kProfK = ENGINE_ENV_ON("ENGINE_KPROF");
   static int kProfToken = 0;
   const auto kProfT0 = std::chrono::steady_clock::now();
   if (kProfK && n == 1 && !use_graph_) cuda::kprof_reset();
@@ -2052,7 +2180,7 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
         slot->capture_begin();
         run_pipeline(n, start_pos, last_row_only);
         slot->capture_end();
-        if (std::getenv("ENGINE_DBG_PFGRAPH"))
+        if (ENGINE_ENV_ON("ENGINE_DBG_PFGRAPH"))
           std::fprintf(stderr, "[pfgraph] captured n=%d\n", n);
       } catch (const std::exception& e) {
         slot.reset();
@@ -2066,7 +2194,7 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
     // execute anything, so the graph is launched immediately after it is recorded.
     slot->launch();
     cuda::stream_sync();
-    if (std::getenv("ENGINE_DBG_PFGRAPH"))
+    if (ENGINE_ENV_ON("ENGINE_DBG_PFGRAPH"))
       std::fprintf(stderr, "[pfgraph] ran n=%d (ready=%d)\n", n, (int)slot->ready());
     if (kProfFwd) {
       cuda::stream_sync();
@@ -2109,6 +2237,8 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
     // adds a WDDM round trip per token.
   }
 
+  const auto acc_pipe_end = std::chrono::steady_clock::now();
+  if (acc_tok) prof_acc::pipe_ms += prof_acc::since(fwd_t_pre);
   // Device top-k head: only `k` (index,value) pairs cross PCIe instead of the logits row.
   const bool want_topk = topk_k > 0 && last_row_only && n == 1 && head_topk_ &&
                          k_topkpart_ && k_topkfinal_ && tk != nullptr;
@@ -2125,12 +2255,17 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
       tk->idx[static_cast<size_t>(q)] = pi[q];
       tk->val[static_cast<size_t>(q)] = pin[q];
     }
-    if (std::getenv("ENGINE_DBG_FWD")) {
+    if (ENGINE_ENV_ON("ENGINE_DBG_FWD")) {
       std::fprintf(stderr, "[fwd] topk-dl %.2f ms (top1=%d)\n",
                    std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - fwd_t_pre)
                        .count(),
                    tk->idx[0]);
+    }
+    if (acc_tok) {
+      prof_acc::head_copy_ms += prof_acc::since(acc_pipe_end);
+      prof_acc::token_ms += prof_acc::since(acc_t_entry);
+      ++prof_acc::tokens;
     }
     return {};
   }
@@ -2149,7 +2284,7 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
   } else {
     logits_.download(out.data(), logits_bytes);
   }
-  if (std::getenv("ENGINE_DBG_FWD")) {
+  if (ENGINE_ENV_ON("ENGINE_DBG_FWD")) {
     auto ms = [](std::chrono::steady_clock::time_point a) {
       return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a)
           .count();
@@ -2157,10 +2292,15 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
     std::fprintf(stderr, "[fwd] pre %.2f  pipe %.2f  logits-dl %.2f  total %.2f ms\n",
                  ms(fwd_t_pre), ms(fwd_t_pipe), ms(fwdT0), ms(fwd_t_entry));
   }
-  if (const char* lp = std::getenv("ENGINE_LOGITS")) {
+  if (const char* lp = ENGINE_ENV_STR("ENGINE_LOGITS")) {
     std::ofstream f(lp, std::ios::binary);
     f.write(reinterpret_cast<const char*>(out.data()),
             static_cast<std::streamsize>(out.size() * 4));
+  }
+  if (acc_tok) {
+    prof_acc::head_copy_ms += prof_acc::since(acc_pipe_end);
+    prof_acc::token_ms += prof_acc::since(acc_t_entry);
+    ++prof_acc::tokens;
   }
   return out;
 }
@@ -2200,7 +2340,7 @@ bool DenseRunner::gemv_typed(const std::string& type, const void* W, int n_out, 
 
 void DenseRunner::matvec_f32_ptr(const void* W, int n_out, int n_in, cuda::Buffer& in,
                                  cuda::Buffer& out) {
-  if (std::getenv("ENGINE_DBG_MATVEC") && dbg_matvec_++ < 4)
+  if (ENGINE_ENV_ON("ENGINE_DBG_MATVEC") && dbg_matvec_++ < 4)
     std::fprintf(stderr, "[matvec] ptr n_tokens_cur=%d n_out=%d n_in=%d\n", n_tokens_cur_, n_out,
                  n_in);
   if (n_tokens_cur_ <= 4) {
@@ -2218,7 +2358,7 @@ void DenseRunner::matvec_f32_ptr(const void* W, int n_out, int n_in, cuda::Buffe
 
 void DenseRunner::matvec_f32(const cuda::Buffer& W, int n_out, int n_in, cuda::Buffer& in,
                             cuda::Buffer& out) {
-  if (std::getenv("ENGINE_DBG_MATVEC") && dbg_matvec_++ < 6)
+  if (ENGINE_ENV_ON("ENGINE_DBG_MATVEC") && dbg_matvec_++ < 6)
     std::fprintf(stderr, "[matvec] buf n_tokens_cur=%d n_out=%d n_in=%d -> %s\n", n_tokens_cur_,
                  n_out, n_in, n_tokens_cur_ <= 4 ? "GEMV" : "cublas");
   if (n_tokens_cur_ <= 4) {
@@ -2236,7 +2376,9 @@ void DenseRunner::matvec_f32(const cuda::Buffer& W, int n_out, int n_in, cuda::B
 
 void DenseRunner::run_moe(int layer, int n_tokens) {
   auto& L = layers_[layer];
-  static const bool kProf = std::getenv("ENGINE_PROFILE") != nullptr;
+  const bool acc_moe = prof_acc::counting(n_tokens);
+  const auto acc_moe0 = std::chrono::steady_clock::now();
+  static const bool kProf = ENGINE_ENV_ON("ENGINE_PROFILE");
   const auto t0 = std::chrono::steady_clock::now();
   auto ms_since = [&](const std::chrono::steady_clock::time_point& a) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
@@ -2249,10 +2391,10 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   static const int topk_ov = experts_topk_;
   const int topk = topk_ov > 0 ? std::min(topk_ov, ir_.moe.n_expert_used)
                               : ir_.moe.n_expert_used;
-  if (std::getenv("ENGINE_DBG_LG2") && layer == 1)
+  if (ENGINE_ENV_ON("ENGINE_DBG_LG2") && layer == 1)
     std::fprintf(stderr, "[lg2] router gemm\n");
   const bool router_kernel_mode =
-      std::getenv("ENGINE_ROUTER_KERNEL") != nullptr ||
+      ENGINE_ENV_ON("ENGINE_ROUTER_KERNEL") ||
       layer_graph_ || layer_graph_mode_;
   if (k_routergemm_ && router_kernel_mode) {
     void* ph = hn_.data();
@@ -2280,16 +2422,16 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     if (t == "Q5_1") return 4;
     return -1;
   };
-  const bool dev_ok = std::getenv("ENGINE_DEV_ROUTE") != nullptr ||
+  const bool dev_ok = ENGINE_ENV_ON("ENGINE_DEV_ROUTE") ||
                       layer_graph_ || layer_graph_mode_ || dev_route_default_;
   bool use_dev = false;
   if (dev_ok && gpu_n_pre == ne && L.all_ptr_idx >= 0 && k_moeroute_ && n_tokens <= 8 &&
       !L.q_experts.empty()) {
     use_dev = type_id_of(L.q_experts[0].type) >= 0 && type_id_of(L.q_experts[1].type) >= 0 &&
               type_id_of(L.q_experts[2].type) >= 0 &&
-              std::getenv("ENGINE_DEV_NO_Q51") == nullptr;
+              !ENGINE_ENV_ON("ENGINE_DEV_NO_Q51");
   }
-  if (std::getenv("ENGINE_DBG_DEVWHY") && layer <= 3)
+  if (ENGINE_ENV_ON("ENGINE_DBG_DEVWHY") && layer <= 3)
     std::fprintf(stderr,
                  "[devwhy] layer %d use_dev=%d gpu_n=%d ne=%d all_ptr=%d ntok=%d qexp=%zu "
                  "t=%s,%s,%s\n",
@@ -2299,7 +2441,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
                  L.q_experts.size() > 1 ? L.q_experts[1].type.c_str() : "-",
                  L.q_experts.size() > 2 ? L.q_experts[2].type.c_str() : "-");
   // Diagnostic: skip the router round-trip (wrong results, measures its cost).
-  static const bool fixed_route = std::getenv("ENGINE_MOE_FIXED_ROUTING") != nullptr;
+  static const bool fixed_route = ENGINE_ENV_ON("ENGINE_MOE_FIXED_ROUTING");
   // A CPU-resident MoE layer needs exactly one host round trip per token.  Its GPU-side
   // shared-expert block does NOT depend on the routing, so it is issued *before* that
   // round trip: the stream flush then covers it, the queue is empty while the host pool
@@ -2320,7 +2462,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       cuda::launch(k_zerofill_, 64, 1, 1, 256, 1, 1, 0, zargs);
     }
     if (layer == 1) {
-      if (const char* dp = std::getenv("ENGINE_DUMP")) {
+      if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
         cuda::stream_sync();
         std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
         hn_.download(h.data(), h.size() * 4);
@@ -2339,7 +2481,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       // persistent scratch: allocating cuda::Buffer per layer costs ~1 ms per malloc
       // (cudaMalloc synchronises), which dominated the Coder's decode time.
       const size_t need = static_cast<size_t>(n_tokens) * static_cast<size_t>(L.sh_inter);
-      if (std::getenv("ENGINE_DBG_SCRATCH") && layer < 3)
+      if (ENGINE_ENV_ON("ENGINE_DBG_SCRATCH") && layer < 3)
         std::fprintf(stderr, "[scratch] layer %d need=%zu size=%zu\\n", layer, need * 4,
                      sh_scratch_.size());
       if (sh_scratch_.size() < need * 4) sh_scratch_ = cuda::Buffer(need * 4);
@@ -2381,7 +2523,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         std::fprintf(stderr, "[moe-prof]  sh down %.2f ms\\n", ms_since(td0));
       }
       double sh_scale = 1.0;
-      if (const char* e = std::getenv("ENGINE_SH_SCALE")) sh_scale = std::atof(e);
+      if (const char* e = ENGINE_ENV_STR("ENGINE_SH_SCALE")) sh_scale = std::atof(e);
       if (sh_scale != 1.0) {
         const long long tot = static_cast<long long>(n_tokens) * hidden_;
         std::vector<float> host(static_cast<size_t>(tot));
@@ -2436,6 +2578,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     rl_owned.assign(static_cast<size_t>(n_tokens) * ne, 0.f);
     rl = rl_owned.data();
   }
+  if (acc_moe) prof_acc::moe_pre_ms += prof_acc::since(acc_moe0);
   // Host-resident experts: issue the shared-expert GPU block now so the flush below is
   // the only one and the queue drains before the host GEMV starts.
   if (any_cpu_pre) run_shared_block();
@@ -2443,6 +2586,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     cuda::stream_sync();
     rl = static_cast<const float*>(rl_pin_.data());
   }
+  const auto acc_t_route0 = std::chrono::steady_clock::now();
 
   // host-side routing: softmax -> top-k -> renormalize (matches the reference)
   std::vector<std::vector<std::pair<int, float>>> route(static_cast<size_t>(n_tokens));
@@ -2475,13 +2619,14 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
 
   g_prof_router_ms += std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
+  if (acc_moe && !use_dev) prof_acc::moe_route_ms += prof_acc::since(acc_t_route0);
   if (fixed_route) {
     for (int t = 0; t < n_tokens; ++t) {
       route[t].clear();
       for (int k = 0; k < topk; ++k) route[t].push_back({k, 1.f / static_cast<float>(topk)});
     }
   }
-  if (std::getenv("ENGINE_DBG_DEVROUTE") && layer == 1) {
+  if (ENGINE_ENV_ON("ENGINE_DBG_DEVROUTE") && layer == 1) {
     std::fprintf(stderr, "[route-host] layer 1:");
     for (int t = 0; t < n_tokens && t < 1; ++t)
       for (const auto& r : route[t]) std::fprintf(stderr, " (e%d,w%.4f)", r.first, r.second);
@@ -2510,7 +2655,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     for (size_t i = 0; i < n_elems; ++i) xout_host[i] = 0.f;
     const double sync_ms = 0.0, dl_ms = 0.0;
     const auto cp_t1 = std::chrono::steady_clock::now();
-    if (std::getenv("ENGINE_DBG_CPULAYER") && n_tokens == 1) {
+    if (ENGINE_ENV_ON("ENGINE_DBG_CPULAYER") && n_tokens == 1) {
       const double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - cp_t1).count();
       static double sacc = 0, dacc = 0;
@@ -2522,7 +2667,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   }
 
   const auto t_loop0 = std::chrono::steady_clock::now();
-  const bool kCpuDbg = any_cpu && std::getenv("ENGINE_DBG_CPULAYER") != nullptr &&
+  const bool kCpuDbg = any_cpu && ENGINE_ENV_ON("ENGINE_DBG_CPULAYER") &&
                        n_tokens == 2;
   // Pack the whole routing table once: uploading per expert cost two synchronous
   // H2D copies x 6 experts x 26 layers per token (~0.5 s/token on the Coder).
@@ -2559,7 +2704,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   static const bool cpu_moe_batch = engine::config::get_bool("cpu_moe_batch");
   const bool cpu_quant_host = any_cpu && !L.h_gate_bytes.empty() && hn_host != nullptr;
   bool cpu_batched = false;
-  if (cpu_quant_host && cpu_moe_batch && !std::getenv("ENGINE_EXPERT_ARENA")) {
+  if (cpu_quant_host && cpu_moe_batch && !ENGINE_ENV_ON("ENGINE_EXPERT_ARENA")) {
     const int inter = expert_inter_;
     const std::size_t g_slab_g = static_cast<std::size_t>(inter) * hidden_ / L.h_be_g * L.h_bb_g;
     const std::size_t g_slab_u = static_cast<std::size_t>(inter) * hidden_ / L.h_be_u * L.h_bb_u;
@@ -2582,8 +2727,9 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       cpu::moe_forward_mt(L.h_type_g, ag.data(), L.h_type_u, au.data(), L.h_type_d, ad.data(),
                           atok.data(), aw.data(), static_cast<int>(atok.size()), n_tokens,
                           hidden_, inter, hn_host, xout_host);
+      if (prof_acc::counting(n_tokens)) prof_acc::gemv_ms += prof_acc::since(bt0);
       cpu_batched = true;
-      if (std::getenv("ENGINE_DBG_CPUEXEC")) {
+      if (ENGINE_ENV_ON("ENGINE_DBG_CPUEXEC")) {
         static double ssum = 0;
         static int scnt = 0;
         static double last_sum = 0;
@@ -2611,6 +2757,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     }
   }
 
+  const auto acc_t_tail0 = std::chrono::steady_clock::now();
   // ---- fused path: one kernel for gate+up+silu and one for down+scatter ----
   bool fused_done = false;
   static const bool fused_env = !no_moe_fused_;
@@ -2699,7 +2846,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   // otherwise put a forbidden stream sync inside the capture.
   static const bool dev_route_auto = dev_route_default_;
   const bool dev_route_env =
-      std::getenv("ENGINE_DEV_ROUTE") != nullptr || layer_graph_ || layer_graph_mode_ ||
+      ENGINE_ENV_ON("ENGINE_DEV_ROUTE") || layer_graph_ || layer_graph_mode_ ||
       dev_route_auto;
   const int gpu_n_dr = (L.cpu_begin >= 0 && L.cpu_begin <= ne) ? L.cpu_begin
                                                               : ((gpu_experts_ < 0) ? ne : ne);
@@ -2716,7 +2863,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
               td = type_id(L.q_experts[2].type);
     const int nact = n_tokens * topk;
     if (tg >= 0 && tu >= 0 && td >= 0) {
-      if (std::getenv("ENGINE_DBG_DEVROUTE"))
+      if (ENGINE_ENV_ON("ENGINE_DBG_DEVROUTE"))
         std::fprintf(stderr,
                      "[devroute] layer %d ne=%d topk=%d nact=%d idx=%d types=%d/%d/%d "
                      "gp0=%p inter=%d hidden=%d\n",
@@ -2731,7 +2878,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         moe_gact_ = cuda::Buffer(static_cast<size_t>(nact) * expert_inter_ * 4);
       // xout_ was zeroed right after routing and the shared experts have already
       // added their contribution -- zeroing again here would wipe it out.
-      if (std::getenv("ENGINE_DBG_LG2") && layer == 1)
+      if (ENGINE_ENV_ON("ENGINE_DBG_LG2") && layer == 1)
         std::fprintf(stderr, "[lg2] route kernel\n");
       {
         void* pl = router_logits_.data();
@@ -2742,7 +2889,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         void* pw = slot_w_.data();
         void* args[] = {&pl, &nen, &tk, &sg, &nt, &pe, &pt, &pw};
         cuda::launch(k_moeroute_, n_tokens, 1, 1, 32, 1, 1, 0, args);
-        if (std::getenv("ENGINE_DBG_DEVROUTE")) {
+        if (ENGINE_ENV_ON("ENGINE_DBG_DEVROUTE")) {
           cuda::sync();
           std::vector<int> he(nact), ht(nact);
           std::vector<float> hw(nact);
@@ -2763,7 +2910,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         int hid = hidden_, inter = expert_inter_, t1 = tg, t2 = tu;
         void* args[] = {&pg, &pu, &pe, &pt, &px, &pa, &hid, &inter, &t1, &t2};
         cuda::launch(k_moegateupdev_, (expert_inter_ + 31) / 32, nact, 1, 256, 1, 1, 0, args);
-        if (std::getenv("ENGINE_DBG_DEVROUTE")) {
+        if (ENGINE_ENV_ON("ENGINE_DBG_DEVROUTE")) {
           cuda::sync();
           std::fprintf(stderr, "[devroute]   gateup ok\n");
         }
@@ -2778,7 +2925,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         int hid = hidden_, inter = expert_inter_, t3 = td;
         void* args[] = {&pd, &pe, &pt, &pw, &pa, &po, &hid, &inter, &t3};
         cuda::launch(k_modeowndev_, (hidden_ + 31) / 32, nact, 1, 256, 1, 1, 0, args);
-        if (std::getenv("ENGINE_DBG_DEVROUTE")) {
+        if (ENGINE_ENV_ON("ENGINE_DBG_DEVROUTE")) {
           cuda::sync();
           std::fprintf(stderr, "[devroute]   down ok\n");
         }
@@ -2790,8 +2937,8 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         void* args[] = {&pa, &pb, &total};
         cuda::launch(k_add_, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
       }
-      static const int hash_layer = []() { const char* e = std::getenv("ENGINE_DBG_MOEHASH_LAYER"); return e ? std::atoi(e) : 1; }();
-  if (std::getenv("ENGINE_DBG_MOEHASH") && layer == hash_layer) {
+      static const int hash_layer = []() { const char* e = ENGINE_ENV_STR("ENGINE_DBG_MOEHASH_LAYER"); return e ? std::atoi(e) : 1; }();
+  if (ENGINE_ENV_ON("ENGINE_DBG_MOEHASH") && layer == hash_layer) {
     cuda::sync();
     std::vector<float> hh(static_cast<size_t>(n_tokens) * hidden_);
     xout_.download(hh.data(), hh.size() * 4);
@@ -2805,7 +2952,12 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
 
   std::vector<int> ti;
   std::vector<float> tw;
-  for (int e = 0; e < ne && !fused_done; ++e) {
+  // Host-batched CPU-expert layers (gpu_n == 0) were fully evaluated above, so this
+  // per-expert loop would only spin over ne empty ranges: 3 steady_clock reads + 2 vector
+  // assigns per iteration, measured 22 us/layer (~0.5 ms/token on the 35B, 24 CPU layers).
+  // Skipping it is behaviour-neutral (every iteration would hit a pure-`continue` path).
+  const int expert_loop_end = (cpu_batched && gpu_n == 0) ? 0 : ne;
+  for (int e = 0; e < expert_loop_end && !fused_done; ++e) {
     const int off_e = exp_off[static_cast<size_t>(e)];
     const int off_e1 = exp_off[static_cast<size_t>(e) + 1];
     ti.assign(all_idx.begin() + off_e, all_idx.begin() + off_e1);
@@ -2829,7 +2981,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     }
     if (e >= gpu_n) {
       if (cpu_batched) continue;   // already computed in the batched host pass above
-      if (std::getenv("ENGINE_DBG_CPULAYER") && n_tokens == 2 && layer >= 17)
+      if (ENGINE_ENV_ON("ENGINE_DBG_CPULAYER") && n_tokens == 2 && layer >= 17)
         std::fprintf(stderr, "[cpulayer] layer %d e=%d quant_branch=%d host_f32=%zu\n", layer, e,
                      static_cast<int>(!L.h_gate_bytes.empty()), L.host_gate.size());
       if (!L.h_gate_bytes.empty()) {
@@ -2839,7 +2991,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         // Streaming the expert through VRAM only paid off while the CPU matvec was a
         // scalar ~3 GMAC/s loop. With the AVX2 kernels (28 GMAC/s) the host path wins
         // big: Coder 189 -> 147 ms/token, 35B 186 -> 81 ms/token.
-        static const bool use_arena = std::getenv("ENGINE_EXPERT_ARENA") != nullptr;
+        static const bool use_arena = ENGINE_ENV_ON("ENGINE_EXPERT_ARENA");
         // CPU expert: quantized bytes stay quantized on the host
         const int inter = expert_inter_;
         const std::size_t g_slab_g =
@@ -2857,7 +3009,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         // CPU matvec runs at ~3 GMAC/s and dominated the 35B's decode time.
         bool streamed = false;
         static int dbg_arena_hits = 0, dbg_cpu_hits = 0;
-        if (std::getenv("ENGINE_DBG_ARENA") && layer == 20)
+        if (ENGINE_ENV_ON("ENGINE_DBG_ARENA") && layer == 20)
           std::fprintf(stderr, "[arena] layer %d e=%d m=%d types=%s/%s arena=%d\n", layer, e, m,
                        L.h_type_g.c_str(), L.h_type_u.c_str(), static_cast<int>(use_arena));
         if (use_arena && L.h_type_g == L.h_type_u && m == 1) {
@@ -2894,7 +3046,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
           }
         }
         if (streamed) ++dbg_arena_hits; else ++dbg_cpu_hits;
-        if (std::getenv("ENGINE_DBG_ARENA") && layer == 20)
+        if (ENGINE_ENV_ON("ENGINE_DBG_ARENA") && layer == 20)
           std::fprintf(stderr, "[arena]   -> %s (arena=%d cpu=%d)\n",
                        streamed ? "GPU" : "CPU", dbg_arena_hits, dbg_cpu_hits);
         if (!streamed) {
@@ -2960,7 +3112,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       void* pi = const_cast<int*>(d_idx_base + exp_off[static_cast<size_t>(e)]);
       void* args[] = {&ps, &pd, &pi, &width};
       cuda::launch(k_gather_, m, 1, 1, 128, 1, 1, 0, args);
-      if (std::getenv("ENGINE_DBG_GEMVTIME")) {
+      if (ENGINE_ENV_ON("ENGINE_DBG_GEMVTIME")) {
         cuda::sync();
         static int gn = 0;
         if (gn < 6) {
@@ -2990,7 +3142,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       void* pa = gact_.data();
       void* args[] = {&pg, &pu, &pa, &total};
       cuda::launch(k_silu_, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
-      if (std::getenv("ENGINE_DBG_GEMVTIME")) {
+      if (ENGINE_ENV_ON("ENGINE_DBG_GEMVTIME")) {
         cuda::sync();
         static int sn = 0;
         if (sn < 6) {
@@ -3039,7 +3191,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   if (any_cpu && std::getenv("ENGINE_DUMP_MOE_SPLIT")) {
     std::vector<float> gpu_out(static_cast<size_t>(n_tokens) * hidden_);
     cuda::stream_sync();
-    if (const char* dp = std::getenv("ENGINE_DUMP_MOE_SPLIT")) {
+    if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP_MOE_SPLIT")) {
       xout_.download(gpu_out.data(), gpu_out.size() * 4);
       char n1[512], n2[512];
       std::snprintf(n1, sizeof(n1), "%s_L%d_gpu.f32", dp, layer);
@@ -3057,8 +3209,8 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   }
   // Debug dumps of the intermediate MoE output read xout_ after the host part has been
   // folded in, so that (env-gated) path keeps the historical two-step merge.
-  const bool moe_dbg_path = std::getenv("ENGINE_DUMP") != nullptr ||
-                            std::getenv("ENGINE_DUMP_MOE_SPLIT") != nullptr;
+  const bool moe_dbg_path = ENGINE_ENV_ON("ENGINE_DUMP") ||
+                            ENGINE_ENV_ON("ENGINE_DUMP_MOE_SPLIT");
   bool host_part_folded = false;
   if (any_cpu) {
     // Merge the host-side expert partial sums on the DEVICE: one pinned upload plus an
@@ -3076,7 +3228,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     }
   }
   if (layer == 1) {
-    if (const char* dp = std::getenv("ENGINE_DUMP")) {
+    if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP")) {
       cuda::stream_sync();
       std::vector<float> h(static_cast<size_t>(n_tokens) * hidden_);
       xout_.download(h.data(), h.size() * 4);
@@ -3101,7 +3253,11 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       cuda::launch(k_add_, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
     }
   }
-  if (std::getenv("ENGINE_PIPE_PROF")) cuda::sync();
+  if (ENGINE_ENV_ON("ENGINE_PIPE_PROF")) cuda::sync();
+  if (acc_moe) {
+    prof_acc::moe_ms += prof_acc::since(acc_moe0);
+    prof_acc::moe_tail_ms += prof_acc::since(acc_t_tail0);
+  }
   if (kCpuDbg)
     std::fprintf(stderr,
                  "[cpuexperts] layer %d: moe-total %.2f ms (sync %lld calls / %.2f ms)\n", layer,
@@ -3119,7 +3275,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     std::fprintf(stderr, "[moe-prof]   launch %.2f ms, wait-after-sync %.2f ms\n", shared_launch,
                  shared_sync);
   }
-  if (std::getenv("ENGINE_DBG_MOEHASH") && layer == 1) {
+  if (ENGINE_ENV_ON("ENGINE_DBG_MOEHASH") && layer == 1) {
     cuda::sync();
     std::vector<float> hh(static_cast<size_t>(n_tokens) * hidden_);
     xout_.download(hh.data(), hh.size() * 4);
@@ -3312,7 +3468,7 @@ bool DenseRunner::load_qtensor_span(const std::string& name, size_t byte_offset,
 
 void DenseRunner::matmul(const QTensor& w, int n_tokens, cuda::Buffer& in, cuda::Buffer& out) {
   if (!w.valid) throw std::runtime_error("matmul: invalid quantized tensor");
-  static const bool probe_env = std::getenv("ENGINE_DBG_GEMVTIME") != nullptr;
+  static const bool probe_env = ENGINE_ENV_ON("ENGINE_DBG_GEMVTIME");
   const bool probe_on = probe_env && n_tokens == 1;
   static int probe_n = 0;
   const auto probe_t0 = std::chrono::steady_clock::now();
@@ -3361,7 +3517,7 @@ void DenseRunner::matmul(const QTensor& w, int n_tokens, cuda::Buffer& in, cuda:
   // keeps the output within ~3e-4 relative of the exact f32 path.
   // Diagnostic: skip the GEMM body entirely (garbage output, used to attribute the
   // prefill wall clock between the tensor-core GEMMs and everything else).
-  static const bool skip_gemm_dbg = std::getenv("ENGINE_SKIP_GEMM") != nullptr;
+  static const bool skip_gemm_dbg = ENGINE_ENV_ON("ENGINE_SKIP_GEMM");
   if (skip_gemm_dbg && n_tokens > 1) return;
   static const bool want_f16 = prefill_f16_;
   const bool want_acc16 = want_f16 && prefill_f16_acc_;
@@ -4102,7 +4258,7 @@ void DenseRunner::run_mla_attention(int layer, int n_tokens, int start_pos) {
   }
   if (layer == 0 && std::getenv("ENGINE_DUMP_MLA")) {
     // q before rope, so the projection and the rotation can be checked separately
-    const char* dp = std::getenv("ENGINE_DUMP_MLA");
+    const char* dp = ENGINE_ENV_STR("ENGINE_DUMP_MLA");
     cuda::stream_sync();
     std::vector<float> hq(static_cast<size_t>(n_tokens) * static_cast<size_t>(n_head_) *
                           static_cast<size_t>(qk));
@@ -4111,7 +4267,7 @@ void DenseRunner::run_mla_attention(int layer, int n_tokens, int start_pos) {
     fq.write(reinterpret_cast<const char*>(hq.data()),
              static_cast<std::streamsize>(hq.size() * 4));
   }
-  static const char* mla_dump = std::getenv("ENGINE_DUMP_MLA");
+  static const char* mla_dump = ENGINE_ENV_STR("ENGINE_DUMP_MLA");
   auto mla_dump_save = [&](cuda::Buffer& buf, const char* tag, size_t n) {
     if (!mla_dump || layer != 0) return;
     cuda::stream_sync();
@@ -4175,7 +4331,7 @@ void DenseRunner::run_mla_attention(int layer, int n_tokens, int start_pos) {
     float ms = rope_mscale_;
     void* args[] = {&pb, &pp, &nh, &stride, &rd, &off, &pf, &ms};
     // DeepSeek-V2's reference views the rope dims as complex pairs -> interleaved
-    static const bool rope_inter = std::getenv("ENGINE_MLA_ROPE_NEOX") == nullptr;
+    static const bool rope_inter = !ENGINE_ENV_ON("ENGINE_MLA_ROPE_NEOX");
     cuda::launch(rope_inter ? k_ropeinter_ : k_ropestrided_, n_tokens, n_head_, 1,
                  static_cast<int>(qk_rope / 2), 1, 1, 0, args);
   };
@@ -4207,7 +4363,7 @@ void DenseRunner::run_mla_attention(int layer, int n_tokens, int start_pos) {
     void* pp = pos_dev_.data();
     void* args[] = {&pq, &pK, &pV, &po, &pp, &nh, &qk_, &vd, &ms};
     const size_t sh = static_cast<size_t>(max_seq_) * sizeof(float);
-    if (!std::getenv("ENGINE_SKIP_MLA_ATTN")) {
+    if (!ENGINE_ENV_ON("ENGINE_SKIP_MLA_ATTN")) {
       cuda::max_dynamic_shared_mem(k_mlaattnc_);  // allow > 48 KiB for ctx > 12288
       cuda::launch(k_mlaattnc_, n_tokens, n_head_, 1, 32, 1, 1, sh, args);
     }
@@ -4215,7 +4371,7 @@ void DenseRunner::run_mla_attention(int layer, int n_tokens, int start_pos) {
   if (L.mla_quant) matmul(L.qwo_mla, n_tokens, mout_, proj_);
   else matvec_f32(L.wo_mla, hidden_, n_head_ * v_dim, mout_, proj_);
   if (layer == 0 && std::getenv("ENGINE_DUMP_MLA")) {
-    const char* dp = std::getenv("ENGINE_DUMP_MLA");
+    const char* dp = ENGINE_ENV_STR("ENGINE_DUMP_MLA");
     cuda::stream_sync();
     std::vector<float> hp(static_cast<size_t>(n_tokens) * static_cast<size_t>(hidden_));
     proj_.download(hp.data(), hp.size() * 4);
