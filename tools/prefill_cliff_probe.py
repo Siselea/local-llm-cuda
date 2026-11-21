@@ -12,7 +12,7 @@ It drives the real OpenAI-compatible server (same path the user hits) and reads 
 server-reported timings: prompt_tokens, prefill_ms, cache_hit_tokens, prefilled_tokens.
 
 Usage:
-  python tools/prefill_cliff_probe.py --model D:/p0/models/Qwen3.5-9B-Q5_K_M.gguf \
+  python tools/prefill_cliff_probe.py --model ${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf \
       --ctx 32768 --rows 128 --port 7071 --tag cold-128 \
       --cases 2000,2000,2000,9100
   (each case is a target prompt length in tokens; use a distinct nonce per request)

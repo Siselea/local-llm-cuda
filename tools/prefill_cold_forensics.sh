@@ -8,7 +8,7 @@ TAG=${1:-coldforensics}
 ROWS=${2:-512}
 CTX=${3:-32768}
 CASES=${4:-2969,2969}
-MODEL=${MODEL:-D:/p0/models/Qwen3.5-9B-Q5_K_M.gguf}
+MODEL=${MODEL:-${MODEL_DIR}/Qwen3.5-9B-Q5_K_M.gguf}
 OUT=build/$TAG
 
 : > "$OUT.gpu.csv"

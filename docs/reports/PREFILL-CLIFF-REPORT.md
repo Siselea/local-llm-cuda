@@ -116,7 +116,7 @@ req0 target=13363: HTTP 400           <- 改前是 500 "forward: bad token count
 ### 5.3 decode 不回退
 9B：`[time] decode 21.35 ms/token (47 tok/s, 16 steps)`，top-1 **2614** ✓（任务书要求 ≥45 tok/s）。
 
-### 5.4 五套验证（独占 GPU，`MODEL_DIR=D:/p0/models PY=D:/p0/py312/python.exe`）
+### 5.4 五套验证（独占 GPU，`MODEL_DIR=<MODEL_DIR> PY=python`）
 
 | 套件 | 状态 | 说明 |
 |---|---|---|
