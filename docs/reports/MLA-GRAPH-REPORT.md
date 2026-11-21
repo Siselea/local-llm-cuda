@@ -140,6 +140,42 @@ Coder-V2-Lite 的**长文本质量**本身是已知限制（`docs/reports/SPEC-C
 需要走 `/v1/completions` 原样 prompt。本次 e2e 只断言"服务可用 + 速度 + 与图无关"，
 文本质量不在本任务范围（与 pre-MLA 二进制逐字节一致已证明不是本次改动引起）。
 
+## 6b. 后续：35B 的两个 graph 机会（同一轮实测）
+
+### A) 35B GPU 层整层图 —— **实测证伪，不做**
+
+历史结论是"整层图更慢"，怀疑根因是 `run_gpu_layer_graph()` 置 `layer_graph_mode_=true`
+关掉了融合专家内核（`can_fuse` 要求 `!layer_graph_mode_`）。实测证明**这不是真因**：
+
+- 同二进制交错 3 轮（`ENGINE_GPU_FULL_LAYER_GRAPH=1` vs 默认，15 步中位）：
+  **plain 37.81 → 整层图 40.00 ms（+2.19 ms，更慢）**，gen 完全一致。
+- `ENGINE_PROF_ACC=1` 账本：整层图把 GPU 层提交从 12 次降到 0 次（launches 405→225，
+  GPU 层 0.201→0.010 ms），但 **CPU 层 sync 从 0.322 涨到 0.512 ms/层（+4.75 ms/token）**，
+  CPU 层总时间 1.284→1.511 ms/层。净结果 +2.4 ms。
+- 原因：35B GPU 层走设备路由，`all_idx` 为空，`can_fuse` 在两模式下本来就是 false；
+  整层图真正的作用是让 **host 不再受提交限制、跑到 GPU 前面**，省下的提交时间被
+  CPU 层的 `stream_sync`（等 GPU + 队列排空）原样吃掉。**35B 已经从"提交受限"变成
+  "CPU 层 sync / 宿主 GEMV 受限"，继续给 GPU 层加图只会把时间搬家。**
+
+### B) 35B CPU 层的共享专家 GPU 段图（`cpu_layer_ffn_graph`，默认开）—— **采纳**
+
+CPU 层每层有 ~8–9 次 kernel 发射（zero-fill + 共享 gate/up/silu/down + gate_inp + add），
+这段只依赖 `hn_` 和固定权重、逐 token 不变，且**在 host 的关键路径上**（host 必须先提交完
+才能 `stream_sync`）。按层录一张图（懒捕获：第一个 decode token 正常执行后录制）：
+
+| 指标（同二进制交错 5 轮，15 步中位） | graph off | graph on | 变化 |
+|---|---|---|---|
+| 35B decode | 38.04 ms | **37.36 ms** | **−0.68 ms（−1.8%）** |
+| launches/token（`[acc]`） | 405（CPU 225） | **230（CPU 50）** | −175（=25 层 × 7） |
+| CPU 层 launch | 0.116 ms/层 | **0.049 ms/层** | −0.067 |
+| CPU 层 sync | 0.332 ms/层 | 0.374 ms/层 | +0.042（另一半被 sync 吃掉） |
+
+上限 −1.7 ms 只兑现了 −0.68 ms：**省下的提交时间约一半变成了 sync 等待**（与 A 同一机制），
+但仍净正收益，且 kernel 序列/加法次序完全不变。开关 `ENGINE_NO_CPU_FFN_GRAPH=1` /
+`--no-cpu-ffn-graph`。bit-exact：35B 16 token × 6 次运行（新默认×2 / 图关×2 / 改动前二进制×2）
+gen 完全一致（35B logits 本身 run-to-run 非确定，split-K 原子加）；Coder 4/4 用例
+gen + 409600 B logits 逐字节相同（Coder 的 CPU 层同样走这条图）。
+
 ## 7. 失败/负面尝试记录
 
 1. **`quant_reuse_` 不变量 bug**（§2.3）：先手动在 replay 后清 `qc_ptr_`，后改为
