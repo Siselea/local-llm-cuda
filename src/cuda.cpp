@@ -59,6 +59,7 @@ struct Driver {
   CUresult(__stdcall* EventCreate)(void**, unsigned) = nullptr;
   CUresult(__stdcall* EventDestroy)(void*) = nullptr;
   CUresult(__stdcall* EventRecord)(void*, void*) = nullptr;
+  CUresult(__stdcall* StreamWaitEvent)(void*, void*, unsigned) = nullptr;
   CUresult(__stdcall* EventSynchronize)(void*) = nullptr;
   CUresult(__stdcall* EventElapsedTime)(float*, void*, void*) = nullptr;
   CUresult(__stdcall* StreamCreate)(void**, unsigned) = nullptr;
@@ -193,6 +194,7 @@ void load_driver() {
   g_driver.bind(g_driver.EventCreate, "cuEventCreate");
   g_driver.bind(g_driver.EventDestroy, "cuEventDestroy");
   g_driver.bind(g_driver.EventRecord, "cuEventRecord");
+  g_driver.bind(g_driver.StreamWaitEvent, "cuStreamWaitEvent");
   g_driver.bind(g_driver.EventSynchronize, "cuEventSynchronize");
   g_driver.bind(g_driver.EventElapsedTime, "cuEventElapsedTime");
   g_driver.bind(g_driver.StreamCreate, "cuStreamCreate");
@@ -767,6 +769,10 @@ MemInfo mem_info() {
 }
 
 Event::Event() { check(g_driver.EventCreate(&ev_, 0), "cuEventCreate"); }
+void Event::record_on(void* stream) { check(g_driver.EventRecord(ev_, stream), "cuEventRecord"); }
+void Event::stream_wait(void* stream) {
+  check(g_driver.StreamWaitEvent(stream, ev_, 0), "cuStreamWaitEvent");
+}
 Event::~Event() {
   if (ev_) g_driver.EventDestroy(ev_);
 }

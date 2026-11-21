@@ -483,6 +483,13 @@ class DenseRunner {
   bool mla_attn_graph_ = true; // config: per-layer CUDA graph for the MLA attention segment
   bool no_graph_cfg_ = false;  // config: --no-graph disables every capture path
   bool cpu_layer_ffn_graph_ = true;  // config: graph for the shared-expert block of CPU layers
+  bool cpu_dual_stream_ = true;      // config: overlap that block with the host GEMV
+  // Second stream for the CPU-layer shared-expert block: on decode it waits for hn_
+  // (event on the main stream) and then runs concurrently with the routing round-trip
+  // and the host GEMV, so its GPU time is hidden instead of extending the routing sync.
+  // The main stream joins it before xout_ is consumed.
+  void* sh_stream_ = nullptr;
+  std::unique_ptr<cuda::Event> sh_ev_;
   bool rms4_ = true;           // config: vectorised rmsnorm kernel
   // impl of forward()/forward_topk(); topk_k > 0 selects the device top-k head
   std::vector<float> forward_impl(const std::vector<int>& tokens, int start_pos,

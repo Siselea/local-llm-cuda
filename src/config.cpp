@@ -104,6 +104,11 @@ const OptionDef kDefs[] = {
      "(ENGINE_CPU_LAYER_GRAPH opts in; measured neutral-to-negative on this VM)"},
     {"mla_no_graph", "ENGINE_MLA_NO_GRAPH", "mla-no-graph", false, false, Type::Bool, "false",
      0, 0, "disable CUDA Graph for MLA models (default keeps the historical rule)"},
+    {"cpu_dual_stream", "ENGINE_NO_CPU_DUAL_STREAM", "no-cpu-dual-stream", false, true,
+     Type::Bool, "true", 0, 0,
+     "run the CPU-layer shared-expert block on a second stream, concurrently with the "
+     "host routed-expert GEMV (structural overlap: the block is independent of routing); "
+     "the main stream joins it before the add3 that consumes xout_"},
     {"cpu_layer_ffn_graph", "ENGINE_NO_CPU_FFN_GRAPH", "no-cpu-ffn-graph", false, true,
      Type::Bool, "true", 0, 0,
      "per-layer CUDA graph for the shared-expert GPU block of CPU-placed MoE layers "

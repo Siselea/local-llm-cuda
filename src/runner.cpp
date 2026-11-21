@@ -2584,7 +2584,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   // the host submission time (~0.12 ms/layer of cuLaunchKernel calls on the 35B, all of
   // it on the critical path because the host must finish submitting before it can sync),
   // while keeping the exact same kernel sequence and addition order.
-  if (any_cpu_pre) {
+  auto submit_shared_block = [&]() {
     auto& SL = layers_[layer];
     const bool sh_graph = cpu_layer_ffn_graph_ && !no_graph_cfg_ && n_tokens == 1 &&
                           !graph_capture_ && !use_dev && !ENGINE_ENV_ON("ENGINE_DUMP") &&
@@ -2618,6 +2618,31 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
           std::fprintf(stderr, "[cpu-ffn-graph] disabled: %s\n", e.what());
         }
       }
+    }
+  };
+  // Decode: submit the block on a second stream *after* the routing sync, so its GPU
+  // work overlaps the host GEMV instead of extending the sync.  Prefill keeps the
+  // historical order (submit before the sync, which also drains the queue).
+  const bool sh_dual = any_cpu_pre && cpu_dual_stream_ && n_tokens == 1 && !graph_capture_ &&
+                       !ENGINE_ENV_ON("ENGINE_DUMP") && !ENGINE_ENV_ON("ENGINE_PROFILE") &&
+                       !ENGINE_ENV_ON("ENGINE_KPROF");
+  bool sh_dual_submitted = false;
+  if (any_cpu_pre) {
+    if (sh_dual) {
+      // The block only reads hn_ and the layer's fixed weights, so it only has to wait
+      // for the main stream up to the norms/router (recorded here as an event); after
+      // that it runs concurrently with the routing round-trip and the host GEMV.
+      if (!sh_stream_) sh_stream_ = cuda::create_stream();
+      if (!sh_ev_) sh_ev_ = std::make_unique<cuda::Event>();
+      sh_ev_->record_on(cuda::current_stream());
+      sh_ev_->stream_wait(sh_stream_);
+      void* saved_stream = cuda::current_stream();
+      cuda::set_stream(sh_stream_);
+      submit_shared_block();
+      cuda::set_stream(saved_stream);
+      sh_dual_submitted = true;
+    } else {
+      submit_shared_block();
     }
   }
   if (dl_routing) {
@@ -2804,6 +2829,9 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     }
   }
 
+  // Join the shared-expert stream before the fused/per-expert GPU kernels and the tail
+  // add3 read xout_ on the main stream (the host GEMV above ran concurrently with it).
+  if (sh_dual_submitted) cuda::stream_sync(sh_stream_);
   const auto acc_t_tail0 = std::chrono::steady_clock::now();
   // ---- fused path: one kernel for gate+up+silu and one for down+scatter ----
   bool fused_done = false;
@@ -4064,6 +4092,7 @@ void DenseRunner::load_config_snapshot() {
   layer_graph_ = cfg.get_bool("layer_graph");
   mla_attn_graph_ = cfg.get_bool("mla_attn_graph");
   cpu_layer_ffn_graph_ = cfg.get_bool("cpu_layer_ffn_graph");
+  cpu_dual_stream_ = cfg.get_bool("cpu_dual_stream");
   no_graph_cfg_ = cfg.get_bool("no_graph");
   layer_graph_auto_ = cfg.get_bool("layer_graph_auto");
   no_bm_ = cfg.get_bool("no_bm");

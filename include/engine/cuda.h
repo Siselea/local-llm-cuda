@@ -161,6 +161,10 @@ class Event {
   Event(const Event&) = delete;
   Event& operator=(const Event&) = delete;
   void record();
+  // Cross-stream ordering without a host synchronisation: record on one stream, then
+  // make another stream wait for it (cuStreamWaitEvent).
+  void record_on(void* stream);
+  void stream_wait(void* stream);
   double elapsed_ms(const Event& end) const;   // valid after end.sync()
   void synchronize();
 
