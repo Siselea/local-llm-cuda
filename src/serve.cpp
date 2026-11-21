@@ -360,7 +360,14 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
   const int vocab = model.vocab();
   if (static_cast<int>(logits.size()) < vocab)
     throw std::runtime_error("model returned fewer logits than the vocabulary");
-  std::vector<float> last(logits.end() - vocab, logits.end());
+  // forward(last_row_only=true) returns exactly one vocabulary row.  Move it instead
+  // of copying ~1 MB (this used to be a hidden per-request cost).
+  std::vector<float> last;
+  if (static_cast<int>(logits.size()) == vocab) {
+    last = std::move(logits);
+  } else {
+    last.assign(logits.end() - vocab, logits.end());
+  }
 
   sampler::Sampler sampler(0);
   sampler::Params sp;
@@ -478,7 +485,9 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
   // ---- prefill context bookkeeping ---------------------------------------
   std::vector<int> context = ids;  // prompt + generated (for repetition penalty)
   int pos = static_cast<int>(ids.size());
-  int next = greedy ? sampler::Sampler::argmax(last) : sampler.sample(last, context);
+  int next = greedy ? sampler::Sampler::argmax(last)
+                    : sampler.sample_bounded(last, context);
+  std::vector<float>().swap(last);  // release the 1 MB prefill row after the first pick
   int produced = 0;
 
   // ---- optional MTP speculative decoding (greedy + single-call prefill only) ----
@@ -603,8 +612,8 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
       auto row = model.forward_topk({cur}, pos, 5, &tkr);
       ++pos;
       if (!row.empty()) {
-        last.assign(row.end() - vocab, row.end());
-        next = sampler::Sampler::argmax(last);
+        // device top-k header disabled -> the full row came back: argmax in place
+        next = sampler::Sampler::argmax(row);
       } else if (!tkr.idx.empty()) {
         next = tkr.idx[0];
       } else {
@@ -618,8 +627,10 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
         out.finish_reason = "error";
         break;
       }
-      last.assign(row.end() - vocab, row.end());
-      next = sampler.sample(last, context);
+      // sample directly from the moved-in row: no second 1 MB copy, and the
+      // candidate set is selected inside the sampler (top_k>0: exact top-k;
+      // top_k=0: top-1024 approximation, see /props.sampling and docs/CONFIG.md).
+      next = sampler.sample_bounded(row, context);
     }
   }
   if (spec_active) model.spec_end();
@@ -963,6 +974,27 @@ void handle_props(const ServerState& st, http::Conn& conn) {
   w.integer(st.opts.default_top_k);
   w.key("repeat_penalty");
   w.number(st.opts.default_repetition_penalty);
+  w.end_obj();
+  // How non-greedy sampling is implemented (perf(serve) change 2026-11-21):
+  // the sampler chain runs on a bounded candidate set instead of the full
+  // vocabulary.  Exposed so benchmark tools / UIs can see the approximation.
+  w.key("sampling");
+  w.begin_obj();
+  w.key("implementation");
+  w.str("bounded-candidates");
+  w.key("candidate_cap");
+  w.integer(sampler::Sampler::kDefaultCandidateCap);
+  w.key("top_k_candidates");
+  w.str("max(top_k,64)");
+  w.key("top_k_zero");
+  w.str("approx-top-1024");
+  w.key("greedy");
+  w.str("exact argmax over the full vocabulary (unchanged)");
+  w.key("notes");
+  w.str("non-greedy: repetition penalty/top_k/top_p/min_p/temperature are evaluated on "
+        "the candidate set; top_p/min_p probabilities are renormalised over it; with "
+        "top_k=0 the nuclei are approximated by the top-1024 logits (long-tail mass "
+        "below is truncated). top_k>0 keeps the exact top-k set.");
   w.end_obj();
   w.key("host");
   w.str(st.opts.host);
@@ -2012,9 +2044,11 @@ int run(const Options& opts) {
               st.model->prefix_state_supported() ? "hybrid SSM+KV" : "KV only",
               static_cast<double>(st.model->prefix_state_bytes()) / 1048576.0,
               st.model->prefill_chunk(), st.no_limit_tokens);
-  std::printf("[serve] sampling: temp=%.2f top_k=%d top_p=%.2f | think budget: %s%d tokens "
+  std::printf("[serve] sampling: temp=%.2f top_k=%d top_p=%.2f | sampler: bounded candidates "
+              "(cap %d; top_k=0 -> top-%d approx) | think budget: %s%d tokens "
               "| repeat guard: level %d\n",
               st.opts.default_temperature, st.opts.default_top_k, st.opts.default_top_p,
+              sampler::Sampler::kDefaultCandidateCap, sampler::Sampler::kDefaultCandidateCap,
               st.think_budget > 0 ? "force </think> after " : "off",
               st.think_budget, st.repeat_guard);
   if (st.tk.vocab_size() != st.model->vocab())

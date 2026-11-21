@@ -292,6 +292,35 @@ llama.cpp webui 默认发 `max_tokens:-1`。以前按 ctx 上限（4096）生成
 现在 `max_tokens<=0` 映射为 `serve_no_limit_tokens`（默认 1024，`--no-limit-tokens` 可改），
 `/props` 暴露 `no_limit_tokens`。
 
+### 5.5 采样性能：候选集采样（`perf(serve)`，2026-11-21）
+
+**问题**：serve 对**每个非 greedy token** 走 `forward()` 取整行 248320 维 logits
+（1 MB D2H）+ `last.assign` 再复制 1 MB + `Sampler` 整词表 `fill` + `partial_sort(248320,20)`
+≈ 0.2 ms/token；如果客户端发 `top_k=0`（只 top_p，llama.cpp 系 UI 可配），
+整词表 `exp`（1.33 ms）+ `sort 248320 pairs`（0.45 ms）≈ **1.9 ms/token**（9B 的 ~9%）。
+
+**修复**：
+
+* serve 不再复制 logits 行（move 进 sampler）；greedy 路径逐 token 不变（仍是设备 top-k + argmax）。
+* 新增 `Sampler::sample_bounded()`：先用 host **单遍 top-N 扫描**（sorted insertion window，AVX2 8 路跳过）选候选集，再在候选集上跑
+  **同一套** sampler 链（repetition penalty → top_k → top_p → min_p → temp → dist）：
+  * `top_k > 0`：候选 = 前 `max(top_k,64)`，top-k 集合精确；
+  * `top_k = 0`：候选 = 前 1024（`kDefaultCandidateCap`），即 **top-1024 近似 top_p**；
+  * penalty 只作用候选 id（不再整行复制）。
+* 预留设备候选接口：`Sampler::set_candidates(ids, logits, n)`，等 runner 侧设备 top-k
+  扩到 64/128 后直接接入（serve 不需要再改）。
+* `/props.sampling` 暴露实现（`implementation=bounded-candidates`、`candidate_cap`、
+  `top_k_zero=approx-top-1024`）——客户端/评测可据此判断是否近似。
+* 已知差异：极端长尾分布下排名 >1024 的 token 概率被截断；`top_k>0` 时若被 penalty 压出
+  前 64 的 token 才会引入顺序差异（概率可忽略）。单测 `tests/test_sampler.cpp` 覆盖
+  greedy 一致、top_k 精确、top_k=0 截断（对比整词表实现）、penalty、外部候选、可复现性。
+
+**webui 实际参数（证据）**：bundle 里请求体默认
+`temperature:0.6, top_k:20, top_p:.95, min_p:0`（`getConfig()` 还会把 llama.cpp 旧默认
+`0.8/40/0.95/0.05` 一次性迁移到 `0.6/20/0.95/0`）——所以 webui 主路径是 `top_k=20`
+（省 ~0.2 ms/token），`top_k=0` 是显式关闭 top-k 的客户端才会走的边缘路径（省 ~1.7 ms/token）。
+实测数据见 `docs/reports/SERVE-SAMPLING-PERF.md`。
+
 ---
 
 ## 6. 已知限制（如实）

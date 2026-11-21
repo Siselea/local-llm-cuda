@@ -300,6 +300,25 @@ run_attn_legacy / derive_ctx_limit / activation_bytes`（`src/runner.cpp`）；
 服务端托管的 llama.cpp webui 前端默认值同步改成这组，旧 localStorage 配置会做一次性迁移。
 模型在更高温度（如 0.8）下容易在 thinking 里自述循环，见 `SERVE.md` §5.3。
 
+**非 greedy 采样的候选集实现（`perf(serve)`，2026-11-21）**：serve 对每个非 greedy token
+不再把 248320 维 logits 整行做 fill / exp / sort，而是在**候选集**上跑同一套采样链：
+
+* `top_k > 0`：候选 = raw logits 的前 `max(top_k, 64)` 个（host 单遍 top-N 扫描：sorted insertion window + AVX2 8 路跳过），
+  top-k 集合与整词表实现**精确一致**；
+* `top_k = 0`（只给 top_p 的 llama.cpp 系 UI 常见）：候选 = 前 `1024`
+  （`Sampler::kDefaultCandidateCap`），top_p / min_p / softmax 在该候选集上归一化，
+  即"**用 top-1024 近似 top_p**"；
+* repetition penalty 只作用在候选 id 上（不再复制整行）；greedy（`temperature=0`）仍是
+  整行 argmax，**逐 token 输出不变**；
+* 已知差异：极端长尾分布下，排名 >1024 的 token 概率被截断（正常对话影响极小；单测
+  `test_sampler.cpp` 里有对应 case）。
+
+实现方式通过 **`/props.sampling`** 暴露：
+`{"implementation":"bounded-candidates","candidate_cap":1024,"top_k_candidates":"max(top_k,64)",
+"top_k_zero":"approx-top-1024","greedy":"exact argmax ..."}`。
+将来 runner 侧设备端 top-k 扩到 64/128 后，可直接用 `Sampler::set_candidates(ids, logits, n)`
+把设备候选接进来（接口已预留，serve 无需再改）。
+
 **serve 的 prefill chunk 默认值**：若没有显式设置 `prefill_rows`，`engine serve` 会把
 `prefill_rows`（和 `prefill_rows_max`）钉在 `128`。前缀缓存的快照/切分点按该 chunk 边界对齐，
 128 让"每轮最多多 prefill <128 token"；同时 128 行的 activation/logits 缓冲更小，能多放 GPU 专家。

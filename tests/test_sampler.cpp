@@ -193,6 +193,207 @@ void test_repetition_penalty() {
   check(can_pick_0, "repeat_last_n window expires older tokens");
 }
 
+// ---------------------------------------------------------------------------
+// Bounded-candidate sampling (perf(serve) 2026-11-21): the serve non-greedy path.
+// Must keep greedy bit-identical, keep top_k exact, and only approximate top_p
+// when top_k == 0 (top-1024 candidate cap).
+// ---------------------------------------------------------------------------
+void test_bounded_greedy_parity() {
+  engine::sampler::Params p;
+  p.temperature = 0.0;
+  bool same = true;
+  for (int seed = 0; seed < 5; ++seed) {
+    auto logits = make_logits(5000, 3.0f);
+    logits[static_cast<size_t>(17 + seed)] = 50.0f;
+    engine::sampler::Sampler a(static_cast<uint64_t>(seed));
+    engine::sampler::Sampler b(static_cast<uint64_t>(seed));
+    a.set_params(p);
+    b.set_params(p);
+    for (int i = 0; i < 50; ++i) {
+      const int ra = a.sample(logits, {});
+      const int rb = b.sample_bounded(logits, {});
+      if (!(ra == rb && ra == engine::sampler::Sampler::argmax(logits))) same = false;
+    }
+  }
+  check(same, "bounded: temperature=0 is an exact full-row argmax (same as sample)");
+}
+
+void test_bounded_top_k_exact() {
+  auto logits = make_logits(5000, 4.0f);
+  engine::sampler::Params p;
+  p.temperature = 1.0;
+  p.top_k = 3;
+  p.seed = 1;
+  engine::sampler::Sampler s(1);
+  s.set_params(p);
+  s.set_candidate_cap(64);
+  bool in_range = true;
+  for (int i = 0; i < 500; ++i) {
+    const int id = s.sample_bounded(logits, {});
+    if (id < 0 || id > 2) in_range = false;
+  }
+  check(in_range, "bounded: top_k=3 only samples the 3 best ids (candidate cap 64)");
+}
+
+void test_bounded_top_p() {
+  std::vector<float> logits = flat_logits(1000, -10.0f);
+  logits[77] = 0.0f;
+  engine::sampler::Params p;
+  p.temperature = 1.0;
+  p.top_p = 0.5;
+  p.top_k = 0;
+  p.seed = 3;
+  engine::sampler::Sampler s(3);
+  s.set_params(p);
+  bool always_77 = true;
+  for (int i = 0; i < 200; ++i)
+    if (s.sample_bounded(logits, {}) != 77) always_77 = false;
+  check(always_77, "bounded: top_p keeps the dominant token only");
+
+  auto flat = flat_logits(100, 0.0f);
+  engine::sampler::Params q;
+  q.temperature = 1.0;
+  q.top_p = 1.0;
+  q.top_k = 0;
+  q.seed = 11;
+  engine::sampler::Sampler s2(11);
+  s2.set_params(q);
+  std::map<int, int> hist;
+  for (int i = 0; i < 2000; ++i) hist[s2.sample_bounded(flat, {})]++;
+  check(hist.size() > 50, "bounded: candidate set == vocab samples the whole distribution");
+}
+
+void test_bounded_reproducible() {
+  auto logits = make_logits(2000);
+  engine::sampler::Params p;
+  p.temperature = 0.9;
+  p.top_p = 0.9;
+  p.top_k = 40;
+  p.seed = 42;
+  engine::sampler::Sampler s1(42), s2(42);
+  s1.set_params(p);
+  s2.set_params(p);
+  bool equal = true;
+  for (int i = 0; i < 256; ++i) {
+    std::vector<int> ctx(static_cast<size_t>(i), i % 7);
+    if (s1.sample_bounded(logits, ctx) != s2.sample_bounded(logits, ctx)) equal = false;
+  }
+  check(equal, "bounded: same seed + params -> identical sampled sequence");
+}
+
+void test_bounded_top_k0_truncation() {
+  // flat logits over a 5000-token vocab: top_k=0 must stay inside the top
+  // candidate_cap() logits (documented approximation), while the full-vocab
+  // reference can reach the whole distribution.
+  auto flat = flat_logits(5000, 0.0f);
+  engine::sampler::Params p;
+  p.temperature = 1.0;
+  p.top_p = 1.0;
+  p.top_k = 0;
+  p.seed = 21;
+  engine::sampler::Sampler a(21), b(21);
+  a.set_params(p);
+  b.set_params(p);
+  std::map<int, int> bounded_hist;
+  int tail_full = 0;
+  for (int i = 0; i < 3000; ++i) {
+    const int idb = b.sample_bounded(flat, {});
+    bounded_hist[idb]++;
+    if (a.sample(flat, {}) >= engine::sampler::Sampler::kDefaultCandidateCap) ++tail_full;
+  }
+  const bool bounded_small = bounded_hist.size() <=
+                             static_cast<size_t>(engine::sampler::Sampler::kDefaultCandidateCap);
+  check(bounded_small, "bounded: top_k=0 candidate set capped at 1024 tokens");
+  check(tail_full > 0, "reference: full-vocab top_k=0 can sample below top-1024 (documented diff)");
+}
+
+void test_bounded_penalty() {
+  std::vector<float> logits = flat_logits(100, 0.0f);
+  logits[0] = 5.0f;
+  logits[1] = 4.0f;
+  engine::sampler::Params p;
+  p.temperature = 1.0;
+  p.top_k = 2;
+  p.repetition_penalty = 10.0;
+  p.seed = 9;
+  engine::sampler::Sampler s(9);
+  s.set_params(p);
+  s.set_candidate_cap(64);
+  std::vector<int> recent = {0};
+  int n1 = 0;
+  for (int i = 0; i < 2000; ++i)
+    if (s.sample_bounded(logits, recent) == 1) ++n1;
+  check(n1 > 1900, "bounded: repetition penalty suppresses a repeated candidate (>95%)");
+}
+
+void test_external_candidates() {
+  // Simulates the future device-top-k hook: the runner hands back 5 candidates.
+  std::vector<float> logits = flat_logits(1000, 0.0f);
+  const int ids[5] = {3, 7, 11, 42, 99};
+  const float vals[5] = {-2.0f, -1.5f, -1.0f, -0.5f, 0.0f};
+  for (int i = 0; i < 5; ++i) logits[static_cast<size_t>(ids[i])] = vals[i];
+  engine::sampler::Params p;
+  p.temperature = 1.0;
+  p.top_k = 0;
+  p.top_p = 1.0;
+  p.seed = 5;
+  engine::sampler::Sampler s(5);
+  s.set_params(p);
+  s.set_candidates(ids, vals, 5);
+  bool only_candidates = true;
+  std::map<int, int> hist;
+  for (int i = 0; i < 1000; ++i) {
+    const int id = s.sample_bounded(logits, {});
+    if (!(id == 3 || id == 7 || id == 11 || id == 42 || id == 99)) only_candidates = false;
+    hist[id]++;
+  }
+  check(only_candidates, "external candidates: only the supplied ids are sampled");
+  check(hist[99] > hist[3], "external candidates: their own logits drive the distribution");
+  s.clear_candidates();
+  check(!s.has_external_candidates(), "external candidates: clear_candidates() resets the hook");
+
+  // deterministic given the same seed
+  engine::sampler::Sampler a(99), b(99);
+  a.set_params(p);
+  b.set_params(p);
+  a.set_candidates(ids, vals, 5);
+  b.set_candidates(ids, vals, 5);
+  bool same = true;
+  for (int i = 0; i < 256; ++i)
+    if (a.sample_bounded(logits, {}) != b.sample_bounded(logits, {})) same = false;
+  check(same, "external candidates: deterministic for a seed");
+}
+
+void test_bounded_penalised_topk_matches_full() {
+  // With top_k>0 the bounded path must select the same top-k set as the
+  // full-vocab reference: a penalised leader is replaced by the next logit.
+  auto logits = make_logits(200, 5.0f);
+  logits[0] = 6.0f;  // leader, but repeated
+  logits[1] = 5.999f;
+  logits[2] = 5.998f;
+  logits[3] = 5.997f;
+  engine::sampler::Params p;
+  p.temperature = 1.0;
+  p.top_k = 3;
+  p.repetition_penalty = 100.0;
+  p.seed = 13;
+  engine::sampler::Sampler a(13), b(13);
+  a.set_params(p);
+  b.set_params(p);
+  std::vector<int> recent = {0};
+  std::map<int, int> ha, hb;
+  for (int i = 0; i < 1500; ++i) {
+    ha[a.sample(logits, recent)]++;
+    hb[b.sample_bounded(logits, recent)]++;
+  }
+  auto keys = [](const std::map<int, int>& h) {
+    std::vector<int> k;
+    for (const auto& kv : h) k.push_back(kv.first);
+    return k;
+  };
+  check(keys(ha) == keys(hb), "bounded: penalised top_k set matches the full-vocab reference");
+}
+
 }  // namespace
 
 int main() {
@@ -204,6 +405,14 @@ int main() {
   test_top_p();
   test_min_p();
   test_repetition_penalty();
+  test_bounded_greedy_parity();
+  test_bounded_top_k_exact();
+  test_bounded_top_p();
+  test_bounded_reproducible();
+  test_bounded_top_k0_truncation();
+  test_bounded_penalty();
+  test_external_candidates();
+  test_bounded_penalised_topk_matches_full();
   std::printf("\n%s\n", failures == 0 ? "SAMPLER TESTS PASSED" : "SAMPLER TESTS FAILED");
   return failures == 0 ? 0 : 1;
 }
