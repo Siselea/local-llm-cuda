@@ -287,6 +287,10 @@ class DenseRunner {
   void* qc_ptr_ = nullptr;
   int qc_nin_ = 0;
   long long qc_stamp_ = -1;
+  // Graph-launch generation the staged int8 copy belongs to.  A graph replay executes
+  // kernels without advancing g_launch_calls, so qc_stamp_ alone cannot prove that a
+  // staged buffer is still valid; see docs/GRAPH-INVARIANTS.md (invariant 1).
+  long long qc_graph_ = -1;
   bool splitk_ = false, dp4a_optin_ = false;
   bool use_quant_gemm_ = false, half_optin_ = false, half_t_optin_ = false;
   // Prefill GEMM via fp16 tensor cores: dequantise the weight slab straight to fp16

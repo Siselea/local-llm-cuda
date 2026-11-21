@@ -107,6 +107,11 @@ extern long long g_sync_calls;
 extern double g_sync_ms;
 extern long long g_launch_calls;
 extern double g_launch_ms;
+// Monotonic count of Graph::launch() calls.  A graph replay executes its recorded
+// kernels without going through cuda::launch(), so g_launch_calls does not advance for
+// it; host caches that use "nothing was launched since" as a validity proof must also
+// compare this generation (see docs/GRAPH-INVARIANTS.md).
+extern long long g_graph_launches;
 extern long long g_buf_bytes;
 extern long long g_buf_count;
 extern std::vector<std::pair<size_t, int>> g_buf_log;

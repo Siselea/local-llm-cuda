@@ -3747,7 +3747,8 @@ void DenseRunner::run_gemv_plan(const GemvChoice& c, const QTensor& w, cuda::Buf
       // GEMVs; reuse the staged int8 copy when no kernel has been launched since
       // (which also proves the buffer cannot have been overwritten).
       const bool reuse = quant_reuse_ && qc_ptr_ == pxf && qc_nin_ == nni &&
-                         qc_stamp_ == cuda::g_launch_calls;
+                         qc_stamp_ == cuda::g_launch_calls &&
+                         qc_graph_ == cuda::g_graph_launches;
       if (!reuse) {
         void* qargs[] = {&pxf, &pq, &pdx, &pxs8, &nni};
         cuda::launch(k_quantx_i8_, (w.n_in + 31) / 32, 1, 1, 32, 1, 1, 0, qargs);
@@ -3772,6 +3773,7 @@ void DenseRunner::run_gemv_plan(const GemvChoice& c, const QTensor& w, cuda::Buf
         qc_ptr_ = pxf;
         qc_nin_ = nni;
         qc_stamp_ = cuda::g_launch_calls;
+        qc_graph_ = cuda::g_graph_launches;
       }
       return;
     }

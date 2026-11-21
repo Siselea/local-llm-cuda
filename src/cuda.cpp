@@ -560,9 +560,13 @@ void Graph::capture_end() {
   check(g_driver.StreamEndCapture(g_stream, &graph_), "cuStreamEndCapture");
   check(g_driver.GraphInstantiate(&exec_, graph_, 0), "cuGraphInstantiate");
 }
-void Graph::launch() { check(g_driver.GraphLaunch(exec_, g_stream), "cuGraphLaunch"); }
+void Graph::launch() {
+  check(g_driver.GraphLaunch(exec_, g_stream), "cuGraphLaunch");
+  ++g_graph_launches;
+}
 
 long long g_launch_calls = 0;
+long long g_graph_launches = 0;
 double g_launch_ms = 0.0;
 namespace {
 struct KProfAgg { double ms = 0.0; long long calls = 0; };
