@@ -141,6 +141,7 @@ Q5_K 12288x4096  = q5k_dp4a_s
 | `cpu_layer_graph` | `--cpu-layer-graph` | `ENGINE_NO_CPU_LAYER_GRAPH`（反转） | bool | `true` | CPU 驻留 MoE 层也录制 attention/mixer 段的逐层 Graph：每层少 ~7 次 WDDM 提交，35B 上 ~1.6 ms/token。早期实测"净变慢"是因为一次性录制落在 decode 计时窗口内；把录制挪到首次执行之后（prefill 内）后净收益为正 |
 | `dev_route` | `--dev-route` | `ENGINE_NO_DEV_ROUTE`（反转）/ `ENGINE_DEV_ROUTE`（强制开） | bool | `true` | GPU 驻留层用设备端路由：省掉每层 router D2H + host 同步 + 路由表 H2D；专家的量化布局里含 `Q5_1` 时自动关闭（该分支数值未验证） |
 | `mla_no_graph` | `--mla-no-graph` | `ENGINE_MLA_NO_GRAPH` | bool | `false` | MLA 模型禁用 Graph（保留历史规则） |
+| `cpu_layer_ffn_graph` | `--no-cpu-ffn-graph` | `ENGINE_NO_CPU_FFN_GRAPH` | bool | `true` | CPU 驻留 MoE 层的共享专家 GPU 段（zero-fill + 共享 gate/up/silu/down + gate_inp + add，约 8–9 次 kernel）按层录一张 CUDA Graph：这段只依赖 `hn_` 和固定权重，逐 token 不变；图化省的是 host 提交时间（35B CPU 层每层 ~0.12 ms，且因 sync 前必须先提交完而全在关键路径上），kernel 序列与加法次序完全不变 |
 | `mla_attn_graph` | `--no-mla-attn-graph` | `ENGINE_NO_MLA_ATTN_GRAPH` | bool | `true` | deepseek2 MLA 的 decode attention 段（ln1 norm + MLA attention + ln2 norm）按层录一张 CUDA Graph：实测每层 18 次 WDDM 提交 → 1 次 cuGraphLaunch（本机 1 次图启动 ≈10 µs，18 次裸提交 ≈180 µs）。仅当 MLA 投影全量化且 `mla_q_layout` 非 global 时生效；`--no-graph` 也会整体关掉 |
 | `prefill_f32` | `--prefill-f32` / `--prefill-f32=0` | `ENGINE_PREFILL_F32` | bool | `true` | 保留 f32 权重镜像用于 batch>1 prefill；MoE 或显存不足时自动关闭 |
 | `gemm` | `--quant-gemm` | `ENGINE_GEMM` | bool | `false` | 自研量化 GEMM 用于 prefill（实验） |

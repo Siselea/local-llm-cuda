@@ -232,6 +232,11 @@ class DenseRunner {
     // (matmul GEMV path) and the q layout is not the cuBLAS "global" variant.
     std::unique_ptr<cuda::Graph> mla_attn_graph;
     int mla_attn_graph_state = 0;   // 0 = execute + record on the first decode call, 2 = replay
+    // CPU-placed MoE layer: the shared-expert GPU block (zero-fill + shared gate/up/silu/
+    // down + gate_inp + add, ~8 launches) depends only on hn_ and fixed weights, so it
+    // is recorded once and replayed; saves the host submission time before the sync.
+    std::unique_ptr<cuda::Graph> cpu_ffn_graph;
+    int cpu_ffn_graph_state = 0;   // 0 = execute + record on the first decode call, 2 = replay
   };
 
   // ---- MTP / speculative decoding internals --------------------------------
@@ -477,6 +482,7 @@ class DenseRunner {
   bool head_topk_ = true;      // config: reduce logits on the device for decode
   bool mla_attn_graph_ = true; // config: per-layer CUDA graph for the MLA attention segment
   bool no_graph_cfg_ = false;  // config: --no-graph disables every capture path
+  bool cpu_layer_ffn_graph_ = true;  // config: graph for the shared-expert block of CPU layers
   bool rms4_ = true;           // config: vectorised rmsnorm kernel
   // impl of forward()/forward_topk(); topk_k > 0 selects the device top-k head
   std::vector<float> forward_impl(const std::vector<int>& tokens, int start_pos,

@@ -2579,7 +2579,47 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   if (acc_moe) prof_acc::moe_pre_ms += prof_acc::since(acc_moe0);
   // Host-resident experts: issue the shared-expert GPU block now so the flush below is
   // the only one and the queue drains before the host GEMV starts.
-  if (any_cpu_pre) run_shared_block();
+  // The block depends only on hn_ and the layer's fixed weights, i.e. it is
+  // token-invariant, so on decode it is recorded once as a per-layer graph.  That saves
+  // the host submission time (~0.12 ms/layer of cuLaunchKernel calls on the 35B, all of
+  // it on the critical path because the host must finish submitting before it can sync),
+  // while keeping the exact same kernel sequence and addition order.
+  if (any_cpu_pre) {
+    auto& SL = layers_[layer];
+    const bool sh_graph = cpu_layer_ffn_graph_ && !no_graph_cfg_ && n_tokens == 1 &&
+                          !graph_capture_ && !use_dev && !ENGINE_ENV_ON("ENGINE_DUMP") &&
+                          !ENGINE_ENV_ON("ENGINE_PROFILE") && !ENGINE_ENV_ON("ENGINE_KPROF") &&
+                          !ENGINE_ENV_STR("ENGINE_SH_SCALE");
+    if (sh_graph && SL.cpu_ffn_graph_state == 2 && SL.cpu_ffn_graph) {
+      SL.cpu_ffn_graph->launch();
+    } else {
+      run_shared_block();
+      if (sh_graph) {
+        // First decode-shaped call: the block already ran above (this token's result),
+        // now record the same sequence.  Recording executes nothing, so the state it
+        // captures stays as the normal path left it.
+        cuda::stream_sync();
+        auto g = std::make_unique<cuda::Graph>();
+        try {
+          g->capture_begin();
+          graph_capture_ = true;
+          run_shared_block();
+          graph_capture_ = false;
+          g->capture_end();
+          SL.cpu_ffn_graph = std::move(g);
+          SL.cpu_ffn_graph_state = 2;
+          if (ENGINE_ENV_ON("ENGINE_DBG_GRAPH"))
+            std::fprintf(stderr, "[graph] layer %d cpu ffn block captured\n", layer);
+        } catch (const std::exception& e) {
+          graph_capture_ = false;
+          g->capture_abort();
+          // Never retry in this process: a half-recorded stream would poison later work.
+          cpu_layer_ffn_graph_ = false;
+          std::fprintf(stderr, "[cpu-ffn-graph] disabled: %s\n", e.what());
+        }
+      }
+    }
+  }
   if (dl_routing) {
     cuda::stream_sync();
     rl = static_cast<const float*>(rl_pin_.data());
@@ -4023,6 +4063,7 @@ void DenseRunner::load_config_snapshot() {
   prefill_graph_ = cfg.get_bool("prefill_graph");
   layer_graph_ = cfg.get_bool("layer_graph");
   mla_attn_graph_ = cfg.get_bool("mla_attn_graph");
+  cpu_layer_ffn_graph_ = cfg.get_bool("cpu_layer_ffn_graph");
   no_graph_cfg_ = cfg.get_bool("no_graph");
   layer_graph_auto_ = cfg.get_bool("layer_graph_auto");
   no_bm_ = cfg.get_bool("no_bm");
