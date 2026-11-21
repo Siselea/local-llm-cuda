@@ -322,7 +322,8 @@ llama.cpp webui 默认发 `max_tokens:-1`。以前按 ctx 上限（4096）生成
   greedy 一致、top_k 精确、top_k=0 截断（对比整词表实现）、penalty、外部候选、可复现性。
 
 **device top-k 候选（2026-11-21 新增，v0.1.4 仅接线）**：解码头可在设备端直接产出 top-k
-候选（`head_topk_max`，**stock 默认 8**；v0.1.5 会用 A/B 后把它默认提到 64），非 greedy 请求在
+候选（`head_topk_max`，**stock 默认 8**；实测 k=64 的 device top-k 内核本身要 2.4–5.8 ms/token，
+大于省掉的 1 MB D2H ⇒ **默认保持 8**，k>8 自动回退整行，见报告 §11），非 greedy 请求在
 `top_k>0 && max(top_k,64) <= head_topk_max` 时只把候选 `(id, logit)` 拷回 host
 （省掉整行 248320×4 B ≈1 MB D2H + host 扫描），其余请求（`top_k=0`、`top_k>64`、
 设备头不可用）**自动回退整行路径**。`/props.sampling.device_candidates` 暴露

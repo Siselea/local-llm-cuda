@@ -299,3 +299,27 @@ webui 默认 top_k=20/top_p=0.95。
 （40716/185/2614/2614）；`gen_regression` **10/10 GREEN**；`verify_generality` **26/26 GREEN**；
 `verify_serve` 0.5B **22/22**、9B **21/21 GREEN**；`test_sampler` **PASS**。
 验证时 `HEAD=89e8b3a dirty=15`；提交后工作树只剩他人改动。
+
+
+## 11. v0.1.5 计划中的 A/B：device top-k k=64 是**净亏**（2026-11-21 21:57，负结果）
+
+`98f4a9d`（v0.1.4）只接线、保持 stock `head_topk_max=8`。计划 v0.1.5 把它默认提到 64，
+因此先做了**同二进制、只改 env** 的交易对照（避免把 prefill x8/chunk 收益混进来）：
+
+| 场景 | k=8（off） | k=64（on） | 差值 |
+|---|---|---|---|
+| greedy decode（temp0，128 tok） | **45.04 tok/s / 22.20 ms/tok** | **35.69 tok/s / 28.02 ms/tok** | **+5.8 ms/token（−26%）** |
+| 采样 decode（temp0.6/top_k20） | 42.42 tok/s / 23.57 ms | 38.56 tok/s / 25.93 ms | +2.36 ms/token（−10%） |
+| 采样 decode（top_k=0，应走整行回退） | 41.45 tok/s / 24.13 ms | 36.93 tok/s / 27.08 ms | +2.95 ms/token（−12%） |
+
+（greedy 两次的 generated_token_ids **完全相同**，排除采样差异。）
+
+**机制**：`head_topk_max` 同时决定 decode CUDA graph 里 `topk_partial/topk_final` 的 kk；
+topk 内核按 k 轮选择（每轮扫一遍本 block 的 248k/nblk 个 logits），k=64 的代价（~2.4–5.8 ms/token）
+**远大于**省掉的 1 MB D2H + host 扫描（~0.3 ms），而且对 greedy 和回退到整行的请求同样生效
+⇒ 提高 default 是负优化。
+
+**结论/下一步**：v0.1.5 **不启用** `head_topk_max=64`；保持 stock 8（top_k>8 自动回退整行）。
+若要启用设备候选，需要先优化 device top-k 内核（例如 k≤8 保持、k>8 改用一次扫描的
+阈值/基数选择，或让 graph 按请求配置选 kk），这属于 runner/kernels 侧（edge-kernels）；
+serve 侧接线与 `sample_external` 已就绪，默认值一行即可切换。
