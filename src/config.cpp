@@ -47,6 +47,17 @@ const OptionDef kDefs[] = {
     // ---------------- memory placement ----------------
     {"vram_margin_mb", "ENGINE_VRAM_MARGIN_MB", "vram-margin", true, false, Type::Int, "1200",
      0, 1 << 20, "free VRAM (MiB) required to remain after loading (post-load check)"},
+    {"vram_extra_reserve_mb", "ENGINE_VRAM_EXTRA_RESERVE_MB", "vram-extra-reserve", true,
+     false, Type::Int, "1024", 0, 1 << 20,
+     "VRAM reserved for allocations that never show up in the engine's own ledger: CUDA "
+     "context, cuBLAS workspaces and allocator padding.  The automatic layer placement "
+     "subtracts it so the post-load free-VRAM margin is real instead of optimistic "
+     "(measured on this machine as [vram] post-load used - alloc_sum: 1.13-1.25 GiB on the "
+     "9B/35B, 2.1 GiB on the Coder MoE).  Tuning curve on an exclusive GPU: reserve 1024 "
+     "keeps 2.1-2.4 GiB free after load (margin 1200) at a decode cost of only 0.6-2.4%, "
+     "while 2048 costs 6.5-9% (every MiB of reserve can drop a whole MoE layer).  Without "
+     "it an auto-placed MoE model can load to 0 MiB free and the driver pages: 3 tok/s "
+     "instead of 25.  0 restores the old optimistic behaviour"},
     {"vram_budget_mb", "ENGINE_VRAM_BUDGET_MB", "vram-budget", true, false, Type::Int, "0",
      0, 1 << 20, "simulated VRAM budget in MiB for expert placement, 0 = free VRAM"},
     {"workspace_mb", "ENGINE_WORKSPACE_MB", "workspace", true, false, Type::Int, "768",

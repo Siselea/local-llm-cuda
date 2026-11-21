@@ -339,6 +339,10 @@ class DenseRunner {
   size_t vram_margin_floor_bytes_ = 900ull << 20;  // hard floor for the auto-margin decision
   bool vram_auto_layers_ = false;              // config: opt-in post-load auto-margin promotion
   int vram_auto_layers_max_ = 2;               // config: max layers promoted after load
+  // Ledger-invisible VRAM (driver context, cuBLAS workspaces, allocator padding): the
+  // auto layer placement reserves it, otherwise the post-load margin is optimistic and
+  // the driver pages (measured gap between device-used and cuda::g_buf_bytes).
+  size_t vram_extra_reserve_ = 0;
   bool vram_adaptive_ = true;
   bool gpu_layers_explicit_ = false;           // user pinned gpu_layers
   int planned_gpu_moe_layers_ = -1;            // pre-load estimate (0 = none)

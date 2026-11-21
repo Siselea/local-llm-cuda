@@ -27,6 +27,7 @@
 | [MTP-RECON.md](MTP-RECON.md) | MTP / 投机解码 可行性报告（MTP-RECON） | MTP 机制逆向分析：权重布局、草稿/验证流程与可行性评估。 |
 | [OVERHEAD-17MS-REPORT.md](OVERHEAD-17MS-REPORT.md) | 17 ms 可回收开销 — 取证、实现与结论报告（OVERHEAD-17MS） | decode 17 ms 额外开销定位与优化报告。 |
 | [PRE-FILL-REPORT.md](PRE-FILL-REPORT.md) | PRE-FILL 报告：prefill 从 llama.cpp 的 1/4 到与之同量级（多行量化 GEMM + 注意力分块 + SSM 状态常驻） | prefill fp16 tensor-core GEMM 优化：9B 1.6k prompt 333→1046-1097 tok/s。 |
+| [PLACEMENT-VRAM-MARGIN.md](PLACEMENT-VRAM-MARGIN.md) | 自动分层显存余量修复（PLACEMENT-VRAM-MARGIN） | 自动分层漏算"账本看不见"的 1.1-2.1 GiB 开销（驱动/cuBLAS/分配器）→ 装载后可能 0 MiB free、驱动换页（3 tok/s）：新增可标定 vram_extra_reserve_mb=1024、逐层自适应检查纳入该预留、装载后不足改为明确 ERROR；3×generality + genreg + smoke 全绿。 |
 | [PREFILL-CLIFF-REPORT.md](PREFILL-CLIFF-REPORT.md) | PREFILL-CLIFF 报告：用户可感知的两个 prefill 慢（首 token / 长文档） | serve prefill chunk 128→512/1024 自适应 + 装载期按实际显存定 rows + 超长 prompt 400：长文档 prefill 1.85–2.0×，冷启动惩罚消除。 |
 | [Q6K-DP4A-RESULTS.md](Q6K-DP4A-RESULTS.md) | Q6_K dp4a GEMV 改造（2026-11-14） | Q6_K DP4A int8 内核的结果与边界分析。 |
 | [QWEN35-SEMANTICS-FIX-REPORT.md](QWEN35-SEMANTICS-FIX-REPORT.md) | Qwen3.5-9B / Qwen3.6-35B-A3B 真实文本生成修复报告（GGUF 张量语义） | qwen35/qwen35moe GGUF 语义修复：llama.cpp 约定 vs HF 语义，逐 token 一致。 |

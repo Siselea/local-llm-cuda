@@ -421,9 +421,13 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
     } else {
       budget = cuda::mem_info().free_bytes;
     }
-    // KV cache + activations + workspace reserve
+    // KV cache + activations + workspace reserve.  vram_extra_reserve_ covers the
+    // allocations the ledger below cannot see (driver context, cuBLAS workspaces,
+    // allocator padding): without it the planned layer count can leave 0 MiB free
+    // after load, which makes the driver page (measured: 25 tok/s -> 3 tok/s).
     const size_t kv = kv_layer_bytes(max_seq_) * static_cast<size_t>(n_kv_layers_);
-    const size_t reserve = kv + (static_cast<size_t>(cfg.get_int("workspace_mb")) << 20);
+    const size_t reserve = kv + (static_cast<size_t>(cfg.get_int("workspace_mb")) << 20) +
+                           vram_extra_reserve_;
     // The f32 lm_head mirror is only built when the GGUF has no quantized output
     // tensor; reserving vocab*hidden*4 unconditionally wastes ~2 GiB on 248k-vocab
     // models and costs several expert layers.
@@ -4182,6 +4186,7 @@ void DenseRunner::load_config_snapshot() {
   }
   vram_margin_bytes_ = static_cast<size_t>(cfg.get_int("vram_margin_mb")) << 20;
   vram_adaptive_ = cfg.get_bool("vram_check");
+  vram_extra_reserve_ = static_cast<size_t>(cfg.get_int("vram_extra_reserve_mb")) << 20;
   gpu_layers_explicit_ = cfg.was_set("gpu_layers");
   has_kernel_overrides_ = !cfg.kernel_overrides().empty();
 }
@@ -4204,7 +4209,13 @@ bool DenseRunner::expert_layer_fits_vram(int layer, int moe_index, size_t device
   // estimate with only ~38 MiB left, then the final free-VRAM check came out 38 MiB below
   // the configured margin).  The slack keeps the "free >= margin after load" contract
   // instead of letting a borderline layer in and then only warning about it.
-  const size_t need = device_bytes + extra_bytes + residual + (96ull << 20);
+  // The 96 MiB slack covers pointer arrays / allocator granularity; vram_extra_reserve_
+  // covers the ledger-invisible driver/cuBLAS overhead, otherwise the last admitted
+  // layer can consume the post-load margin (that was the auto-placement flake: the same
+  // command landed on 14/15/17 GPU layers depending on ambient free VRAM and one of
+  // those picked free=0 after load).
+  const size_t need =
+      device_bytes + extra_bytes + residual + (96ull << 20) + vram_extra_reserve_;
   if (mi.free_bytes >= need + vram_margin_bytes_) {
     if (debug_)
       std::fprintf(stderr,
@@ -4234,28 +4245,32 @@ void DenseRunner::check_post_load_vram() {
   const cuda::MemInfo mi = cuda::mem_info();
   const long long free_mb = static_cast<long long>(mi.free_bytes >> 20);
   const long long margin_mb = static_cast<long long>(vram_margin_bytes_ >> 20);
+  // The ledger gap (device used - engine allocations) is the value vram_extra_reserve_
+  // is calibrated against; printing it makes future calibration data-driven.
+  const long long used_mb = static_cast<long long>((mi.total_bytes - mi.free_bytes) >> 20);
+  const long long ledger_mb = static_cast<long long>(cuda::g_buf_bytes >> 20);
   if (mi.free_bytes >= vram_margin_bytes_) {
     std::fprintf(stderr,
                  "[vram] check OK: %lld MiB free >= %lld MiB margin (gpu_moe_layers=%d)"
-                 "%s\n",
+                 "%s [ledger gap %lld MiB, reserve %lld MiB]\n",
                  free_mb, margin_mb, gpu_moe_layers_,
-                 gpu_layers_explicit_ ? " [explicit --gpu-layers]" : " [auto]");
+                 gpu_layers_explicit_ ? " [explicit --gpu-layers]" : " [auto]",
+                 used_mb - ledger_mb,
+                 static_cast<long long>(vram_extra_reserve_ >> 20));
   } else {
-    // The estimate above may still be off (e.g. expert layers placed late).  Rather than
-    // only warning, start cutting the biggest single lever we control here: the prefill
-    // activation buffers.  Free VRAM is the difference between 25 tok/s and 3 tok/s once
-    // the driver starts paging.
-    size_t before = rows_;
-    while (rows_ > 32 && mi.free_bytes < vram_margin_bytes_) {
-      rows_ >>= 1;
-      // activations are per-row; shrink until the freed bytes are enough or we hit 32
-      break;
-    }
+    // The activation buffers are sized before the weights are uploaded (see the actual
+    // free-VRAM re-derivation there) and this check runs after them, so shrinking rows_
+    // here would not free anything -- it used to just print "Prefill chunk halved".  The
+    // lever that actually works is the placement estimate above (vram_extra_reserve_);
+    // this path is now a loud, actionable backstop.
     std::fprintf(stderr,
-                 "[vram] WARNING: only %lld MiB free after load, margin is %lld MiB. "
-                 "Lower --gpu-layers / --vram-margin to avoid driver paging.%s\n",
-                 free_mb, margin_mb,
-                 rows_ < before ? " Prefill chunk halved." : "");
+                 "[vram] ERROR: only %lld MiB free after load, margin is %lld MiB "
+                 "(ledger gap %lld MiB, extra reserve %lld MiB). Driver paging will make "
+                 "this run ~10x slower. Fix: lower --gpu-layers (currently auto-placed at "
+                 "%d), raise --vram-margin, or raise --vram-extra-reserve.%s\n",
+                 free_mb, margin_mb, used_mb - ledger_mb,
+                 static_cast<long long>(vram_extra_reserve_ >> 20), gpu_moe_layers_,
+                 "");
   }
 }
 
