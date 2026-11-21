@@ -22,6 +22,7 @@
 | [HOSTLAYER-35B-REPORT.md](HOSTLAYER-35B-REPORT.md) | hostlayer-35b 交付报告（2026-11-15） | 35B CPU 专家层调度与主机侧带宽分析。 |
 | [KV-LONGCTX-REPORT.md](KV-LONGCTX-REPORT.md) | KV cache 量化 + 长上下文 attention + 上下文上限自适应（KV-LONGCTX-REPORT） | KV 量化与长上下文报告：q8_0/q4_0 KV、ctx 自适应与长上下文实测。 |
 | [LONGCTX-REPORT.md](LONGCTX-REPORT.md) | 长上下文（4k / 2k 预填）报告：一个必然崩溃的 bug + 修复后的数据 | 长上下文（2048/4k/8k）填充与性能实测。 |
+| [LAYER-MAJOR-PREFILL-PLAN.md](LAYER-MAJOR-PREFILL-PLAN.md) | 层主序 prefill 设计（LAYER-MAJOR-PREFILL-PLAN） | 设计文档：把 chunk-major 改成 layer-major（每权重矩阵 dequant 一次），预期长文档 −8~−10%；tail 用「小 n CUDA graph」而不是层主序。 |
 | [MTP-IMPL-REPORT.md](MTP-IMPL-REPORT.md) | MTP 投机解码 实施报告（MTP-IMPL） | MTP 投机解码实现报告（实验特性，默认关闭）。 |
 | [MTP-RECON.md](MTP-RECON.md) | MTP / 投机解码 可行性报告（MTP-RECON） | MTP 机制逆向分析：权重布局、草稿/验证流程与可行性评估。 |
 | [OVERHEAD-17MS-REPORT.md](OVERHEAD-17MS-REPORT.md) | 17 ms 可回收开销 — 取证、实现与结论报告（OVERHEAD-17MS） | decode 17 ms 额外开销定位与优化报告。 |

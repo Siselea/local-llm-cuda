@@ -33,6 +33,29 @@ has() {
     printf '%s\n' "$out" | tail -4 | sed 's/^/    /'
   fi
 }
+# Same assertion as has(), but retries once after a short pause.  On this machine the
+# previous engine process can still be releasing its VRAM when the next one starts
+# (WDDM), which is enough to flip the post-load margin check (headroom is only
+# ~170 MiB over the 1200 MiB default margin).  The assertion itself is NOT relaxed:
+# the engine must still report "check OK", we just allow the release latency to settle.
+has_retry() {
+  local name="$1" want="$2"
+  shift 2
+  local out
+  out=$(eval "$@" 2>&1)
+  if printf '%s' "$out" | grep -qF "$want"; then ok "$name"; return 0; fi
+  sleep 2
+  out=$(eval "$@" 2>&1)
+  if printf '%s' "$out" | grep -qF "$want"; then
+    ok "$name (retry 1/1 due to VRAM release latency)"
+  else
+    bad "$name (retry 1/1 due to VRAM release latency)"
+    printf '%s\n' "$out" | tail -4 | sed 's/^/    /'
+    # surface the VRAM ledger so a future flake can be told apart from a real regression
+    printf '%s\n' "$out" | grep -E '\[vram\]' | sed 's/^/    /'
+  fi
+}
+
 fails_with() {
   local name="$1" want="$2"
   shift 2
@@ -144,7 +167,12 @@ else
   else
     bad "margin sweep (600MiB:$lo, 2400MiB:$hi)"
   fi
-  has "post-load margin enforced" "check OK" \
+  # record device VRAM before the check: if this ever flakes again the log shows
+  # whether the headroom was thin (driver/previous process) or a real regression.
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "  (pre-check GPU mem used: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null))"
+  fi
+  has_retry "post-load margin enforced" "check OK" \
     "ENGINE_TOPK=1 $GEN --model '$M_CODER' --ids 549,6077,280,7239 --n 2"
   has "explicit gpu-layers honoured" "gpu_moe_layers=8" \
     "ENGINE_TOPK=1 $GEN --model '$M_CODER' --ids 549,6077 --n 1 --gpu-layers 8"
