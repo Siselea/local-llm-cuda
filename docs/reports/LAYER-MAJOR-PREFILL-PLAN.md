@@ -11,8 +11,8 @@
    - 13.4k prompt、chunk=1024（14 块）：省 `13 × ~95 ms ≈ 1.24 s` / 16.0 s ⇒ **约 −7.7%**
    - 4.4k prompt、chunk=1024（5 块）：省 `4 × 95 ≈ 0.38 s` / 3.7 s ⇒ **约 −10%**
    - **52-token tail（1 块）：收益 0**（本来就只 dequant 一次）
-2. 所以：**层主序不是 tail 的解**。tail 的 ~180–200 ms 固定成本要另找杠杆，其中最便宜的是**小 n 的 CUDA graph**（把 ~700 次 launch 变成 1 次；现有 `prefill_graph` 机制早就写好，只是默认关、且当时对大 chunk 无收益所以被搁置）。
-3. 推荐顺序：**先做小 n CUDA graph（1–2 h，直接改善多轮首 token）→ 再做层主序 V1（FFN-only，2–3 h，长文档 −8~−10%）**。
+2. **小 n CUDA graph 已实现并实测：不影响性能**（图确实捕获/重放了，但 68 tok 的 prefill 图开 190 ms = 图关 190 ms）。原因：~130 ms 固定成本是**显存流量**（dequant 读 6.1 GB + 写 12.2 GB + cuBLAS 再读 12.2 GB ≈ 30 GB ≈ 91 ms），不是 launch 开销。代码留在 `pf/small-n-graph` 分支、默认关。
+3. 推荐顺序：**① fused dequant+GEMM（去掉 fp16 镜像，tail 190→~85 ms、长文档再 −9%）→ ② 层主序 V1（−8~−10%）**。两者叠加是长文档与 tail 的根治组合。
 
 ---
 
@@ -94,28 +94,49 @@ for layer in layers:                      # 外层
 
 ---
 
-## 3. tail 的 ~180 ms：更便宜的解法（建议先做）
+## 3. tail 的固定成本：小 n CUDA graph 已实测 **无效**，真正的杠杆是"去掉 fp16 镜像"
 
-tail 是"1 个 chunk"，层主序救不了它。它的固定成本里有很大一块是 **launch 数量**（~700 次/forward），而 WDDM 下每次 launch 约 30–100 µs ⇒ 20–70 ms；再加上 dequant ~95 ms。
+### 3.1 实测（2026-11-21，9B，prefix cache 关，独占 GPU，同一二进制，`ENGINE_NO_GRAPH=1` 作对照）
 
-**小 n CUDA graph**：复用现成的 `prefill_graph` 机制（`src/runner.cpp` 里按 `n_tokens` 捕获整条 prefill 流水线，默认 `prefill_graph=false`；当初实测对大 chunk 无收益 1506 vs 1478 ms，因为大 chunk 是 GPU-bound）。对 n≤128 的 tail 它是 **launch-bound**，预期能把固定成本从 ~180 ms 降一个档次（dequant 仍在，launch 大部分消失）。
+| n_tokens | 图开（捕获+重放） | 图关（纯 launch） | 差异 |
+|---|---|---|---|
+| 68 | **190 ms** | **190 ms** | 0 |
+| 91 | 197 ms | 195 ms | +1% |
+| 160 | 285 ms | 277 ms | +3% |
 
-设计要点：
-1. 新配置 `prefill_graph_small_max`（默认 128，0=关）：只对 `n_tokens ≤ max` 的 forward 捕获图；
-2. 按 n 分桶（例如 8/16/…/128 或精确 n），图缓存上限 `prefill_graph_slots`（默认 16）避免无限内存；
-3. 捕获前必须预分配 `x_half_`/`dequant_scratch_`（现有代码已这么做）；
-4. 位置无关性已验证（位置在 `pos_dev_`，图捕获时不 baked；大 chunk 图当时实测无收益但没有正确性问题）；
-5. 与 server-mode 的 cache 路径交互：tail 的 n 由 prompt 决定（变化多），桶化会造成"某个 n 首次请求捕获一次"的成本（捕获 ~5–20 ms），可接受；若不想承担，可只对**最常见桶**（如 n≤128 每 16 一桶）捕获。
+图**确实**被捕获与重放（`ENGINE_DBG_PFGRAPH=1` 打出 `[pfgraph] captured n=69 rowsonly=1` / `ran ... ready=1`；图按 `n*2+(last_row_only)` 键控、LRU 有界、capture 失败安全回退），但**时间完全不变** ⇒ 之前"~700 次 WDDM launch 是固定成本大头（20–70 ms）"的假设被证伪：本机 WDDM 在连续提交时每次 launch 只有几 µs。
 
----
+> 实现已留在独立分支 `pf/small-n-graph`（worktree `build/pf_smallgraph`，commit `df6341e`），配置项 `prefill_small_graph`/`prefill_graph_small_min`/`prefill_graph_small_max`/`prefill_graph_slots`，**默认 false**；等将来把固定成本压到 launch 重新变成大头（例如做完 §3.3）再评估打开。
+
+### 3.2 ~130 ms 固定成本是什么：显存流量（不是 launch）
+
+每个小 prefill forward 的固定流量（9B）：
+
+| 步骤 | 流量 |
+|---|---|
+| 读量化权重 → 写 fp16 镜像（dequant，实测 ≈95 ms） | 6.1 GB 读 + 12.2 GB 写 |
+| cuBLAS 读 fp16 镜像做 GEMM | 12.2 GB 读 |
+| **合计** | **≈30 GB / 331 GB/s ≈ 91 ms** + dequant 计算 ⇒ 与实测 fixed ≈120–130 ms 吻合 |
+
+图只改"提交方式"、不改流量，所以对固定成本无效。
+
+### 3.3 真正的杠杆：fused dequant + GEMM（不落 fp16 镜像）
+
+把"dequant 到 fp16 scratch → cuBLAS 再读"改成 **tile 级 fused kernel**：读量化权重 tile（全模型总流量 6.1 GB）→ 在 shared memory 里 dequant 成 fp16 tile → 直接 HMMA。流量 30 GB → 6.1 GB，固定成本预期 130 ms → **~25–35 ms**：
+- **tail**：52-token prefill 从 ~190 ms → 预期 **~80–90 ms**（剩下的是 conv/attention/head 等其它固定项）；
+- **长文档**：每个 chunk 的固定成本同样从 ~130 ms → ~30 ms；13.4k（14 个 chunk）再省 `14 × 100 ms ≈ 1.4 s / 16 s ≈ 9%`；
+- **与层主序可叠加**：层主序消除"每 chunk 一次 dequant"，fused 消除"每次 dequant 的镜像写读"，两者叠加后长文档的固定成本从 14×130 ms=1.82 s 降到 ~14×30 ms=0.42 s（约 −9% 总时长），tail 也受益。
+
+实现入口：`src/kernels.h` 已有自研量化 GEMM（`gemm_q4k/q5k/q6k`，当前 SIMT f32，慢到 19 tok/s，见 `ENGINE_GEMM=1` 实测），把它升级为"dequant→shared fp16→HMMA"即可复用现有 prefill 结构；这是本项目下一个真正的性能台阶（不是图，也不是更大的 chunk）。
 
 ## 4. 落地步骤与验收
 
 | 步骤 | 工作量 | 验收 |
 |---|---|---|
-| ① 小 n CUDA graph（`prefill_graph_small_max`） | 1–2 h | 52-token tail prefill 从 ~200 ms 降到 ≤130 ms；`gen_regression` 10/10；逐 token 对拍一致 |
-| ② 层主序 V1（dense 模型） | 2–3 h | 13.4k prompt −7~−10%（交错 A/B min-of-3）；`gen_regression` 10/10；`ENGINE_SPLIT_PREFILL` top-1 一致；bit-exact 与现路径对拍 |
-| ③ （可选）层主序 V2 / 35B MoE 适配 | +1 天 | 35B 长 prompt prefill 不退化 |
+| ① fused dequant+GEMM（kernels.h 的 `gemm_q*k` 升级为 dequant→shared fp16→HMMA） | 1–2 天 | tail 52 tok：190→≤90 ms；13.4k：再 −8~−10%；`gen_regression` 10/10；`ENGINE_SPLIT_PREFILL` top-1 一致 |
+| ② 层主序 V1（dense 模型；与①叠加） | 2–3 h | 13.4k prompt 累计 −12~−15%（交错 A/B min-of-3）；`gen_regression` 10/10；逐 token 对拍 |
+| ③ （可选）小 n CUDA graph 重新评估（`pf/small-n-graph` 分支已就绪，默认关） | 0.5 h | 若①把固定成本压到 ~30 ms 后 launch 占比回升，再 A/B 一次 |
+| ④ （可选）层主序 V2 / 35B MoE 适配 | +1 天 | 35B 长 prompt prefill 不退化 |
 
 **风险**：
 - bit-exact 前提是"chunk 边界不变"——若将来 server-mode 的 cache 解耦需要改变前向 chunk，必须重新对拍（届时保持"同一次请求内 chunk 序列一致"即可）。
