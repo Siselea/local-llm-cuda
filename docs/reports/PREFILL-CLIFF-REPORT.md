@@ -122,7 +122,7 @@ req0 target=13363: HTTP 400           <- 改前是 500 "forward: bad token count
 |---|---|---|
 | `tools/verify.sh` | **ALL GREEN（exit 0）** | 在该提交的构建上通过 |
 | `tools/smoke_models.sh` | **exit 0** | 40716 / 185 / 2614 / 2614 全对 |
-| `tools/gen_regression.sh` | **未通过（2 例：`35b_chat22`、`coder_v2_lite`）** | **不能归因于本提交**：(a) 用的 `build/*.exe` 是 18:07 构建，工作树里含 **edge-kernels 未提交的设备 top-k 改动**（`head_topk_max_` / `forward_topk_candidates`，见 `git diff src/runner.cpp`），(b) 跑的时候 GPU 上有 **3 个 `test_gen.exe`（合计 12.2 GB > 12 GB 显存）** 在验证 v0.1.2，处于换页状态。**必须在"工作树干净 + 独占 GPU"下重跑才能定性**；本提交对 CLI 的 prefill 只有"装载期 rows 决策"一处影响，且 gen_regression 的 prompt 只有 8–22 token（< 任何 rows），chunk 不变。 |
+| `tools/gen_regression.sh` | **待干净环境重测**（一次运行里 2 例未过：`35b_chat22`、`coder_v2_lite`） | **不能归因于本提交**：(a) 用的 `build/*.exe` 是 18:07 构建，工作树里含 **edge-kernels 未提交的设备 top-k 改动**（`head_topk_max_` / `forward_topk_candidates`，见 `git diff src/runner.cpp`），(b) 跑的时候 GPU 上有 **3 个 `test_gen.exe`（合计 12.2 GB > 12 GB 显存）** 在验证 v0.1.2，处于换页状态。**必须在"工作树干净 + 独占 GPU"下重跑才能定性**；本提交对 CLI 的 prefill 只有"装载期 rows 决策"一处影响，且 gen_regression 的 prompt 只有 8–22 token（< 任何 rows），chunk 不变。 |
 | `tools/verify_generality.sh` | **未完成** | 在 GPU 被 edge-kernels 占用后中止。注：先前日志里的 `MODEL_DIR: unbound variable` 是外层 shell `export A=B && (...)` 在本机 ops wrapper 下**只对第一条命令生效**的假失败；已用自带 export 的 `tools/pf_run_suites.sh` 修正，需干净窗口复跑 |
 | `tools/verify_serve.sh` | **未完成** | 同上 |
 | `stability_probe.py long_ctx/long_chat` | 未跑 | 建议与 server-mode 的 prefix-cache 复测同窗口（它负责多轮/长上下文稳定性） |
