@@ -282,6 +282,13 @@ const OptionDef kDefs[] = {
      0, 0, "experimental fp16 NT prefill mirror"},
     {"half_t", "ENGINE_HALF_T", "half-t", false, false, Type::Bool, "false",
      0, 0, "experimental fp16 TN prefill mirror"},
+    {"prefill_logits_rows", "ENGINE_PREFILL_LOGITS_ROWS", "prefill-logits-rows", true,
+     false, Type::Int, "1", 0, 1 << 20,
+     "how many logits rows the prefill activation budget reserves (0 = one per chunk row, "
+     "the old behaviour).  A last_row_only prefill head computes exactly ONE row, so "
+     "reserving 1 instead of rows*vocab*4 frees ~1 MB per row at a 248k vocab and lets the "
+     "prefill chunk grow ~4x at the same VRAM (fewer whole-model dequant passes); a "
+     "full-logits call grows the buffer on demand"},
     {"prefill_f16", "ENGINE_PREFILL_F16", "prefill-f16", false, false, Type::Bool, "true",
      0, 0,
      "prefill (n_tokens>1) GEMM through fp16 tensor cores: dequantise the weight slab "

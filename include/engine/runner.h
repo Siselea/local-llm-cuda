@@ -456,7 +456,9 @@ class DenseRunner {
   bool kv_override_ctx_ = false;   // max_seq_ was clamped/derived from the VRAM budget
   int attn_split_rows_ = 8;    // rows of attn_scratch_ (decode / small-batch batches)
   size_t kv_layer_bytes(int seq) const;   // bytes of K+V of one attention layer
-  size_t activation_bytes(int rows) const;  // activation VRAM for `rows` prefilled rows
+  size_t activation_bytes(int rows) const;
+  // Grow logits_ if a full-logits call needs more rows than were reserved.
+  void ensure_logits_rows(int rows);  // activation VRAM for `rows` prefilled rows
   bool kv_quant_ok() const;               // tiled kernel supports this head_dim
   void derive_ctx_limit(int requested);
   void alloc_kv_cache(LayerW& w);
@@ -532,6 +534,10 @@ class DenseRunner {
   // overhead on top of ~1.3 s of GPU work.
   std::map<int, std::unique_ptr<cuda::Graph>> prefill_graphs_;
   bool prefill_graph_ = true;
+  // Logits rows reserved for prefill chunk sizing (default 1: a last_row_only prefill
+  // head computes one row; 0 restores rows*vocab*4).  ensure_logits_rows() grows the
+  // buffer when a caller asks for full logits.
+  int prefill_logits_rows_ = 1;
   int x_half_max_nin_ = 0;   // widest matmul input seen (sizes the fp16 staging buffer)
   bool graph_ready_ = false;
   bool use_graph_ = true;

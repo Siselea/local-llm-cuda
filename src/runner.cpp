@@ -575,12 +575,20 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   {
     const size_t free_now = cuda::mem_info().free_bytes;
     const size_t need_margin = vram_margin_bytes_ + (64ull << 20);
+    // activation_bytes() is the design formula; the constructor allocates measurably
+    // more (measured on the 9B hybrid at rows=4096: 2300 MiB real vs 1925 MiB estimated,
+    // i.e. ~18% more -- attention scratch and staging buffers the formula omits).  The
+    // growth therefore budgets with a calibrated cushion so the post-load free-VRAM
+    // margin stays real; without it the serve post-load guard refused to start.
+    auto need_for = [&](size_t r) {
+      return static_cast<size_t>(static_cast<double>(activation_bytes(static_cast<int>(r))) *
+                                 1.18) + need_margin;
+    };
     const int want_rows = static_cast<int>(rows_);
-    while (rows_ > 32 && free_now < activation_bytes(static_cast<int>(rows_)) + need_margin)
-      rows_ >>= 1;
+    while (rows_ > 32 && free_now < need_for(rows_)) rows_ >>= 1;
     const int grow_cap = static_cast<int>(engine::config::get_int("prefill_rows_max"));
     while (rows_ < static_cast<size_t>(max_seq_) && static_cast<int>(rows_) < grow_cap &&
-           free_now >= activation_bytes(static_cast<int>(rows_ * 2)) + need_margin)
+           free_now >= need_for(rows_ * 2))
       rows_ *= 2;
     if (static_cast<int>(rows_) != want_rows)
       std::fprintf(stderr,
@@ -611,7 +619,18 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   up_ = cuda::Buffer(rows * inter_ * 4);
   act_ = cuda::Buffer(rows * inter_ * 4);
   down_ = cuda::Buffer(rows * hidden_ * 4);
-  logits_ = cuda::Buffer(rows * static_cast<size_t>(vocab_) * 4);
+  // Reserve only the configured number of logits rows: a last_row_only prefill head
+  // computes exactly one row, so rows*vocab*4 (1 MB/row at a 248k vocab, 78% of the
+  // per-row activation estimate) needlessly capped the prefill chunk at ~1024 rows on
+  // a 9B at ctx 32768, and every extra chunk re-dequantises the whole model.  A caller
+  // that wants full logits grows the buffer on demand (ensure_logits_rows).
+  {
+    int logits_rows = static_cast<int>(rows);
+    if (prefill_logits_rows_ > 0 && prefill_logits_rows_ < logits_rows)
+      logits_rows = prefill_logits_rows_;
+    logits_ = cuda::Buffer(static_cast<size_t>(std::max(1, logits_rows)) *
+                           static_cast<size_t>(vocab_) * 4);
+  }
   // pinned staging for the per-token logits download (see forward())
   logits_pin_.resize(static_cast<size_t>(vocab_) * 4);
   // Split-K scratch of the tiled attention (decode path).  Allocated here, not at
@@ -740,8 +759,58 @@ size_t DenseRunner::activation_bytes(int rows) const {
   per_row += static_cast<size_t>(n_head_) * static_cast<size_t>(head_dim_) * 4 * 2;
   per_row += static_cast<size_t>(n_kv_) * static_cast<size_t>(head_dim_) * 4 * 2;
   per_row += static_cast<size_t>(inter_) * 4 * 3;
-  per_row += static_cast<size_t>(vocab_) * 4;              // one logits row per token
-  return r * per_row + (2ull << 20);
+  // Hybrid SSM (qwen3.5): the mixer keeps its own per-token working set -- two conv
+  // buffers, z/o/v, q/k, four per-value-head vectors, the qfull/gate/attn staging.
+  // Missing these made the chunk-growth estimate ~221 KB/row optimistic on the 9B.
+  if (ir_.ssm.variant != "none") {
+    const auto& S = ir_.ssm;
+    per_row += static_cast<size_t>(S.conv_dim) * 4 * 2;              // mixed, conv
+    per_row += static_cast<size_t>(S.value_dim) * 4 * 3;             // z, o, v
+    per_row += static_cast<size_t>(S.key_dim) * 4 * 2;               // q, k
+    per_row += static_cast<size_t>(S.n_value_head) * 4 * 4;          // beta, beta_b, a, g
+    per_row += static_cast<size_t>(n_head_ * head_dim_ * 2) * 4;     // qfull
+    per_row += static_cast<size_t>(n_head_ * head_dim_) * 4 * 2;     // gate, attn_q
+    per_row += static_cast<size_t>(n_kv_ * head_dim_) * 4 * 2;       // attn_k, attn_v
+  }
+  // MLA projections (DeepSeek-V2 style): the absorbed q/kv staging buffers.
+  if (ir_.attn.variant == "mla") {
+    const size_t qk = static_cast<size_t>(ir_.attn.key_length);
+    const size_t v_dim = static_cast<size_t>(ir_.attn.value_length);
+    const size_t kv_lora = static_cast<size_t>(ir_.attn.kv_lora_rank);
+    const size_t qk_rope = static_cast<size_t>(ir_.attn.rope_dim);
+    const size_t nh = static_cast<size_t>(n_head_);
+    per_row += nh * qk * 4 * 3;                                      // mq, mk, mla_qraw
+    per_row += (kv_lora + qk_rope) * 4;                              // mkva
+    per_row += kv_lora * 4 * 2;                                      // mckv, mckvn
+    per_row += qk_rope * 4;                                          // mkpe
+    per_row += nh * (qk - qk_rope) * 4;                              // mkn
+    per_row += nh * v_dim * 4 * 2;                                   // mv, mout
+    per_row += nh * (qk - qk_rope + v_dim) * 4;                      // mla_kvraw
+  }
+  // MoE router logits and the gather staging buffers.
+  if (ir_.moe.n_expert > 0)
+    per_row += static_cast<size_t>(ir_.moe.n_expert) * 4 + static_cast<size_t>(hidden_) * 4 * 2;
+  // Logits: a last_row_only prefill head computes ONE row, so only the reserved rows
+  // (default 1) are part of the footprint.  Keeping this in sync with the allocation
+  // above is what lets the VRAM-derived chunk growth pick a much larger chunk.
+  const int logits_rows =
+      prefill_logits_rows_ > 0
+          ? std::min<int>(prefill_logits_rows_, static_cast<int>(r))
+          : static_cast<int>(r);
+  return r * per_row +
+         static_cast<size_t>(std::max(1, logits_rows)) * static_cast<size_t>(vocab_) * 4 +
+         (2ull << 20);
+}
+
+void DenseRunner::ensure_logits_rows(int rows) {
+  const size_t need = static_cast<size_t>(std::max(1, rows)) *
+                      static_cast<size_t>(vocab_) * 4;
+  if (logits_.size() >= need) return;
+  logits_ = cuda::Buffer(need);
+  std::fprintf(stderr,
+               "[logits] grew the logits buffer to %d rows (%.0f MiB) for a full-logits "
+               "call (prefill_logits_rows=%d)\n",
+               std::max(1, rows), static_cast<double>(need) / 1048576.0, prefill_logits_rows_);
 }
 
 void DenseRunner::derive_ctx_limit(int requested) {
@@ -2049,6 +2118,7 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
                  g_prof_active_ms);
   }
   const int rows = last_row_only ? 1 : n;
+  ensure_logits_rows(rows);
   {
     void* px = static_cast<float*>(x_.data()) +
                static_cast<size_t>(last_row_only ? (n - 1) * hidden_ : 0);
@@ -4155,6 +4225,7 @@ void DenseRunner::load_config_snapshot() {
   attn_gqa_ = cfg.get_bool("attn_gqa");
   prefill_f16_acc_ = cfg.get_bool("prefill_f16_acc");
   prefill_graph_ = cfg.get_bool("prefill_graph");
+  prefill_logits_rows_ = static_cast<int>(cfg.get_int("prefill_logits_rows"));
   layer_graph_ = cfg.get_bool("layer_graph");
   mla_attn_graph_ = cfg.get_bool("mla_attn_graph");
   cpu_layer_ffn_graph_ = cfg.get_bool("cpu_layer_ffn_graph");

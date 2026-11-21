@@ -2008,7 +2008,8 @@ int run(const Options& opts) {
   // fine (a turn only re-prefills the new tokens + <128 history tokens) while both
   // the cached and the full-prefill path still use identical absolute chunk
   // boundaries (bit-exact).  Explicit --prefill-rows / ENGINE_PREFILL_ROWS wins.
-  // Serve default prefill chunk: 512 tokens (was 128).  128 keeps the prefix-cache
+  // Serve default prefill chunk: 512 tokens (was 128), up to 4096 when VRAM allows --
+  // logits are reserved for one row now, so the row budget is ~4x smaller per token.  128 keeps the prefix-cache
   // snapshot granularity fine, but it costs every prefill a full-model dequant pass and
   // a fixed per-chunk overhead: measured on the 9B (exclusive GPU, prefix cache off),
   // a 2.4-3.6k prompt runs 592 tok/s at 128 vs 1023-1103 tok/s at 512, and an 11-13k
@@ -2021,7 +2022,7 @@ int run(const Options& opts) {
     std::string perr;
     engine::config::Config::get().set("prefill_rows", "512", engine::config::Source::Cli, &perr);
     if (!engine::config::was_set("prefill_rows_max"))
-      engine::config::Config::get().set("prefill_rows_max", "1024",
+      engine::config::Config::get().set("prefill_rows_max", "4096",
                                         engine::config::Source::Cli, &perr);
   }
   st.cache_align = static_cast<int>(engine::config::get_int("serve_cache_align"));
