@@ -622,14 +622,20 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   // decode head top-k staging: allocated here so CUDA-graph capture never mallocs
   head_topk_ = engine::config::get_bool("head_topk");
   {
+    // head_topk_max is the number of candidates the device head produces (and hence the
+    // largest k forward_topk()/forward_topk_candidates() can return).  kMaxTopK caps it.
+    head_topk_max_ = engine::config::get_int("head_topk_max");
+    if (head_topk_max_ < 1) head_topk_max_ = 1;
+    if (head_topk_max_ > kMaxTopK) head_topk_max_ = kMaxTopK;
     int nblk = static_cast<int>((static_cast<size_t>(vocab_) + 1939) / 1940);
     nblk = nblk < 1 ? 1 : (nblk > 256 ? 256 : nblk);
     topk_nblk_ = nblk;
-    topk_pv_ = cuda::Buffer(static_cast<size_t>(nblk) * 8 * 4);
-    topk_pi_ = cuda::Buffer(static_cast<size_t>(nblk) * 8 * 4);
-    topk_ov_ = cuda::Buffer(8 * 4);
-    topk_oi_ = cuda::Buffer(8 * 4);
-    topk_pin_.resize(8 * 4 * 2);
+    const size_t cap = static_cast<size_t>(kMaxTopK);
+    topk_pv_ = cuda::Buffer(static_cast<size_t>(nblk) * cap * 4);
+    topk_pi_ = cuda::Buffer(static_cast<size_t>(nblk) * cap * 4);
+    topk_ov_ = cuda::Buffer(cap * 4);
+    topk_oi_ = cuda::Buffer(cap * 4);
+    topk_pin_.resize(cap * 4 * 2);
   }
   if (ir_.ssm.variant != "none") {
     const auto& S = ir_.ssm;
@@ -2073,7 +2079,7 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
   // so forward()/forward_topk() only copy back k pairs instead of the whole row.
   // Recorded into the decode CUDA graph like the rest of the head.
   if (head_topk_ && rows == 1 && k_topkpart_ && k_topkfinal_ && topk_nblk_ > 0) {
-    int kk = 5;
+    int kk = head_topk_max_;   // recorded into the decode graph; forward_topk reads <= kk
     void* px = logits_.data();
     void* ppv = topk_pv_.data();
     void* ppi = topk_pi_.data();
@@ -2095,6 +2101,17 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
 std::vector<float> DenseRunner::forward(const std::vector<int>& tokens, int start_pos,
                                        bool last_row_only) {
   return forward_impl(tokens, start_pos, last_row_only, 0, nullptr);
+}
+
+bool DenseRunner::forward_topk_candidates(const std::vector<int>& tokens, int start_pos, int k,
+                                          std::vector<int>* ids, std::vector<float>* logits) {
+  if (k <= 0 || k > head_topk_max_) return false;
+  TopKResult tk;
+  const auto rest = forward_topk(tokens, start_pos, k, &tk);
+  if (!rest.empty()) return false;   // device top-k head unavailable (e.g. head_topk off)
+  if (ids) *ids = tk.idx;
+  if (logits) *logits = tk.val;
+  return true;
 }
 
 std::vector<float> DenseRunner::forward_topk(const std::vector<int>& tokens, int start_pos,
@@ -2268,14 +2285,15 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
   const bool want_topk = topk_k > 0 && last_row_only && n == 1 && head_topk_ &&
                          k_topkpart_ && k_topkfinal_ && tk != nullptr;
   if (want_topk) {
-    const int kk = std::min(topk_k, 8);
+    const int kk = std::min(topk_k, head_topk_max_);
     float* pin = static_cast<float*>(topk_pin_.data());
     topk_ov_.download_async(pin, static_cast<size_t>(kk) * 4);
-    topk_oi_.download_async(reinterpret_cast<int*>(pin + 8), static_cast<size_t>(kk) * 4);
+    topk_oi_.download_async(reinterpret_cast<int*>(pin + kMaxTopK),
+                           static_cast<size_t>(kk) * 4);
     cuda::stream_sync();
     tk->idx.assign(static_cast<size_t>(kk), -1);
     tk->val.assign(static_cast<size_t>(kk), 0.f);
-    const int* pi = reinterpret_cast<const int*>(pin + 8);
+    const int* pi = reinterpret_cast<const int*>(pin + kMaxTopK);
     for (int q = 0; q < kk; ++q) {
       tk->idx[static_cast<size_t>(q)] = pi[q];
       tk->val[static_cast<size_t>(q)] = pin[q];
@@ -4125,6 +4143,7 @@ void DenseRunner::load_config_snapshot() {
   cpu_layer_ffn_graph_ = cfg.get_bool("cpu_layer_ffn_graph");
   cpu_dual_stream_ = cfg.get_bool("cpu_dual_stream");
   tail_zero_copy_ = cfg.get_bool("tail_zero_copy");
+  // head_topk_max is read directly in the constructor (it sizes the graph buffers).
   no_graph_cfg_ = cfg.get_bool("no_graph");
   layer_graph_auto_ = cfg.get_bool("layer_graph_auto");
   no_bm_ = cfg.get_bool("no_bm");

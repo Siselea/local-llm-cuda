@@ -223,6 +223,12 @@ const OptionDef kDefs[] = {
     {"rms4", "ENGINE_NO_RMS4", "no-rms4", false, true, Type::Bool, "true", 0, 0,
      "float4 rmsnorm kernel (4x fewer load/store instructions in the 1-block norm; "
      "requires width % 4 == 0, falls back automatically)"},
+    {"head_topk_max", "ENGINE_HEAD_TOPK_MAX", "head-topk-max", true, false, Type::Int, "8",
+     1, 128,
+     "decode head candidates computed on the device (1-128): forward_topk / "
+     "forward_topk_candidates can return up to this many (index, logit) pairs without "
+     "copying the full logits row; larger values let a sampling server sample from "
+     "top-k candidates instead of a 1 MB D2H"},
     {"head_topk", "ENGINE_NO_HEAD_TOPK", "no-head-topk", false, true, Type::Bool, "true", 0, 0,
      "reduce the decode logits row to the top-k on the device and transfer only k pairs "
      "(the full 0.4-1 MB row download costs ~0.27 ms/token on WDDM)"},

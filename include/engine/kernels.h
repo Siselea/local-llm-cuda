@@ -3107,20 +3107,25 @@ extern "C" __global__ void topk_partial(const float* __restrict__ x, float* __re
                                         int* __restrict__ pi, int n, int nblk, int k) {
   __shared__ float sv[32];
   __shared__ int si[32];
-  __shared__ int taken[8];
+  // Selection bitmap over the block's local range (chunk <= 8192 indices).  An O(1)
+  // skip test instead of scanning the already-taken list keeps k=64/128 cheap.
+  __shared__ unsigned int taken[256];
   const int b = blockIdx.x;
   const int chunk = (n + nblk - 1) / nblk;
   const int lo = b * chunk;
   const int hi = min(n, lo + chunk);
   const int tid = threadIdx.x;
+  {
+    const int words = ((hi - lo) + 31) >> 5;
+    for (int w = tid; w < words; w += blockDim.x) taken[w] = 0u;
+    __syncthreads();
+  }
   for (int q = 0; q < k; ++q) {
     float best = 0.f;
     int bidx = -1;
     for (int i = lo + tid; i < hi; i += blockDim.x) {
-      bool skip = false;
-      for (int p = 0; p < q; ++p)
-        if (taken[p] == i) { skip = true; break; }
-      if (skip) continue;
+      const int off = i - lo;
+      if ((taken[off >> 5] >> (off & 31)) & 1u) continue;
       topk_better(best, bidx, x[i], i);
     }
     const unsigned full = 0xffffffffu;
@@ -3139,7 +3144,10 @@ extern "C" __global__ void topk_partial(const float* __restrict__ x, float* __re
       for (int j = 0; j < nw; ++j) topk_better(bv, bi, sv[j], si[j]);
       pv[b * k + q] = bv;
       pi[b * k + q] = bi;
-      taken[q] = bi;
+      if (bi >= 0) {
+        const int off = bi - lo;
+        taken[off >> 5] |= 1u << (off & 31);
+      }
     }
     __syncthreads();
   }
@@ -3151,7 +3159,7 @@ extern "C" __global__ void topk_final(const float* __restrict__ pv, const int* _
                                      int nc, int k, int* __restrict__ oi, float* __restrict__ ov) {
   __shared__ float sv[32];
   __shared__ int si[32];
-  __shared__ int taken[8];
+  __shared__ int taken[128];
   const int tid = threadIdx.x;
   for (int q = 0; q < k; ++q) {
     float best = 0.f;

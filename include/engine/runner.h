@@ -48,6 +48,11 @@ class DenseRunner {
   };
   std::vector<float> forward_topk(const std::vector<int>& tokens, int start_pos, int k,
                                   TopKResult* out);
+  // Device-side top-k candidates for a sampling server: returns k (index, logit) pairs
+  // straight from the device head (no full-vocab logits row crosses PCIe).  False when
+  // the device head is unavailable or k exceeds head_topk_max.
+  bool forward_topk_candidates(const std::vector<int>& tokens, int start_pos, int k,
+                               std::vector<int>* ids, std::vector<float>* logits);
 
   const ir::Model& ir() const { return ir_; }
   // test hook: contents of the MLA k-cache for one layer
@@ -481,6 +486,8 @@ class DenseRunner {
   cuda::Buffer topk_pv_, topk_pi_, topk_ov_, topk_oi_;
   cuda::PinnedBuffer topk_pin_;
   int topk_nblk_ = 0;
+  static constexpr int kMaxTopK = 128;  // device-head candidate cap (kernel limit)
+  int head_topk_max_ = 8;   // config: candidates produced per decode token
   bool vram_extend_ = true;    // config: measured VRAM check may extend GPU residency
   bool q35_cpu_layer_graph_ = true;  // per-layer CUDA graph for CPU-placed qwen35 MoE layers
   bool head_topk_ = true;      // config: reduce logits on the device for decode

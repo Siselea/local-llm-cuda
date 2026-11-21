@@ -141,6 +141,7 @@ Q5_K 12288x4096  = q5k_dp4a_s
 | `cpu_layer_graph` | `--cpu-layer-graph` | `ENGINE_NO_CPU_LAYER_GRAPH`（反转） | bool | `true` | CPU 驻留 MoE 层也录制 attention/mixer 段的逐层 Graph：每层少 ~7 次 WDDM 提交，35B 上 ~1.6 ms/token。早期实测"净变慢"是因为一次性录制落在 decode 计时窗口内；把录制挪到首次执行之后（prefill 内）后净收益为正 |
 | `dev_route` | `--dev-route` | `ENGINE_NO_DEV_ROUTE`（反转）/ `ENGINE_DEV_ROUTE`（强制开） | bool | `true` | GPU 驻留层用设备端路由：省掉每层 router D2H + host 同步 + 路由表 H2D；专家的量化布局里含 `Q5_1` 时自动关闭（该分支数值未验证） |
 | `mla_no_graph` | `--mla-no-graph` | `ENGINE_MLA_NO_GRAPH` | bool | `false` | MLA 模型禁用 Graph（保留历史规则） |
+| `tail_zero_copy` | `--no-tail-zc` | `ENGINE_NO_TAIL_ZC` | bool | `true` | CPU 层 tail：`add_three_inplace` 直接读**mapped pinned**（设备可寻址）的 host 专家部分和（零拷贝 PCIe 读），省掉一次 pinned H2D 拷贝 + 依赖 kernel 的 ~25–35 µs/层 |
 | `cpu_dual_stream` | `--no-cpu-dual-stream` | `ENGINE_NO_CPU_DUAL_STREAM` | bool | `true` | CPU 驻留层的共享专家块放到第二条 stream，与 host routed 专家 GEMV **并发**（该块只依赖 `hn_` 和固定权重，与路由无关）：GPU 工作被 GEMV 窗口（~0.6 ms/层）藏住，主流在 add3 之前 join；kernel 序列与加法次序不变 |
 | `cpu_layer_ffn_graph` | `--no-cpu-ffn-graph` | `ENGINE_NO_CPU_FFN_GRAPH` | bool | `true` | CPU 驻留 MoE 层的共享专家 GPU 段（zero-fill + 共享 gate/up/silu/down + gate_inp + add，约 8–9 次 kernel）按层录一张 CUDA Graph：这段只依赖 `hn_` 和固定权重，逐 token 不变；图化省的是 host 提交时间（35B CPU 层每层 ~0.12 ms，且因 sync 前必须先提交完而全在关键路径上），kernel 序列与加法次序完全不变 |
 | `mla_attn_graph` | `--no-mla-attn-graph` | `ENGINE_NO_MLA_ATTN_GRAPH` | bool | `true` | deepseek2 MLA 的 decode attention 段（ln1 norm + MLA attention + ln2 norm）按层录一张 CUDA Graph：实测每层 18 次 WDDM 提交 → 1 次 cuGraphLaunch（本机 1 次图启动 ≈10 µs，18 次裸提交 ≈180 µs）。仅当 MLA 投影全量化且 `mla_q_layout` 非 global 时生效；`--no-graph` 也会整体关掉 |
@@ -212,6 +213,7 @@ run_attn_legacy / derive_ctx_limit / activation_bytes`（`src/runner.cpp`）；
 | `dp4a_q6k` | `--no-dp4a-q6k` | `ENGINE_NO_DP4A_Q6K` | bool | `true` | Q6_K dp4a；关闭回退 fp32 x4 路径 |
 | `tiny_sk` | `--no-tiny-sk` | `ENGINE_NO_TINY_SK` | bool | `true` | 小输出维（Q8_0, n_out<=128）split-K |
 | `rms4` | `--no-rms4` | `ENGINE_NO_RMS4` | bool | `true` | float4 版 rmsnorm（1 个 block 的 norm 是延迟受限的：load/store 指令数 4× 减少，reduction 从 log2(blockDim) 次 `__syncthreads` 降到 1 次 warp-shuffle + 1 barrier）。要求宽度 %4==0 且 16 B 对齐，否则内核内自动回退标量路径 |
+| `head_topk_max` | `--head-topk-max` | `ENGINE_HEAD_TOPK_MAX` | int | `8` | decode head 在设备端算出的候选数（1–128）：`forward_topk` / `forward_topk_candidates` 最多返回这么多 (index, logit) 对，不把整行 logits（1 MB）拉回 host；给 sampling server 用 64/128 时可在候选内采样。kernel 上限 128 |
 | `head_topk` | `--no-head-topk` | `ENGINE_NO_HEAD_TOPK` | bool | `true` | decode 头在**设备端**把 logits 行归约成 top-5（`topk_partial` + `topk_final`），只回传 5 组 (index,value) 而不是整行（0.4–1 MB，WDDM 上 pinned D2H ~0.27 ms/token）；`forward()` 仍返回整行 logits，只有 `forward_topk()` 走快路径 |
 | `gd_delta_128` | `--no-gd-delta-128` | `ENGINE_NO_GD_DELTA_128` | bool | `true` | qwen35 gated-delta-net 的寄存器分块 kernel（head dim 128，state 布局 `[n_vh][KD][VD]`，每 token 只读写一次 2 MB state）；关闭回退通用 kernel |
 | `ssm_fuse` | `--no-ssm-fuse` | `ENGINE_NO_SSM_FUSE` | bool | `true` | gated-delta-net decode 融合：`gd_ssm_prep`（conv1d+silu+写 q/k/v+conv state 移位+beta/g 一次发射）替换 4 次发射；`gd_delta_rule_128f` 把 q/k L2 norm 与 gated RMSNorm 折进 delta-rule kernel。仅 T==1 |
