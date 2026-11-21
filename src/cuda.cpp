@@ -46,6 +46,8 @@ struct Driver {
   CUresult(__stdcall* MemAlloc)(CUdeviceptr*, size_t) = nullptr;
   CUresult(__stdcall* MemAllocHost)(void**, size_t) = nullptr;
   CUresult(__stdcall* MemFreeHost)(void*) = nullptr;
+  CUresult(__stdcall* MemHostAlloc)(void**, size_t, unsigned) = nullptr;
+  CUresult(__stdcall* MemHostGetDevicePointer)(void**, void*, unsigned) = nullptr;
   CUresult(__stdcall* MemFree)(CUdeviceptr) = nullptr;
   CUresult(__stdcall* MemcpyHtoD)(CUdeviceptr, const void*, size_t) = nullptr;
   CUresult(__stdcall* MemcpyDtoH)(void*, CUdeviceptr, size_t) = nullptr;
@@ -173,6 +175,11 @@ void load_driver() {
       GetProcAddress(g_driver.lib, "cuMemAllocHost_v2"));
   g_driver.MemFreeHost = reinterpret_cast<decltype(g_driver.MemFreeHost)>(
       GetProcAddress(g_driver.lib, "cuMemFreeHost"));
+  g_driver.MemHostAlloc = reinterpret_cast<decltype(g_driver.MemHostAlloc)>(
+      GetProcAddress(g_driver.lib, "cuMemHostAlloc"));
+  g_driver.MemHostGetDevicePointer =
+      reinterpret_cast<decltype(g_driver.MemHostGetDevicePointer)>(
+          GetProcAddress(g_driver.lib, "cuMemHostGetDevicePointer_v2"));
   g_driver.MemFree = reinterpret_cast<decltype(g_driver.MemFree)>(
       GetProcAddress(g_driver.lib, "cuMemFree_v2"));
   g_driver.MemcpyHtoD = reinterpret_cast<decltype(g_driver.MemcpyHtoD)>(
@@ -394,6 +401,46 @@ PinnedBuffer::PinnedBuffer(size_t bytes) {
 PinnedBuffer::~PinnedBuffer() {
   if (ptr_) g_driver.MemFreeHost(ptr_);
 }
+// MappedBuffer: pinned host memory that the device can address directly (zero copy).
+// Used for host-computed values that a kernel has to consume right away (the 35B CPU
+// layer's host-expert partial sums): a pinned copy into a device buffer costs an extra
+// ~25-35 us of copy->dependent-kernel latency on this WDDM host, while reading the same
+// 8 KiB over PCIe costs a few us inside the kernel.
+MappedBuffer::MappedBuffer(size_t bytes) { resize(bytes); }
+MappedBuffer::~MappedBuffer() {
+  if (host_ && g_driver.MemFreeHost) g_driver.MemFreeHost(host_);
+}
+MappedBuffer::MappedBuffer(MappedBuffer&& o) noexcept
+    : host_(o.host_), dev_(o.dev_), bytes_(o.bytes_) {
+  o.host_ = nullptr;
+  o.dev_ = nullptr;
+  o.bytes_ = 0;
+}
+MappedBuffer& MappedBuffer::operator=(MappedBuffer&& o) noexcept {
+  if (this != &o) {
+    if (host_ && g_driver.MemFreeHost) g_driver.MemFreeHost(host_);
+    host_ = o.host_;
+    dev_ = o.dev_;
+    bytes_ = o.bytes_;
+    o.host_ = nullptr;
+    o.dev_ = nullptr;
+    o.bytes_ = 0;
+  }
+  return *this;
+}
+void MappedBuffer::resize(size_t bytes) {
+  if (bytes <= bytes_) return;
+  if (host_ && g_driver.MemFreeHost) g_driver.MemFreeHost(host_);
+  host_ = nullptr;
+  dev_ = nullptr;
+  bytes_ = 0;
+  // PORTABLE lets any context (cublas/engine) address it; DEVICEMAP gives a device pointer.
+  check(g_driver.MemHostAlloc(&host_, bytes, 0x02u /*DEVICEMAP*/ | 0x01u /*PORTABLE*/),
+        "cuMemHostAlloc");
+  check(g_driver.MemHostGetDevicePointer(&dev_, host_, 0), "cuMemHostGetDevicePointer");
+  bytes_ = bytes;
+}
+
 PinnedBuffer::PinnedBuffer(PinnedBuffer&& o) noexcept : ptr_(o.ptr_), bytes_(o.bytes_) {
   o.ptr_ = nullptr;
   o.bytes_ = 0;
@@ -457,12 +504,17 @@ void* g_stream = nullptr;   // current stream (nullptr = legacy default)
 int g_capture_kernel_limit = -1;
 int g_capture_kernel_count = 0;
 
-static bool capturing_now() {
-  if (!g_driver.StreamIsCapturing || !g_stream) return false;
-  int mode = 0;
-  if (g_driver.StreamIsCapturing(g_stream, &mode) != CUDA_SUCCESS) return false;
-  return mode != 0;   // 0 == CU_STREAM_CAPTURE_STATUS_NONE
-}
+// The guards below used to call cuStreamIsCapturing on every copy/sync/launch
+// (~97 calls per decode token = one driver round trip each).  The flag is maintained by
+// Graph::capture_begin/end/abort, which are the only places that start/stop a capture on
+// the engine stream.
+// Owner pointer makes capture_abort()/the destructor idempotent and prevents an abort of
+// an unrelated Graph from clearing a live capture's guard.  CUDA refuses nested captures
+// on one stream, so at most one owner exists at a time.
+static Graph* g_capture_owner = nullptr;
+static bool g_capturing = false;   // == (g_capture_owner != nullptr)
+static bool capturing_now() { return g_capturing; }
+bool capturing_active() { return g_capturing; }
 
 
 
@@ -544,6 +596,12 @@ void stream_sync(void* s) {
 
 Graph::Graph() = default;
 Graph::~Graph() {
+  // Safety net: a Graph destroyed while its own capture is still open must not leave
+  // the guard stuck (a thrown recording body whose caller forgot capture_abort()).
+  if (g_capture_owner == this) {
+    std::fprintf(stderr, "[cuda] WARN Graph destroyed during capture; aborting\n");
+    capture_abort();
+  }
   if (exec_) g_driver.GraphExecDestroy(exec_);
   if (graph_) g_driver.GraphDestroy(graph_);
 }
@@ -557,12 +615,22 @@ void Graph::capture_begin() {
     g_capture_kernel_count = 0;
   }
   check(g_driver.StreamBeginCapture(g_stream, 0 /* global */), "cuStreamBeginCapture");
+  g_capture_owner = this;
+  g_capturing = true;
 }
 void Graph::capture_end() {
-  check(g_driver.StreamEndCapture(g_stream, &graph_), "cuStreamEndCapture");
+  // Clear the guard FIRST: if StreamEndCapture fails the stream must not keep looking
+  // like it is capturing (that would silently skip every later sync/copy = hang).
+  const CUresult rc = g_driver.StreamEndCapture(g_stream, &graph_);
+  g_capturing = false;
+  g_capture_owner = nullptr;
+  check(rc, "cuStreamEndCapture");
   check(g_driver.GraphInstantiate(&exec_, graph_, 0), "cuGraphInstantiate");
 }
 void Graph::capture_abort() {
+  if (g_capture_owner != this) return;   // nothing of ours is open; never touch a foreign capture
+  g_capturing = false;
+  g_capture_owner = nullptr;
   if (!g_driver.StreamEndCapture || !g_stream) return;
   void* g = nullptr;
   if (g_driver.StreamEndCapture(g_stream, &g) == CUDA_SUCCESS && g && g_driver.GraphDestroy)

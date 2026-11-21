@@ -104,6 +104,11 @@ const OptionDef kDefs[] = {
      "(ENGINE_CPU_LAYER_GRAPH opts in; measured neutral-to-negative on this VM)"},
     {"mla_no_graph", "ENGINE_MLA_NO_GRAPH", "mla-no-graph", false, false, Type::Bool, "false",
      0, 0, "disable CUDA Graph for MLA models (default keeps the historical rule)"},
+    {"tail_zero_copy", "ENGINE_NO_TAIL_ZC", "no-tail-zc", false, true, Type::Bool, "true",
+     0, 0,
+     "CPU-layer tail: let add_three_inplace read the host-expert partial sums directly "
+     "from mapped (device-addressable) pinned memory instead of a pinned H2D copy "
+     "followed by a dependent kernel (zero-copy over PCIe)"},
     {"cpu_dual_stream", "ENGINE_NO_CPU_DUAL_STREAM", "no-cpu-dual-stream", false, true,
      Type::Bool, "true", 0, 0,
      "run the CPU-layer shared-expert block on a second stream, concurrently with the "

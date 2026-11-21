@@ -65,6 +65,30 @@ class PinnedBuffer {
   size_t bytes_ = 0;
 };
 
+// Pinned host memory that the device can address directly (cuMemHostAlloc DEVICEMAP).
+// A kernel reads it over PCIe, which is cheaper than a pinned H2D copy followed by a
+// dependent kernel when only a few KiB have to cross.
+class MappedBuffer {
+ public:
+  MappedBuffer() = default;
+  explicit MappedBuffer(size_t bytes);
+  ~MappedBuffer();
+  MappedBuffer(const MappedBuffer&) = delete;
+  MappedBuffer& operator=(const MappedBuffer&) = delete;
+  MappedBuffer(MappedBuffer&&) noexcept;
+  MappedBuffer& operator=(MappedBuffer&&) noexcept;
+  void resize(size_t bytes);
+  void* data() { return host_; }             // CPU side
+  const void* data() const { return host_; }
+  void* device() const { return dev_; }      // device-addressable alias
+  size_t size() const { return bytes_; }
+
+ private:
+  void* host_ = nullptr;
+  void* dev_ = nullptr;
+  size_t bytes_ = 0;
+};
+
 class Buffer {
  public:
   Buffer() = default;
@@ -112,6 +136,9 @@ extern double g_launch_ms;
 // it; host caches that use "nothing was launched since" as a validity proof must also
 // compare this generation (see docs/GRAPH-INVARIANTS.md).
 extern long long g_graph_launches;
+// True while a stream capture is open (diagnostic: a capture left open at shutdown means
+// every later sync/copy was silently skipped).  Defined in cuda.cpp.
+bool capturing_active();
 extern long long g_buf_bytes;
 extern long long g_buf_count;
 extern std::vector<std::pair<size_t, int>> g_buf_log;

@@ -954,6 +954,8 @@ void dump();
 }
 
 DenseRunner::~DenseRunner() {
+  if (cuda::capturing_active())
+    std::fprintf(stderr, "[cuda] WARN capture still open at shutdown\n");
   cuda::kprof_dump();
   prof_acc::dump();
 }
@@ -1629,7 +1631,7 @@ void DenseRunner::run_layer(int layer, int n_tokens, int start_pos) {
     const bool gpu_layer_attn =
         ne > 0 && L.cpu_begin == ne && !ENGINE_ENV_ON("ENGINE_NO_GPU_LAYER_GRAPH");
     if (cpu_layer || gpu_layer_attn) {
-      if (gpu_layer && std::getenv("ENGINE_GPU_FULL_LAYER_GRAPH")) {
+      if (gpu_layer && ENGINE_ENV_ON("ENGINE_GPU_FULL_LAYER_GRAPH")) {
         run_gpu_layer_graph(layer, start_pos);   // whole layer (needs device routing)
       } else {
         run_q35_attn_graph(layer, start_pos);    // mixer/attention part only
@@ -3288,7 +3290,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
     for (size_t i = 0; i < static_cast<size_t>(n_tokens) * hidden_; ++i) sc += xout_host[i];
     std::fprintf(stderr, "[dbg]  gpu_part=%.6f cpu_part=%.6f gpu_n=%d\n", sg, sc, gpu_n);
   }
-  if (any_cpu && std::getenv("ENGINE_DUMP_MOE_SPLIT")) {
+  if (any_cpu && ENGINE_ENV_ON("ENGINE_DUMP_MOE_SPLIT")) {
     std::vector<float> gpu_out(static_cast<size_t>(n_tokens) * hidden_);
     cuda::stream_sync();
     if (const char* dp = ENGINE_ENV_STR("ENGINE_DUMP_MOE_SPLIT")) {
@@ -3312,9 +3314,13 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   const bool moe_dbg_path = ENGINE_ENV_ON("ENGINE_DUMP") ||
                             ENGINE_ENV_ON("ENGINE_DUMP_MOE_SPLIT");
   bool host_part_folded = false;
-  if (any_cpu) {
-    // Merge the host-side expert partial sums on the DEVICE: one pinned upload plus an
-    // add kernel, instead of download -> host add -> upload with two stream syncs.
+  // Zero-copy tail: xout_host is mapped, so add_three_inplace below reads it over PCIe.
+  // A pinned H2D copy would add the copy plus a dependent-kernel round trip (~25-35 us
+  // per CPU layer measured on this WDDM host), on the critical path before the next
+  // layer can start.
+  const bool tail_zc = tail_zero_copy_ && !moe_dbg_path;
+  if (any_cpu && !tail_zc) {
+    // Debug / fallback merge path: one pinned upload plus an add kernel.
     const size_t moe_elems = static_cast<size_t>(n_tokens) * hidden_;
     if (moe_host_part_.size() < moe_elems * 4) moe_host_part_ = cuda::Buffer(moe_elems * 4);
     moe_host_part_.upload_async(xout_host, moe_elems * 4);
@@ -3343,7 +3349,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       // x += (xout + host_part): one submission instead of two, bit-identical rounding.
       void* pa = x_.data();
       void* pb = xout_.data();
-      void* pc = moe_host_part_.data();
+      void* pc = tail_zc ? xout_pin_.device() : moe_host_part_.data();
       void* args[] = {&pa, &pb, &pc, &total};
       cuda::launch(k_add3_, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
     } else {
@@ -4118,6 +4124,7 @@ void DenseRunner::load_config_snapshot() {
   mla_attn_graph_ = cfg.get_bool("mla_attn_graph");
   cpu_layer_ffn_graph_ = cfg.get_bool("cpu_layer_ffn_graph");
   cpu_dual_stream_ = cfg.get_bool("cpu_dual_stream");
+  tail_zero_copy_ = cfg.get_bool("tail_zero_copy");
   no_graph_cfg_ = cfg.get_bool("no_graph");
   layer_graph_auto_ = cfg.get_bool("layer_graph_auto");
   no_bm_ = cfg.get_bool("no_bm");

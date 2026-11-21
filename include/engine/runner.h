@@ -276,7 +276,11 @@ class DenseRunner {
   void load_weights();
   void run_layer(int layer, int n_tokens, int start_pos);
   void run_layer_body(int layer, int n_tokens, int start_pos);
-  cuda::PinnedBuffer hn_pin_, xout_pin_, rl_pin_, logits_pin_;
+  cuda::PinnedBuffer hn_pin_, rl_pin_, logits_pin_;
+  // Host-side expert partial sums.  Mapped (device-addressable) so the tail kernel can
+  // read them over PCIe instead of a pinned H2D copy + dependent kernel (measured ~25-35
+  // us of copy->kernel latency per CPU layer on this WDDM host).
+  cuda::MappedBuffer xout_pin_;
   // pinned staging for the per-layer MoE routing tables (d_idx_/d_w_ are uploaded
   // asynchronously from here; a synchronous cuMemcpyHtoD flushed the WDDM queue once
   // per host-routed GPU layer)
@@ -484,6 +488,7 @@ class DenseRunner {
   bool no_graph_cfg_ = false;  // config: --no-graph disables every capture path
   bool cpu_layer_ffn_graph_ = true;  // config: graph for the shared-expert block of CPU layers
   bool cpu_dual_stream_ = true;      // config: overlap that block with the host GEMV
+  bool tail_zero_copy_ = true;       // config: let add3 read the host part over PCIe
   // Second stream for the CPU-layer shared-expert block: on decode it waits for hn_
   // (event on the main stream) and then runs concurrently with the routing round-trip
   // and the host GEMV, so its GPU time is hidden instead of extending the routing sync.
