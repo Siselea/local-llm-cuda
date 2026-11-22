@@ -5,7 +5,7 @@
 [![build](https://github.com/Siselea/local-llm-cuda/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Siselea/local-llm-cuda/actions/workflows/build.yml)
 
 > **不想自己编译？** 直接下载 [Releases](https://github.com/Siselea/local-llm-cuda/releases) 里的
-> `local-llm-cuda-v0.1.5-win64.zip`（Windows x64：engine.exe + launcher.exe + 启动脚本，不含模型）。
+> `local-llm-cuda-v0.1.6-win64.zip`（Windows x64：engine.exe + launcher.exe + 启动脚本，不含模型）。
 > 首次运行 web UI 前用 `bash tools/fetch_webui.sh` 获取聊天前端（MIT，4.4 MB，不随仓库分发）。
 
 ## 截图
