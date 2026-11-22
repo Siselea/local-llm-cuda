@@ -174,8 +174,19 @@ RAM 为进程 WorkingSet 峰值（psapi）。
   “引擎实测放不下时会自动夹紧并打印 requested→actual 账目”。
 - 非法/空输入：红字提示 + 启动按钮流程里 `MessageBox` 拒绝启动，不再静默回退到预设值。
 - `launcher.exe --ctx N` 也接受任意 0..1048576（不再映射到预设槽位）。
-- 截图/证据：⏳ `tests/test_launcher.py`（需要一次 0.5B GUI 启动；本次会话中因共享 build/ 被
-  坏二进制占用而顺延，等 HEAD 二进制装回 `build/` 后重跑并附截图）。
+- 截图（本机实测，`build/` 下；UI 不启动模型，仅 launcher 自身 + 模型扫描）：
+  - `build/launcher-10-ctx-controls.png`：显存与上下文区域：可编辑数字框 + 对数滑块 + 自动勾选；
+  - `build/launcher-11-ctx-12345.png`（及 `-crop.png`）：输入 12345 → “手动 12345 tokens ·
+    KV 显存 ≈ 772 MB（每 token 64.0 KB）”；
+  - `build/launcher-12-ctx-invalid.png`：清空 → 红字 “上下文长度必须是 1..1048576 的整数
+    （任意值均可；当前输入不能启动）”；
+  - `build/launcher-13-ctx-auto.png`：勾选自动 → 按当前空闲显存推导 601 tokens，等价 `--ctx 0`。
+- 本轮顺带修掉的两个 launcher 真 bug（commit `d04d755`）：
+  1. 启动时初始 `4096` 的 EN_CHANGE 在 `g_ctx_edit` 赋值前触发 → 初始就红字“非法”且不再自动恢复；
+  2. **中文 IME 下数字框收不到键入**（IME 组合吞掉 WM_CHAR，ES_NUMBER 只有粘贴能用）；
+     修复：数字 EDIT 解除 IMM 绑定 + WM_KEYDOWN 数字/退格/删除子类化直接改文本，任何 IME 下可用。
+- `tests/test_launcher.py` 已更新覆盖任意值/非法提示/自动勾选/滑块映射；完整 GUI 验收（起 0.5B +
+  启动/停止 + 证据 JSON）在大窗口后重跑并记录结果。
 
 ---
 
@@ -212,6 +223,7 @@ RAM 为进程 WorkingSet 峰值（psapi）。
 | `5414092` | `engine run --ctx N` 在 prompt+生成超过 N 时先打印部分 token 再 `error: forward: position out of range`（半途崩溃） | ctx 视为硬预算：`n` 夹紧到 `ctx-prompt` 并打印 `[run] n capped`；prompt 已占满时装载前明确 `[run] ERROR`；任何正整数 ctx 均可。 |
 | `bd0b477` | `serve` 静默 `max(32, ctx)`（--ctx 1/2/16 被悄悄改成 32，日志还显示 requested=32）；无 requested/actual；物理放不下只会整进程失败 | 任意正整数透传；/props 5 个新字段；启动日志 requested→actual；装载后实测夹紧→返回可行 ctx→自动重试（最多 4 次）；OOM 也走估算重试；dense+超预估 ctx 不再直接拒绝。 |
 | `fix(serve)` 后续（HEAD 47555d2 附近） | `ctx_suggested` 按值传参丢失 → 实测夹紧重试从未生效（§1.2 暴露） | `serve::run(Options&)` in/out 引用；重试链路实测生效（hog 场景 requested 262144 → actual 75775 成功）。 |
+| `d04d755` | launcher ctx 数字框：初始即红字非法；**中文 IME 下键入数字被吞**（只有粘贴可用）；跨进程写入后画面不刷新 | 初始化时屏蔽 EN_CHANGE（g_ctx_sync）+ 每次刷新从输入框内容自愈；数字 EDIT 解除 IMM 绑定 + WM_KEYDOWN 数字/退格/删除子类化；截图脚本强制重绘。 |
 
 ---
 
