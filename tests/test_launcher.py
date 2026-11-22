@@ -1126,8 +1126,11 @@ def main():
     slider = user32.GetDlgItem(hwnd, IDS["ctx_slider"])
 
     def set_ctx_text(txt):
-        # WM_SETTEXT does not reliably notify the parent; send EN_CHANGE explicitly
-        user32.SendMessageW(edit, WM_SETTEXT, 0, ctypes.c_wchar_p(txt))
+        # WM_SETTEXT does not reliably notify the parent; send EN_CHANGE explicitly.
+        # SendMessageW's argtypes use c_ssize_t for lParam, so pass the wide-string
+        # pointer as an integer.
+        ptr = ctypes.cast(ctypes.c_wchar_p(txt), ctypes.c_void_p).value
+        user32.SendMessageW(edit, WM_SETTEXT, 0, ptr)
         user32.SendMessageW(hwnd, WM_COMMAND,
                             (EN_CHANGE << 16) | IDS["ctx_edit"], edit)
 
