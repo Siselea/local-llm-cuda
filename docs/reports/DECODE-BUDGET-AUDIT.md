@@ -167,10 +167,23 @@ GPU 层 0.2 ms/层；GPU 忙占比 32.6%。本轮用同一 probe 复测，确认
 | Coder Q6_K 172 MB（实际跑 `gemv_q8_0_bm`，推测被重打包为 Q8_0 block-major） | 172 MB | 0.52 ms | **0.74 ms**（1 call） | 71% | 0.1–0.2 ms |
 
 9B head 的识别方法：`ENGINE_LAYERS=1 + NO_GRAPH + KPROF` 只跑 1 层，`gemv_q6k_dp4a` 只剩
-2 calls / 3.95 ms，其中 head（n_out=248320）占绝大部分 ⇒ 834 MB / ~3.7 ms = **225 GB/s（68% 峰值）**。
-⇒ **9B head 有 ~0.9–1.2 ms 可回收**（decode 的 3.5–4.5%）：该 kernel 以 8-bit 粒度解包 Q6_K，
-未用 16B 向量化 load；候选方案 = 仿 `gemv_q6k_x4` 的行向量化 / 2 行每线程 + `__ldg` 128-bit。
-35B/Coder 的 head 已用 block-major 布局（87%/71%），优化空间较小。
+2 calls / 3.95 ms，其中 head（n_out=248320）占绝大部分 ⇒ 当时估算 834 MB / ~3.7 ms = 225 GB/s（68%）。
+
+### 4.1 复核修正（2026-11-22，逐 GEMV 计时）
+
+上面的 225 GB/s 是**从聚合计时反推的错误估计**：把同一 kernel 的两次调用（head + 一层 8192×4096
+投影）当成 head 一个。用 `ENGINE_DBG_GEMVTIME=1` 直接打印单次 GEMV 后：
+
+| GEMV | 权重 | 实测 | 带宽 |
+|---|---|---|---|
+| 9B head 248320×4096 Q6_K（`gemv_q6k_dp4a`） | 834.36 MB | **2.82–2.86 ms** | **291–295 GB/s（88–89% 峰值）** |
+| 9B head 同形状（新 `gemv_q6k_dp4a_v2`，2 行/warp + 共享激活） | 834.36 MB | 2.83–2.96 ms | 282–295 GB/s（**无提升**） |
+
+⇒ **9B head 已接近带宽硬底，可回收余量只有 ~0.1–0.2 ms（不是原先估的 0.9–1.2 ms）**，不值得为它
+增加一个 2 行/warp 内核（实测还略慢：Q6_K 210 B/superblock 的 stride 让 4B q 载入无法对齐，
+退回 2×2B 后 2 行/warp 的收益被抵消）。**该项关闭，不改代码。**
+35B/Coder 的 head 已用 block-major 布局（87%/71%），同样接近硬底。
+（教材：审计报告里凡是"由聚合 kernel 计时反推单次时间"的数字，落地前必须用 per-call 计时复核。）
 
 ---
 
@@ -202,7 +215,7 @@ GPU 层 0.2 ms/层；GPU 忙占比 32.6%。本轮用同一 probe 复测，确认
 |---|---|---|---|---|
 | 1 | **decode attention GQA 复用 + f32 float4** | **9B@9100 −3.2 ms（−10%）；@757 −0.3 ms；短 ctx ≈0** | 中：新 kernel（照 `attn_tiled_pre` 的 L1 共享 + `f32_wide` 思路），数学不变可 bit-exact | 产品改动；建议排期 |
 | 2 | **`kv_split` 默认 32 → 16** | **9B@9100 −1.16 ms**（31.34 vs 32.50）；短 ctx 待测 | 低（改默认或按 ctx 自适应） | 配置默认 |
-| 3 | **9B head Q6_K 向量化**（当前 68% 峰值） | **−0.9~1.2 ms（9B decode 的 3.5–4.5%）** | 中：新 kernel 或 x4 风格，需 bit-exact | 产品改动 |
+| 3 | ~~9B head Q6_K 向量化~~ | **已证伪：实测 291–295 GB/s（88–89% 峰值），余量仅 ~0.1–0.2 ms；新 2 行/warp 内核无提升 ⇒ 关闭**（见 §4.1） | — | 不做 |
 | 4 | Coder `quant_x_i8` 5.5 ms/token（14% GPU） | 0.5–2 ms（需查调用来源/复用范围） | 中：扩大 quant 复用或融进 prologue | 产品改动；先补干净账本 |
 | 5 | `set_position` 改 pinned | 18 µs/token（0.08%） | 极低 | 产品改动（顺手） |
 | — | 长 ctx 用 `kv_type=q8_0/q4_0` | **负收益（+2.7~3.3 ms）** | — | **不做** |
