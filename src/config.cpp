@@ -461,6 +461,26 @@ const OptionDef kDefs[] = {
      1, 10000, "timed iterations per kernel candidate during --kernel-calibrate"},
     {"config", nullptr, "config", true, false, Type::String, "",
      0, 0, "config file path (key = value; [kernel] section for calibration)"},
+
+    // ---------------- generic architecture blocks (metadata driven) ----------------
+    // These only affect models whose GGUF metadata/tensor layout asks for the
+    // corresponding feature; the defaults are "use it if the metadata says so".
+    {"arch_ext", "ENGINE_ARCH_EXT", "arch-ext", true, false, Type::String, "auto",
+     0, 0, "generic per-layer dense path: auto (metadata decides) | on | off"},
+    {"arch_act", "ENGINE_ARCH_ACT", "arch-act", true, false, Type::String, "auto",
+     0, 0, "MLP activation: auto | silu | gelu (gelu-tanh for gemma-family metadata)"},
+    {"arch_embed_scale", "ENGINE_ARCH_EMBED_SCALE", "arch-embed-scale", true, false,
+     Type::String, "auto",
+     0, 0, "embedding multiplier: auto | none | sqrt (sqrt(hidden) for gemma-family)"},
+    {"arch_attn_scale", "ENGINE_ARCH_ATTN_SCALE", "arch-attn-scale", true, false,
+     Type::String, "auto",
+     0, 0, "attention logit scale: auto | 1.0 | rsqrt (1/sqrt(head_dim))"},
+    {"arch_norm_mode", "ENGINE_ARCH_NORM_MODE", "arch-norm-mode", true, false,
+     Type::String, "auto",
+     0, 0, "RMSNorm weight interpretation: auto | direct (w) | plus1 (1+w)"},
+    {"arch_softcap", "ENGINE_ARCH_SOFTCAP", "arch-softcap", true, false, Type::String,
+     "auto",
+     0, 0, "final logit softcapping: auto (metadata) | on | off"},
 };
 
 constexpr size_t kNumDefs = sizeof(kDefs) / sizeof(kDefs[0]);

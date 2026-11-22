@@ -52,11 +52,47 @@ struct MoEDesc {
   std::string layout = "none";   // none | fused_3d (GGUF) | split_per_expert (HF)
 };
 
+// Per-layer attention geometry.  Populated generically from metadata structure:
+// scalar metadata -> the same value on every layer, array-valued metadata
+// (`attention.head_count_kv`) and `*_swa` variants selected by
+// `attention.sliding_window_pattern` -> true per-layer values.
+struct LayerAttn {
+  int n_kv = 0;
+  int key_dim = 0;
+  int value_dim = 0;
+  int rope_dim = 0;
+  double rope_base = 0.0;
+  int window = 0;          // 0 = full causal attention
+  bool has_v = true;       // false => attention_k_eq_v (V reuses the K projection)
+  bool qk_norm = false;    // per-head RMSNorm weights on q and k
+  bool v_norm = false;     // weightless RMSNorm on V
+  bool sandwich = false;   // post_attention_norm / post_ffw_norm present
+  bool layer_scalar = false;  // layer_output_scale present
+};
+
 struct LayerDesc {
   int index = 0;
   int n_tensors = 0, n_expert_tensors = 0;
   // qwen35 hybrid stacks: "attn" (full attention) or "linear" (gated delta net)
   std::string kind = "attn";
+  LayerAttn attn;
+};
+
+// Model-level capabilities derived from metadata/tensor structure (never from
+// the architecture name).  The engine enables the generic extended layer path
+// when `extended` is set and applies the individual ops only when present.
+struct ArchCaps {
+  bool extended = false;      // use the generic per-layer-capable dense path
+  bool per_layer_attn = false;
+  bool qk_norm = false;
+  bool v_norm = false;
+  bool sandwich_norm = false;
+  bool layer_scalar = false;
+  bool gelu_mlp = false;
+  double attn_scale = 0.0;    // >0 explicit scale, 0 = legacy 1/sqrt(head_dim)
+  double embed_scale = 1.0;   // multiplier applied to the token embeddings
+  double logit_softcap = 0.0; // final logit softcapping (0 = off)
+  double attn_logit_softcap = 0.0;
 };
 
 // Gated DeltaNet parameters (qwen35 linear attention layers).
@@ -95,6 +131,7 @@ class Model {
   MoEDesc moe;
   SSMDesc ssm;
   TokenizerDesc tok;
+  ArchCaps caps;
   std::vector<LayerDesc> layers;
   std::vector<TensorDesc> tensors;
   std::vector<std::string> warnings;

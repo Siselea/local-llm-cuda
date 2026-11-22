@@ -297,6 +297,108 @@ Model build_from_gguf(const gguf::Model& g) {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Generic per-layer attention geometry / architecture capabilities.
+  // Nothing here matches on the architecture name: scalar metadata provides the
+  // global default, array metadata (head_count_kv / sliding_window_pattern) and
+  // *_swa variants select per-layer values, and optional tensors enable ops.
+  // -------------------------------------------------------------------------
+  {
+    auto has_t = [&](const std::string& n) {
+      for (const auto& t : m.tensors)
+        if (t.name == n) return true;
+      return false;
+    };
+    const std::string p = m.arch + ".";
+    auto arr = [&](const char* key) { return g.get_int_array(p + key); };
+    const std::vector<int64_t> kv_arr = arr("attention.head_count_kv");
+    const std::vector<int64_t> swa_arr = arr("attention.sliding_window_pattern");
+    const bool kv_per_layer = kv_arr.size() == static_cast<size_t>(m.n_layer);
+    const bool swa_per_layer = swa_arr.size() == static_cast<size_t>(m.n_layer);
+    if (!kv_arr.empty() && !kv_per_layer)
+      m.warnings.push_back("attention.head_count_kv is an array of " +
+                           std::to_string(kv_arr.size()) + " values but the model has " +
+                           std::to_string(m.n_layer) + " layers; using the scalar value");
+    if (!swa_arr.empty() && !swa_per_layer)
+      m.warnings.push_back("attention.sliding_window_pattern is an array of " +
+                           std::to_string(swa_arr.size()) + " values but the model has " +
+                           std::to_string(m.n_layer) + " layers; ignoring it");
+    const int kl_swa = static_cast<int>(meta_int(g, m.arch, "attention.key_length_swa"));
+    const int vl_swa = static_cast<int>(meta_int(g, m.arch, "attention.value_length_swa"));
+    const int rd_swa = static_cast<int>(meta_int(g, m.arch, "rope.dimension_count_swa"));
+    const double rb_swa = meta_float(g, m.arch, "rope.freq_base_swa", 0.0);
+    auto& caps = m.caps;
+    int max_kv = std::max(1, a.n_head_kv);
+    int max_kd = std::max(1, a.key_length);
+    int max_vd = std::max(1, a.value_length);
+    for (int i = 0; i < m.n_layer; ++i) {
+      auto& la = m.layers[i].attn;
+      const std::string lp = "blk." + std::to_string(i) + ".";
+      const bool swa = swa_per_layer && swa_arr[static_cast<size_t>(i)] != 0;
+      la.n_kv = kv_per_layer ? static_cast<int>(kv_arr[static_cast<size_t>(i)]) : a.n_head_kv;
+      la.key_dim = (swa && kl_swa > 0) ? kl_swa : a.key_length;
+      la.value_dim = (swa && vl_swa > 0) ? vl_swa : a.value_length;
+      if (la.key_dim <= 0) la.key_dim = m.hidden / std::max(1, a.n_head);
+      if (la.value_dim <= 0) la.value_dim = la.key_dim;
+      la.rope_dim = (swa && rd_swa > 0) ? rd_swa
+                                        : (a.rope_dim > 0 ? a.rope_dim : la.key_dim);
+      la.rope_base = (swa && rb_swa > 0) ? rb_swa : a.rope_freq_base;
+      la.window = swa ? a.sliding_window : 0;
+      const bool has_k = has_t(lp + "attn_k.weight");
+      const bool has_v = has_t(lp + "attn_v.weight");
+      la.has_v = has_v || !has_k;   // no K projection either -> legacy path
+      if (has_k && !has_v) la.has_v = false;   // attention_k_eq_v
+      la.qk_norm = has_t(lp + "attn_q_norm.weight") && has_t(lp + "attn_k_norm.weight");
+      // V norm is weightless and therefore not detectable from tensors; the
+      // family trait is "per-head qk-norm tensors exist".
+      la.v_norm = la.qk_norm && la.has_v;
+      la.sandwich = has_t(lp + "post_attention_norm.weight") &&
+                    has_t(lp + "post_ffw_norm.weight");
+      la.layer_scalar = has_t(lp + "layer_output_scale.weight");
+      if (la.n_kv > 0) max_kv = std::max(max_kv, la.n_kv);
+      max_kd = std::max(max_kd, la.key_dim);
+      max_vd = std::max(max_vd, la.value_dim);
+      caps.per_layer_attn |= swa || kv_per_layer;
+      caps.qk_norm |= la.qk_norm;
+      caps.v_norm |= la.v_norm;
+      caps.sandwich_norm |= la.sandwich;
+      caps.layer_scalar |= la.layer_scalar;
+    }
+    if (kv_per_layer) a.n_head_kv = max_kv;
+    a.key_length = max_kd;
+    a.value_length = max_vd;
+    caps.logit_softcap = meta_float(g, m.arch, "final_logit_softcapping", 0.0);
+    caps.attn_logit_softcap = meta_float(g, m.arch, "attention.logit_softcapping", 0.0);
+    // Family traits (metadata / tensor structure, not the architecture name):
+    // models with per-head qk-norm use a GELU-tanh MLP, sqrt(hidden) embedding
+    // scaling and an unscaled (1.0) attention logit scale.
+    const bool gemma_trait = caps.qk_norm || caps.logit_softcap != 0.0;
+    caps.gelu_mlp = gemma_trait;
+    caps.embed_scale = gemma_trait ? std::sqrt(static_cast<double>(m.hidden)) : 1.0;
+    caps.attn_scale = caps.qk_norm ? 1.0 : 0.0;
+    // Only metadata that the legacy dense path genuinely cannot express turns the
+    // generic path on.  A bare per-head qk-norm tensor set is NOT enough: several
+    // already-supported architectures (qwen3 family) carry attn_q_norm/attn_k_norm
+    // and have their own loaders.  In particular never take over hybrid-SSM / MLA /
+    // MoE models here; they keep their existing, verified code paths.
+    caps.extended = caps.per_layer_attn || caps.sandwich_norm || caps.layer_scalar ||
+                    caps.logit_softcap != 0.0;
+    if (caps.extended) {
+      int n_eq_v = 0;
+      for (int i = 0; i < m.n_layer; ++i)
+        if (!m.layers[i].attn.has_v) ++n_eq_v;
+      m.warnings.push_back(
+          "extended attention path enabled: per_layer=" +
+          std::to_string(static_cast<int>(caps.per_layer_attn)) + " qk_norm=" +
+          std::to_string(static_cast<int>(caps.qk_norm)) + " v_norm=" +
+          std::to_string(static_cast<int>(caps.v_norm)) + " sandwich=" +
+          std::to_string(static_cast<int>(caps.sandwich_norm)) + " layer_scalar=" +
+          std::to_string(static_cast<int>(caps.layer_scalar)) + " k_eq_v_layers=" +
+          std::to_string(n_eq_v) + " logit_softcap=" +
+          std::to_string(caps.logit_softcap));
+    }
+  }
+
   m.vocab = m.tok.n_vocab;
   if (m.vocab == 0) m.vocab = static_cast<uint64_t>(meta_int(g, m.arch, "vocab_size"));
   if (mo.n_expert && mo.n_expert_used > mo.n_expert)
@@ -392,6 +494,36 @@ std::vector<std::string> validate(Model& m) {
     errs.push_back("n_head not divisible by n_head_kv");
 
   // ---- geometry / metadata consistency (fail early, explain what is wrong) ----
+  if (m.caps.extended) {
+    for (int i = 0; i < m.n_layer; ++i) {
+      const auto& la = m.layers[i].attn;
+      const std::string lp = "layer " + std::to_string(i) + ": ";
+      if (la.n_kv <= 0)
+        errs.push_back(lp + "per-layer head_count_kv <= 0 (cannot size the KV cache)");
+      else if (m.attn.n_head > 0 && m.attn.n_head % la.n_kv != 0)
+        errs.push_back(lp + "head_count " + std::to_string(m.attn.n_head) +
+                       " not divisible by per-layer head_count_kv " +
+                       std::to_string(la.n_kv));
+      if (la.key_dim <= 0 || la.key_dim % 2 != 0)
+        errs.push_back(lp + "per-layer key/value head dim " + std::to_string(la.key_dim) +
+                       " must be positive and even (rope pairs)");
+      if (la.value_dim <= 0)
+        errs.push_back(lp + "per-layer value head dim <= 0");
+      if (la.rope_dim <= 0 || la.rope_dim > la.key_dim || la.rope_dim % 2 != 0)
+        errs.push_back(lp + "per-layer rotary dim " + std::to_string(la.rope_dim) +
+                       " must be positive, even and <= head dim " +
+                       std::to_string(la.key_dim));
+      if (la.rope_base <= 0.0)
+        errs.push_back(lp + "per-layer rope base must be > 0");
+      // The extended path writes K and V with one shared row stride kernel; this
+      // is exact for every current gguf layout (gemma4 included) and is reported
+      // instead of silently mis-striding when a future model differs.
+      if (la.key_dim != la.value_dim)
+        errs.push_back(lp + "extended path requires key_dim == value_dim (" +
+                       std::to_string(la.key_dim) + " vs " +
+                       std::to_string(la.value_dim) + ")");
+    }
+  }
   if (m.attn.n_head > 0) {
     if (m.attn.n_head_kv <= 0)
       errs.push_back("attention.head_count_kv missing or 0 (head_count=" +
@@ -401,8 +533,9 @@ std::vector<std::string> validate(Model& m) {
     if (m.attn.key_length > 0 && m.attn.key_length % 2 != 0 && m.attn.variant != "mla")
       errs.push_back("attention.key_length " + std::to_string(m.attn.key_length) +
                      " is odd; the rope kernels rotate values in pairs");
-    if (m.attn.variant != "mla" && m.ssm.variant == "none" && m.attn.key_length > 0 &&
-        m.hidden > 0 && m.attn.n_head * m.attn.key_length != m.hidden)
+    if (m.attn.variant != "mla" && m.ssm.variant == "none" && !m.caps.per_layer_attn &&
+        m.attn.key_length > 0 && m.hidden > 0 &&
+        m.attn.n_head * m.attn.key_length != m.hidden)
       m.warnings.push_back("n_head*key_length = " +
                            std::to_string(m.attn.n_head * m.attn.key_length) + " != hidden " +
                            std::to_string(m.hidden) +

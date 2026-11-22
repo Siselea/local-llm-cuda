@@ -24,11 +24,15 @@ struct Value {
   std::string s;
   uint64_t array_len = 0;
   uint32_t array_elem_type = 0;
-  // Array payload is only materialised when the caller asks for the key in
-  // read(path, capture_keys) -- the tokenizer needs the token/merge strings.
-  // Plain read() keeps skipping the payload so info/plan stay cheap.
+  // Array payload is materialised for (a) the tokenizer keys requested through
+  // read(path, capture_keys), and (b) every small numeric array: model geometry
+  // metadata such as per-layer head counts / sliding-window patterns lives in
+  // such arrays, and the IR derives per-layer behaviour from them generically.
   std::vector<std::string> strs;   // STRING array elements
   std::vector<unsigned char> raw;  // scalar array elements, little endian
+
+  // Decode element `idx` of a numeric array (returns 0 when out of range).
+  int64_t num_at(size_t idx) const;
 };
 
 // ggml tensor type -> (name, block_size, bytes_per_block)
@@ -64,6 +68,11 @@ class Model {
   std::string get_string(const std::string& key, const std::string& fallback = "") const;
   bool get_bool(const std::string& key, bool fallback = false) const;
   uint64_t array_len(const std::string& key) const;
+  // Numeric-array metadata as integers (empty when the key is absent / not an
+  // array / not numeric).  Per-layer model geometry is carried in these.
+  std::vector<int64_t> get_int_array(const std::string& key) const;
+  // True when the key exists and is an array (any element type).
+  bool is_array(const std::string& key) const;
 };
 
 Model read(const std::string& path);

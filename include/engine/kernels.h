@@ -4067,4 +4067,87 @@ extern "C" __global__ void attn_tiled_pre_gqa(const float* __restrict__ q,
 }
 )cuda";
 
+// ---------------------------------------------------------------------------
+// Generic architecture blocks (metadata/tensor driven; used by the extended
+// per-layer dense path, harmless for every other model):
+//   gelu_mul          GELU-tanh(gate)*up, the gemma-family MLP activation
+//   scale_inplace     x *= s                  (layer_output_scale)
+//   softcap_inplace   x = s*tanh(x/s)         (final logit softcapping)
+//   attn_cached_cfg   causal KV attention with configurable logit scale and an
+//                     optional sliding window
+// ---------------------------------------------------------------------------
+inline const char* kGeluMul = R"cuda(
+extern "C" __global__ void gelu_mul(const float* __restrict__ gate,
+                                    const float* __restrict__ up,
+                                    float* __restrict__ out, long long total) {
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < total) {
+    const float g = gate[i];
+    const float c = 0.7978845608028654f;   // sqrt(2/pi)
+    const float y = 0.5f * g * (1.0f + tanhf(c * (g + 0.044715f * g * g * g)));
+    out[i] = y * up[i];
+  }
+}
+)cuda";
+
+inline const char* kScaleInplace = R"cuda(
+extern "C" __global__ void scale_inplace(float* __restrict__ x, float s, long long total) {
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < total) x[i] *= s;
+}
+)cuda";
+
+inline const char* kSoftcapInplace = R"cuda(
+extern "C" __global__ void softcap_inplace(float* __restrict__ x, float s, long long total) {
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < total) x[i] = s * tanhf(x[i] / s);
+}
+)cuda";
+
+inline const char* kAttnCfg = R"cuda(
+extern "C" __global__ void attn_cached_cfg(const float* __restrict__ q,
+                                           const float* __restrict__ Kc,
+                                           const float* __restrict__ Vc,
+                                           float* __restrict__ out,
+                                           const int* __restrict__ pstart, int n_head, int n_kv,
+                                           int D, int max_seq, float scale, int window) {
+  extern __shared__ float sh[];
+  const unsigned mask = 0xffffffffu;
+  const int i = blockIdx.x;
+  const int h = blockIdx.y;
+  const int lane = threadIdx.x & 31;
+  const int qpos = *pstart + i;
+  const int rep = n_head / n_kv;
+  const int kvh = h / rep;
+  const float* qh = q + ((long long)i * n_head + h) * D;
+  const float* Kh = Kc + (long long)kvh * max_seq * D;
+  const float* Vh = Vc + (long long)kvh * max_seq * D;
+  const int j0 = window > 0 ? (qpos - window + 1 > 0 ? qpos - window + 1 : 0) : 0;
+  for (int j = j0 + lane; j <= qpos; j += 32) {
+    const float* kh = Kh + (long long)j * D;
+    float dot = 0.f;
+    for (int d = 0; d < D; ++d) dot += qh[d] * kh[d];
+    sh[j] = dot * scale;
+  }
+  __syncwarp();
+  float lmax = -1e30f;
+  for (int j = j0 + lane; j <= qpos; j += 32) lmax = fmaxf(lmax, sh[j]);
+  for (int off = 16; off > 0; off >>= 1) lmax = fmaxf(lmax, __shfl_xor_sync(mask, lmax, off));
+  float lsum = 0.f;
+  for (int j = j0 + lane; j <= qpos; j += 32) {
+    const float e = expf(sh[j] - lmax);
+    sh[j] = e;
+    lsum += e;
+  }
+  for (int off = 16; off > 0; off >>= 1) lsum += __shfl_xor_sync(mask, lsum, off);
+  __syncwarp();
+  const float inv = 1.f / lsum;
+  for (int d = lane; d < D; d += 32) {
+    float a = 0.f;
+    for (int j = j0; j <= qpos; ++j) a += sh[j] * inv * Vh[(long long)j * D + d];
+    out[((long long)i * n_head + h) * D + d] = a;
+  }
+}
+)cuda";
+
 }  // namespace kernels

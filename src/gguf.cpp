@@ -74,10 +74,15 @@ Value read_array(Reader& r, bool capture) {
   v.array_elem_type = r.get<uint32_t>();
   v.array_len = r.get<uint64_t>();
   if (v.array_len > 100000000ull) throw std::runtime_error("implausible array length");
-  // Without a capture request we only need the length for token arrays; still
-  // skip the payload so parsing a 20 GB model stays cheap.
+  // Small numeric arrays are kept: model geometry metadata (per-layer head
+  // counts, sliding-window patterns, per-layer rope dims...) lives there and the
+  // IR derives per-layer behaviour from it.  String/array payloads of weights are
+  // still skipped unless the tokenizer asked for them, so parsing stays cheap.
+  const int et = static_cast<int>(v.array_elem_type);
+  const bool numeric = (et <= 7) || (et >= 10 && et <= 12);
+  const bool auto_capture = numeric && v.array_len <= 4096;
   auto take_bytes = [&](uint64_t bytes) {
-    if (capture) {
+    if (capture || auto_capture) {
       v.raw.resize(static_cast<size_t>(bytes));
       if (bytes) r.read_raw(v.raw.data(), static_cast<size_t>(bytes));
     } else {
@@ -183,6 +188,52 @@ uint64_t Model::array_len(const std::string& key) const {
   auto it = kv.find(key);
   if (it == kv.end() || it->second.kind != Value::Kind::ARRAY) return 0;
   return it->second.array_len;
+}
+
+int64_t Value::num_at(size_t idx) const {
+  if (idx >= static_cast<size_t>(array_len) || raw.empty()) return 0;
+  const unsigned char* p = raw.data();
+  switch (static_cast<ValueType>(array_elem_type)) {
+    case ValueType::UINT8: return p[idx];
+    case ValueType::INT8: return static_cast<int8_t>(p[idx]);
+    case ValueType::BOOL: return p[idx] != 0 ? 1 : 0;
+    case ValueType::UINT16: { uint16_t v; std::memcpy(&v, p + idx * 2, 2); return v; }
+    case ValueType::INT16: { int16_t v; std::memcpy(&v, p + idx * 2, 2); return v; }
+    case ValueType::UINT32: { uint32_t v; std::memcpy(&v, p + idx * 4, 4); return v; }
+    case ValueType::INT32: { int32_t v; std::memcpy(&v, p + idx * 4, 4); return v; }
+    case ValueType::UINT64: {
+      uint64_t v; std::memcpy(&v, p + idx * 8, 8);
+      return static_cast<int64_t>(v);
+    }
+    case ValueType::INT64: { int64_t v; std::memcpy(&v, p + idx * 8, 8); return v; }
+    case ValueType::FLOAT32: {
+      float v; std::memcpy(&v, p + idx * 4, 4);
+      return static_cast<int64_t>(v);
+    }
+    case ValueType::FLOAT64: {
+      double v; std::memcpy(&v, p + idx * 8, 8);
+      return static_cast<int64_t>(v);
+    }
+    default: return 0;
+  }
+}
+
+std::vector<int64_t> Model::get_int_array(const std::string& key) const {
+  std::vector<int64_t> out;
+  auto it = kv.find(key);
+  if (it == kv.end() || it->second.kind != Value::Kind::ARRAY) return out;
+  const Value& v = it->second;
+  const int et = static_cast<int>(v.array_elem_type);
+  if ((et > 7 && (et < 10 || et > 12))) return out;   // STRING/ARRAY: not numeric
+  if (v.raw.empty()) return out;
+  out.reserve(static_cast<size_t>(v.array_len));
+  for (uint64_t i = 0; i < v.array_len; ++i) out.push_back(v.num_at(static_cast<size_t>(i)));
+  return out;
+}
+
+bool Model::is_array(const std::string& key) const {
+  auto it = kv.find(key);
+  return it != kv.end() && it->second.kind == Value::Kind::ARRAY;
 }
 
 Model read(const std::string& path) {
