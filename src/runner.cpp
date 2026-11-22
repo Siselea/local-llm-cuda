@@ -2016,13 +2016,15 @@ void DenseRunner::load_weights() {
                  (mi.total_bytes - mi.free_bytes) / 1048576.0, mi.free_bytes / 1048576.0,
                  gpu_moe_layers_, cuda::g_buf_bytes / 1048576.0, cuda::g_buf_count);
   }
-  check_post_load_vram();
-  apply_auto_vram_layers();
   start_clock_warmer();
-  // Capture the decode-time layer graphs now.  Capture only *records* the kernel
-  // sequence (nothing executes), so the recurrent state / KV cache stay untouched and
-  // the very first generated token already runs from a replayed graph.  On any failure
-  // fall back to the plain per-launch path for the whole run.
+  // Capture the decode-time layer graphs BEFORE the post-load VRAM check and the
+  // auto-vram expert promotion.  The CUDA graph exec pools are ledger-invisible and cost
+  // ~1.1 GiB on the 35B (measured: free 2910 -> ~1800 before the serve margin check);
+  // capturing them after `apply_auto_vram_layers()` used to consume the very margin the
+  // promotions had just spent, so the serve guard rejected a default 35B launcher start
+  // (and a retry could then hit cuMemAlloc).  Capture only records the kernel sequence
+  // (nothing executes), so the recurrent state / KV cache stay untouched.  On any
+  // failure fall back to the plain per-launch path for the whole run.
   if (layer_graph_auto_) {
     try {
       capture_decode_graphs();
@@ -2041,6 +2043,8 @@ void DenseRunner::load_weights() {
       cuda::stream_sync();
     }
   }
+  check_post_load_vram();
+  apply_auto_vram_layers();
 }
 
 double g_prof_mla_ms = 0.0, g_prof_moe_ms = 0.0;
@@ -4885,12 +4889,19 @@ void DenseRunner::apply_auto_vram_layers() {
     const size_t need = w.h_gate_bytes.size() + w.h_up_bytes.size() + w.h_down_bytes.size();
     if (!g_slab || !u_slab || !d_slab) break;
     const cuda::MemInfo mi = cuda::mem_info();
-    if (mi.free_bytes < need + vram_margin_floor_bytes_) {
+    // Leave the configured post-load margin AND the ledger reserve free, plus the
+    // measured post-promotion activation/graph pool (35B: ~1.1 GiB allocated after the
+    // promotion inside load_weights).  The serve guard rejects a start below --vram-margin,
+    // and a promotion must not create that state; when the reserve does not fit, keep the
+    // layer on the CPU (explicit --gpu-layers is still available).
+    const size_t promo_reserve = std::max(vram_margin_floor_bytes_, vram_margin_bytes_) +
+                                 vram_extra_reserve_ + (1152ull << 20);
+    if (mi.free_bytes < need + promo_reserve) {
       if (debug_)
         std::fprintf(stderr,
-                     "[placement] auto-vram: stop at blk.%d (need %.0f MiB + floor %.0f MiB "
+                     "[placement] auto-vram: stop at blk.%d (need %.0f MiB + reserve %.0f MiB "
                      "> free %.0f MiB)\n",
-                     i, need / 1048576.0, vram_margin_floor_bytes_ / 1048576.0,
+                     i, need / 1048576.0, promo_reserve / 1048576.0,
                      mi.free_bytes / 1048576.0);
       break;
     }
@@ -4923,6 +4934,15 @@ void DenseRunner::apply_auto_vram_layers() {
     }
     w.q_experts = std::move(qe);
     w.cpu_begin = ne;
+    // The layer just switched from the CPU-expert path to the GPU-expert path; graphs
+    // captured for the old path (e.g. attention-only CPU-MoE graphs) are stale.
+    w.layer_graph.reset();
+    w.layer_graph_ready = false;
+    w.layer_graph_state = 0;
+    for (int b = 0; b < 3; ++b) {
+      w.attn_graph[b].reset();
+      w.attn_graph_state[b] = 0;
+    }
     // The per-layer device pointer arrays were uploaded all-nullptr while the layer was
     // host-resident; refresh them with the new device addresses (same layout as load).
     if (w.all_ptr_idx >= 0 && w.all_ptr_idx < static_cast<int>(all_gp_.size())) {
@@ -4951,9 +4971,9 @@ void DenseRunner::apply_auto_vram_layers() {
     const cuda::MemInfo mi2 = cuda::mem_info();
     std::fprintf(stderr,
                  "[placement] auto-vram: promoted MoE layer blk.%d to the GPU (%.0f MiB, "
-                 "free %.0f -> %.0f MiB, floor %.0f MiB) gpu_moe_layers -> %d\n",
+                 "free %.0f -> %.0f MiB, reserve %.0f MiB) gpu_moe_layers -> %d\n",
                  i, need / 1048576.0, mi.free_bytes / 1048576.0, mi2.free_bytes / 1048576.0,
-                 vram_margin_floor_bytes_ / 1048576.0, gpu_moe_layers_);
+                 promo_reserve / 1048576.0, gpu_moe_layers_);
   }
   if (promoted > 0) {
     const cuda::MemInfo mi = cuda::mem_info();

@@ -2329,6 +2329,21 @@ int run(Options& opts) {
                                static_cast<int64_t>(kv_bpt);
         int suggested = static_cast<int>(std::max<int64_t>(1, st.ctx - reduce));
         if (suggested >= st.ctx) suggested = std::max(1, st.ctx - std::max(1, st.ctx / 10));
+        // A suggestion that is a tiny fraction of the request means the VRAM shortfall is
+        // not a ctx problem (e.g. auto expert promotion + graph capture over-committed):
+        // retrying with ctx=1 only reloads the model and can hit cuMemAlloc.  Fail fast
+        // with an actionable message instead.
+        const int min_useful = std::max(16, opts.ctx / 8);
+        if (suggested < min_useful) {
+          std::fprintf(stderr,
+                       "[serve] ERROR: VRAM over-subscribed after load (free %.0f MiB < margin "
+                       "%zu MiB) even though ctx would have to drop from %d to %d; not retrying. "
+                       "Lower --gpu-layers / disable --vram-auto-layers, or raise --vram-margin "
+                       "so placement leaves room for the CUDA graph pools.\n",
+                       static_cast<double>(mem.free_bytes) / 1048576.0, margin_bytes >> 20,
+                       opts.ctx, suggested);
+          return 1;
+        }
         opts.ctx_suggested = suggested;
         std::fprintf(stderr,
                      "[serve] ctx clamp  : requested %d -> %d measured-infeasible "
