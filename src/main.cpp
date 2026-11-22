@@ -1240,9 +1240,33 @@ int main(int argc, char** argv) {
         }
       }
       if (ids.empty()) throw std::runtime_error("no prompt ids");
-      int max_seq = static_cast<int>(ids.size()) + n_gen + 16;
-      if (cfg.was_set("ctx")) max_seq = static_cast<int>(cfg.get_int("ctx"));
-      if (max_seq < static_cast<int>(ids.size())) max_seq = static_cast<int>(ids.size());
+      const int prompt_tokens = static_cast<int>(ids.size());
+      // --ctx is a hard total-sequence budget (prompt + generated) and accepts any
+      // positive integer.  Clip the *generation request* to the room the user left
+      // instead of letting forward() run past max_seq_ ("position out of range" after
+      // partial output was the old failure mode for tiny ctx).
+      const bool ctx_given = cfg.was_set("ctx");
+      const int ctx_req = static_cast<int>(cfg.get_int("ctx"));
+      int max_seq = prompt_tokens + n_gen + 16;
+      if (ctx_given && ctx_req > 0) {
+        if (ctx_req <= prompt_tokens) {
+          std::fprintf(stderr,
+                       "[run] ERROR: --ctx %d leaves no room to generate: the prompt is %d "
+                       "tokens (need ctx >= prompt+1 = %d)\n",
+                       ctx_req, prompt_tokens, prompt_tokens + 1);
+          return 2;
+        }
+        const int room = ctx_req - prompt_tokens;
+        if (n_gen > room) {
+          std::fprintf(stderr,
+                       "[run] n capped: --ctx %d - prompt %d = %d tokens (requested --n %d)\n",
+                       ctx_req, prompt_tokens, room, n_gen);
+          n_gen = room;
+        }
+        max_seq = ctx_req;
+      } else if (ctx_given && ctx_req == 0) {
+        std::fprintf(stderr, "[run] ctx auto: no explicit --ctx limit (derived from free VRAM)\n");
+      }
       if (probe.ok) {
         const int kv_type = kv_type_from_cfg();
         int ledger_ctx = max_seq;
