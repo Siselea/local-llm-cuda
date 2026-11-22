@@ -235,15 +235,20 @@ Gemma4「extended path」WIP（`[arch] extended path enabled ... qk_norm=1 gelu=
 以及 `missing tensor blk.N.ffn_norm.weight`）编进了共享的 `build/test_gen.exe`。
 
 证据：
-- 旧二进制（16:25）：`gen_regression` → 1/10；
+- 旧二进制（16:25，脏树构建）：`gen_regression` → 1/10（9B/35B `got` 全空、coder 75723）；
 - 独立 worktree 从**已提交 HEAD 47555d2** 重建 test_gen → `gen_regression` **10/10 GREEN**；
 - 归因：`5414092` 只改 main.cpp、`bd0b477` 改 serve/config-help、`f60d57a` 改 launcher/tests，
   均不在 test_gen 的链接路径；HEAD 全量构建下五套全绿。
+- 恢复动作已执行：`build/bak_wip_1625/` 备份坏二进制 → 用干净 HEAD worktree 的全套
+  `build/*.exe`（sha1 校验一致）覆盖共享 `build/` → 重跑 `gen_regression` **10/10 GREEN**、
+  `smoke_models` **40716/185/2614/2614 EXIT=0**。
+- generalize 的 arch 提交进入 HEAD（53396ef）后，再次从干净 HEAD worktree 全量重建并覆盖共享
+  `build/`，`gen_regression` 仍 **10/10 GREEN**、smoke 4/4 一致（`build/logs/genreg_head53396.log`
+  / `smoke_head53396.log`）→ 共享环境当前是“HEAD 二进制且绿的”。
 
-团队规则（已写入 `CONTRIBUTING.md`）：**共享 `build/` 只允许由“干净 HEAD worktree”构建**；
-含 WIP 的实验编译必须去独立 worktree（如 `../engine_arch`），并用
-`tools/check_clean_build.sh` 检查（server-mode 维护）。恢复动作：用 HEAD worktree 的全套
-二进制覆盖共享 `build/`，再重跑五套验证。
+团队规则（已写入 `CONTRIBUTING.md` §1.1，并由 server-mode 的 `tools/check_clean_build.sh` 门禁）：
+**共享 `build/` 只允许由“干净 HEAD worktree”构建**；含 WIP 的实验编译必须去独立 worktree
+（如 `../engine_arch`），覆盖前确认无验证进程占用。
 
 ---
 
