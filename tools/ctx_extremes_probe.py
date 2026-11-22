@@ -125,7 +125,20 @@ def http_json(method: str, url: str, body=None, timeout=600):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
-            return r.status, (json.loads(raw) if raw else {}), time.time() - t0
+            if not raw:
+                return r.status, {}, time.time() - t0
+            try:
+                return r.status, json.loads(raw), time.time() - t0
+            except UnicodeDecodeError as ue:
+                # Do not fail the whole measurement if the server emits a JSON body
+                # with an invalid UTF-8 tail (repro for the engine bug this probes):
+                # decode leniently and remember the raw prefix for the report.
+                text = raw.decode('utf-8', 'replace')
+                try:
+                    payload = json.loads(text)
+                except Exception:
+                    payload = {'_invalid_utf8': str(ue), '_raw_hex': raw[:96].hex()}
+                return r.status, payload, time.time() - t0
     except urllib.error.HTTPError as e:
         raw = e.read()
         try:
