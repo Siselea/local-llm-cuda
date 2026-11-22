@@ -511,6 +511,13 @@ bool Server::run(std::string* err) {
     const SOCKET c = ws.accept(static_cast<SOCKET>(listen_fd_),
                                reinterpret_cast<sockaddr*>(&peer), &peer_len);
     if (c == INVALID_SOCKET) continue;
+    {
+      // Per-connection receive timeout: a client that opens the socket but never
+      // finishes its headers/body must not block the single-threaded accept loop.
+      int rcv_timeout = 5000;  // ms
+      ws.setsockopt(c, SOL_SOCKET, SO_RCVTIMEO,
+                    reinterpret_cast<const char*>(&rcv_timeout), sizeof(rcv_timeout));
+    }
     char ip[64] = {0};
     std::snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
                   static_cast<unsigned>((peer.sin_addr.s_addr) & 0xFF),

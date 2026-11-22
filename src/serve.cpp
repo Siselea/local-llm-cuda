@@ -264,12 +264,23 @@ jsonp::Value parse_json_body(const http::Request& req) {
 
 // Cheap validation used before an HTTP response (and especially before an SSE
 // stream) is started: generate() must not throw after the 200 header went out.
+std::string prompt_too_long_message(const ServerState& st, int prompt_tokens) {
+  const int over = prompt_tokens - st.ctx;
+  std::string msg = "prompt is too long: " + std::to_string(prompt_tokens) +
+                    " tokens >= actual context " + std::to_string(st.ctx);
+  if (st.ctx_requested > 0 && st.ctx_requested != st.ctx)
+    msg += " (requested " + std::to_string(st.ctx_requested) + ", clamped to " +
+           std::to_string(st.ctx) + ")";
+  msg += ", over by " + std::to_string(over) +
+         " tokens; shorten the prompt, raise --ctx, or use a smaller kv_type";
+  return msg;
+}
+
 void validate_prompt(const ServerState& st, const std::string& prompt, const GenParams& gp) {
   const std::vector<int> ids = st.tk.encode(prompt, false, true);
   if (ids.empty()) throw UserError("prompt encodes to zero tokens");
   if (static_cast<int>(ids.size()) >= st.ctx)
-    throw UserError("prompt is too long: " + std::to_string(ids.size()) + " tokens >= context " +
-                    std::to_string(st.ctx));
+    throw UserError(prompt_too_long_message(st, static_cast<int>(ids.size())));
   if (std::min(gp.max_tokens, st.ctx - static_cast<int>(ids.size())) <= 0)
     throw UserError("no room left to generate (context full)");
 }
@@ -285,8 +296,7 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
   if (ids.empty()) throw UserError("prompt encodes to zero tokens");
   out.prompt_tokens = static_cast<int>(ids.size());
   if (static_cast<int>(ids.size()) >= st.ctx)
-    throw UserError("prompt is too long: " + std::to_string(ids.size()) + " tokens >= context " +
-                    std::to_string(st.ctx));
+    throw UserError(prompt_too_long_message(st, static_cast<int>(ids.size())));
   int max_new = std::min(gp.max_tokens, st.ctx - static_cast<int>(ids.size()));
   if (max_new <= 0) throw UserError("no room left to generate (context full)");
 
@@ -424,6 +434,10 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
   std::string pending;                       // decoded bytes not yet emitted
   bool stop_hit = false;
   bool in_think = gp.thinking_active;
+  // After "</think>" the model emits a template separator ("\n\n"); drop those
+  // newlines even when they arrive in a later token, so a user stop:["\n\n"] does
+  // not match the separator and end the request with an empty answer.
+  bool drop_leading_newlines = false;
   bool aborted = false;
 
   // ---- degenerate-loop guard (sentence / char levels, see engine/serve_guard.h) ----
@@ -433,33 +447,43 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
 
   auto feed_emitted = [&](const std::string& text) {
     if (text.empty()) return;
-    out.raw_text += text;
-    if (guard.update(text, gp.thinking_active && in_think)) {
+    std::string emitted = text;
+    if ((!gp.thinking_active || !in_think) && drop_leading_newlines) {
+      size_t b = 0;
+      while (b < emitted.size() && emitted[b] == '\n') ++b;
+      if (b == emitted.size()) return;  // separator only: nothing to show
+      emitted = emitted.substr(b);
+      drop_leading_newlines = false;
+    }
+    const std::string& text2 = emitted;
+    out.raw_text += text2;
+    if (guard.update(text2, gp.thinking_active && in_think)) {
       repeat_stop = true;
       out.repeat_guard_hit = true;
     }
     if (!gp.thinking_active) {
-      out.content += text;
-      if (!on_delta(text, false)) aborted = true;
+      out.content += text2;
+      if (!on_delta(text2, false)) aborted = true;
       return;
     }
     if (!in_think) {
-      out.content += text;
-      if (!on_delta(text, false)) aborted = true;
+      out.content += text2;
+      if (!on_delta(text2, false)) aborted = true;
       return;
     }
-    const size_t p = text.find("</think>");
+    const size_t p = text2.find("</think>");
     if (p == std::string::npos) {
-      out.reasoning += text;
-      if (!on_delta(text, true)) aborted = true;
+      out.reasoning += text2;
+      if (!on_delta(text2, true)) aborted = true;
       return;
     }
     if (p > 0) {
-      out.reasoning += text.substr(0, p);
-      if (!on_delta(text.substr(0, p), true)) aborted = true;
+      out.reasoning += text2.substr(0, p);
+      if (!on_delta(text2.substr(0, p), true)) aborted = true;
     }
     in_think = false;
-    std::string rest = text.substr(p + std::strlen("</think>"));
+    drop_leading_newlines = true;
+    std::string rest = text2.substr(p + std::strlen("</think>"));
     // drop the newlines the model emits right after closing the think block
     size_t b = 0;
     while (b < rest.size() && rest[b] == '\n') ++b;
@@ -470,14 +494,53 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
     }
   };
 
+  auto find_stop = [&](size_t from) -> size_t {
+    size_t pos = std::string::npos;
+    for (const auto& s : gp.stop) {
+      const size_t p = pending.find(s, from);
+      if (p != std::string::npos && (pos == std::string::npos || p < pos)) pos = p;
+    }
+    return pos;
+  };
   auto flush = [&](bool force) -> bool {  // false = stop string hit
     while (true) {
-      size_t stop_pos = std::string::npos;
-      for (const auto& s : gp.stop) {
-        const size_t p = pending.find(s);
-        if (p != std::string::npos && (stop_pos == std::string::npos || p < stop_pos))
-          stop_pos = p;
+      // 1) Thinking block bookkeeping happens on the *whole* pending buffer before
+      //    anything is emitted.  The stop holdback below can cut "</think>" in half
+      //    (feed_emitted only sees flushed chunks, so a split marker would never be
+      //    recognised and the answer would stay in reasoning with an empty content).
+      //    Detecting it here makes the split impossible; a partial marker at the tail
+      //    is never emitted because `keep` below also holds a whole marker.
+      if (gp.thinking_active && in_think) {
+        const size_t mp = pending.find("</think>");
+        if (mp != std::string::npos) {
+          if (mp > 0) feed_emitted(pending.substr(0, mp));
+          in_think = false;
+          drop_leading_newlines = true;
+          std::string rest = pending.substr(mp + std::strlen("</think>"));
+          // drop the newlines the model emits right after closing the think block
+          size_t b = 0;
+          while (b < rest.size() && rest[b] == '\n') ++b;
+          pending = rest.substr(b);
+          continue;
+        }
       }
+      // 1b) Drop the template separator newlines after "</think>" (they can arrive in a
+      // later token than the marker).
+      if (drop_leading_newlines && !in_think) {
+        size_t b = 0;
+        while (b < pending.size() && pending[b] == '\n') ++b;
+        if (b == pending.size()) {
+          pending.clear();
+        } else {
+          pending.erase(0, b);
+          drop_leading_newlines = false;
+        }
+      }
+      // 2) Stop strings only apply to visible content.  While the thinking block is
+      //    open, matches in reasoning are ignored: stop:["\\n\\n"] must not end the
+      //    request on a blank line inside the thought block.
+      const size_t stop_pos =
+          (gp.thinking_active && in_think) ? std::string::npos : find_stop(0);
       if (stop_pos != std::string::npos) {
         feed_emitted(pending.substr(0, stop_pos));
         pending.clear();
@@ -489,7 +552,10 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
         pending.clear();
         return true;
       }
-      const size_t keep = max_stop > 1 ? max_stop - 1 : 0;
+      size_t keep = max_stop > 1 ? max_stop - 1 : 0;
+      // While the thought block is open also hold a whole "</think>" so a partial
+      // marker can never be flushed (see 1).
+      if (gp.thinking_active && in_think) keep = std::max(keep, std::strlen("</think>"));
       if (pending.size() <= keep) return true;
       size_t cut = pending.size() - keep;
       // never emit half of a UTF-8 sequence
@@ -2050,7 +2116,7 @@ runner::Container detect_container(const std::string& path) {
 
 }  // namespace
 
-int run(Options opts) {
+int run(Options& opts) {
   ServerState st;
   st.opts = opts;
   // Any positive integer is a valid --ctx here.  Only the model loader may clamp it
@@ -2174,6 +2240,25 @@ int run(Options opts) {
   std::printf("[serve] model ready: vocab=%d ctx=%d load=%.1f s\n", st.model->vocab(), st.ctx,
               load_ms / 1000.0);
   st.mtp_enabled = engine::config::get_bool("mtp") && st.model->mtp_available();
+  // MTP is not bit-exact: its verify step runs a (k+1)-row batch forward whose numeric
+  // path differs from single-token greedy decode (measured: identical for the first 147
+  // tokens on Qwen3.6-35B-A3B, then arg-max diverges; docs/MTP-NUMERICS.md).
+  if (st.mtp_enabled && st.model->prefix_state_supported())
+    std::fprintf(stderr,
+                 "[serve] WARN: --mtp on a hybrid model uses a batch-verify forward whose "
+                 "numeric path differs from single-token greedy decode; long generations "
+                 "may diverge from plain greedy (measured D=147 tokens on 35B-A3B). Do not "
+                 "use --mtp when bit-exact greedy output is required (docs/MTP-NUMERICS.md).\n");
+  // Speculative-decoding rollback snapshots use SSM slots 0..k-1 (qwen35.cpp
+  // spec_snapshot_*), while the multi-turn prefix cache stores its snapshot in slot 0.
+  // Running both would silently overwrite the prefix snapshot with a draft-position
+  // state and corrupt later cache hits; keep MTP off while the prefix cache is on.
+  if (st.mtp_enabled && st.pc.enabled) {
+    std::fprintf(stderr,
+                 "[serve] WARN: --mtp and the prefix cache share SSM slot 0; speculative "
+                 "decoding disabled (use --prefix-cache=0 to keep MTP)\n");
+    st.mtp_enabled = false;
+  }
   if (engine::config::get_bool("mtp"))
     std::printf("[serve] mtp        : %s (k=%d)\n",
                 st.mtp_enabled ? "speculative decoding ON for greedy requests"
@@ -2265,16 +2350,27 @@ int run(Options opts) {
   // state so request #1 starts from a clean cache.  ENGINE_NO_PREWARM=1 disables.
   if (std::getenv("ENGINE_NO_PREWARM") == nullptr) {
     const int chunk = std::max(1, st.model->prefill_chunk());
+    // Warm only a bounded slice of the canonical chunk.  Warming the full 2048-token
+    // chunk costs ~1.6 s of startup for a first-request saving far smaller than that
+    // (a 1024-token warm measured +0.44 s / -0.5 s on request #1), so cap the warmup
+    // at 1024 tokens; the real prefill chunk stays whatever the runner decided.
+    const int pw_chunk = std::min(chunk, 1024);
+    const int target = std::min(pw_chunk + 8, std::max(0, st.ctx - 8));
+    // Grow the warm text until it encodes to `target` tokens (the old fixed 48x text
+    // was only ~192 tokens, so every chunk >184 skipped the prewarm entirely).
     std::string warm_text;
-    for (int i = 0; i < 48; ++i) warm_text += "你好，世界。";
-    const std::vector<int> warm_ids = st.tk.encode(warm_text, false, true);
+    std::vector<int> warm_ids;
+    for (int batch = 0; batch < 512 && static_cast<int>(warm_ids.size()) < target; ++batch) {
+      for (int i = 0; i < 16; ++i) warm_text += "你好，世界。";
+      warm_ids = st.tk.encode(warm_text, false, true);
+    }
     // Best-effort only: a degraded placement (e.g. --vram-margin huge with
     // --allow-oversubscribe) can shrink rows_/ctx to the point where the warmup
     // does not fit; never let the warmup prevent the server from starting.
-    if (chunk < 16 || st.ctx < chunk + 16 ||
-        static_cast<int>(warm_ids.size()) < chunk + 8) {
-      std::printf("[serve] prewarm   : skipped (chunk=%d ctx=%d warm_tokens=%zu)\n", chunk,
-                  st.ctx, warm_ids.size());
+    if (pw_chunk < 16 || st.ctx < pw_chunk + 16 ||
+        static_cast<int>(warm_ids.size()) < pw_chunk + 8) {
+      std::printf("[serve] prewarm   : skipped (chunk=%d pw_chunk=%d ctx=%d warm_tokens=%zu)\n",
+                  chunk, pw_chunk, st.ctx, warm_ids.size());
     } else {
       // Save the clean (position 0) recurrent state first: reset_kv_and_states() is
       // private to the runner, but the public prefix-state API covers exactly the
@@ -2288,20 +2384,21 @@ int run(Options opts) {
         std::fprintf(stderr, "[serve] WARN: prewarm could not snapshot the clean state\n");
       try {
       const auto t_w0 = Clock::now();
-      const std::vector<int> head(warm_ids.begin(), warm_ids.begin() + chunk);
+      const std::vector<int> head(warm_ids.begin(), warm_ids.begin() + pw_chunk);
       st.model->forward(head, 0, /*last_row_only=*/true);  // canonical prefill chunk
       const double chunk_ms = ms_since(t_w0);
       const auto t_t1 = Clock::now();
-      const std::vector<int> tail(warm_ids.begin() + chunk, warm_ids.begin() + chunk + 8);
-      st.model->forward(tail, chunk, /*last_row_only=*/true);  // small-tail bucket
+      const std::vector<int> tail(warm_ids.begin() + pw_chunk,
+                                  warm_ids.begin() + pw_chunk + 8);
+      st.model->forward(tail, pw_chunk, /*last_row_only=*/true);  // small-tail bucket
       const double tail_ms = ms_since(t_t1);
       const auto t_d0 = Clock::now();
-      st.model->forward({warm_ids[0]}, chunk + 8, /*last_row_only=*/true);  // decode graph
+      st.model->forward({warm_ids[0]}, pw_chunk + 8, /*last_row_only=*/true);  // decode graph
       const double dec_ms = ms_since(t_d0);
       if (ssm_state) st.model->prefix_state_restore(0);
       std::printf("[serve] prewarm   : %d-token prefill %.0f ms, 8-token tail %.0f ms, "
                   "1-token decode %.0f ms (graphs captured, KV/SSM reset)\n",
-                  chunk, chunk_ms, tail_ms, dec_ms);
+                  pw_chunk, chunk_ms, tail_ms, dec_ms);
       std::fflush(stdout);
       } catch (const std::exception& e) {
         std::fprintf(stderr,

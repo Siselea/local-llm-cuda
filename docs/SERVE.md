@@ -422,3 +422,32 @@ restore=0.6 ms、save=0.6 ms；长上下文慢点定位见 `docs/reports/SERVE-P
     （15 层专家上 GPU，decode ~25 tok/s）。这是放置/显存配置问题，与采样无关。
 14. **KV 精度**：默认 f32；显存紧张时可用 `--kv-type q8_0`（9B 上 q8_0 与 f32 的 40 步贪心序列
     逐 token 一致；长上下文 4k+ 建议保持 f32，除非显存不足）。
+
+
+### 5.7 思考块与 stop 序列（2026-11-22）
+
+- **`</think>` 不会被 stop holdback 切断**：thinking 打开时先在整个待发缓冲上判定
+  `</think>` 再落盘（并额外 hold 整 marker），旧实现会因 stop 保留字节把 marker 切半，
+  导致答案全部留在 reasoning、content 为空。
+- **stop 只匹配可见 content**：思考块内部的文本不参与 stop；`</think>` 之后的模板分隔空行
+  （可能跨 token 到达）会被吞掉，`stop:["\n\n"]` 不会一上来就命中分隔符。
+- 与 think-budget 的关系：预算判定在 decode 循环、stop 在 flush；两者互不改写顺序。
+  思考超过预算仍按原策略强制闭合 + 关闭 thinking 重试。
+
+### 5.8 任意 ctx 的可见性（serve 侧，与 feature-polish 的 CLI 配合）
+
+- `/props` 同时返回 `n_ctx`（实际值，llama.cpp 兼容）、`n_ctx_requested` / `requested_ctx`
+  （用户请求值，0=auto）、`actual_ctx`、`ctx_clamped`、`ctx_train_exceeded`。
+- 启动日志打印 `[serve] ctx : requested N -> actual M (CLAMPED: ...)`，并保留 runner 的
+  `[ctx] requested=... / [ctx] budget ... / [ctx] CLAMPED ...` 细账。
+- 超 ctx prompt 的 400 消息带齐：`prompt is too long: N tokens >= actual context M
+  (requested R, clamped to M), over by X tokens; shorten the prompt, raise --ctx, or use a
+  smaller kv_type`。
+
+### 5.9 MTP 的限制（`--mtp`）
+
+`--mtp` 的 verify 是 (k+1) 行 batch 前向，与单 token greedy decode 的数值路径不同：
+Qwen3.6-35B-A3B 实测前 147 token 一致、第 148 个分叉（`docs/MTP-NUMERICS.md`、
+`docs/reports/MTP-IMPL-REPORT.md`）。**需要逐位一致的用户不要用 `--mtp`**；服务启动时
+hybrid 模型会打印明确 WARN。另：MTP 回滚快照用 SSM slot 0..k-1、prefix cache 用 slot 0，
+两者同时启用时 serve 会 WARN 并禁用投机（独立 slot 留 v0.2）。
