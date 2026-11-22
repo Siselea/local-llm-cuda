@@ -349,7 +349,8 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
                     kernels::kGemvQ50P4 + kernels::kRmsNorm4 + kernels::kTopkPartial +
                     kernels::kTopkFinal + kernels::kKvQuantCommon + kernels::kKvWriteQ +
                     kernels::kAttnTiled + kernels::kAttnCombine + kernels::kDequantF16 +
-                    kernels::kAttnTiledPre + kernels::kAttnTiledPreGqa + kernels::kGdDelta128Smem +
+                    kernels::kAttnTiledPre + kernels::kAttnTiledPreGqa + kernels::kAttnTiledGqa +
+                    kernels::kGdDelta128Smem +
                     kernels::kGdDelta128Reg + kernels::kF16ToF32 + kernels::kGeluMul +
                     kernels::kScaleInplace + kernels::kSoftcapInplace + kernels::kAttnCfg;
   mod_ = std::make_unique<cuda::Module>(cuda::compile_ptx(src, "runner.cu"));
@@ -398,6 +399,7 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   k_kvwriteq_ = mod_->kernel("kv_write_q");
   k_attntiled_ = mod_->kernel("attn_tiled");
   k_attntiledpre_ = mod_->kernel("attn_tiled_pre");
+  k_attntiledgqa_ = mod_->kernel("attn_tiled_gqa");
   k_attntiledpregqa_ = mod_->kernel("attn_tiled_pre_gqa");
   k_attncombine_ = mod_->kernel("attn_combine");
   k_repackbm_ = mod_->kernel("repack_block_major");
@@ -1209,7 +1211,23 @@ void DenseRunner::run_attn(LayerW& L, int n_tokens, int start_pos, cuda::Buffer&
                  pargs);
     return;
   }
-  cuda::launch(k_attntiled_, n_tokens, n_head_, nsplit, 32, 1, 1, 0, args);
+  // Decode (small batch, nsplit>1): one block per KV head with the rep query heads of
+  // the GQA group; the K/V row fetched for one head is served from L1 to the others.
+  // Same per-lane math / online softmax / scratch layout as attn_tiled, so results are
+  // identical.  ctx-gated (attn_gqa_min_ctx) so short contexts can stay on the tuned
+  // kernel if the wider block turns out slower there.
+  const bool gqa_ok = split && nsplit > 1 && gqa_rep >= 2 && gqa_rep <= 8 && k_attntiledgqa_ &&
+                      n_head_ % n_kv_ == 0 && attn_gqa_decode_ &&
+                      ctx_len >= attn_gqa_min_ctx_;
+  if (gqa_ok) {
+    int wide = (kv_type_ == 0 && head_dim_ == 256 && attn_gqa_wide_) ? 1 : 0;
+    int rep = gqa_rep;
+    void* gargs[] = {&pq,  &pKf, &pVf, &pKq, &pVq, &po,  &psc, &pp,
+                     &nh,  &nkv, &d,   &ms,  &kt,  &ns,  &stride, &rep, &wide};
+    cuda::launch(k_attntiledgqa_, n_tokens, n_kv_, nsplit, 32 * gqa_rep, 1, 1, 0, gargs);
+  } else {
+    cuda::launch(k_attntiled_, n_tokens, n_head_, nsplit, 32, 1, 1, 0, args);
+  }
   if (split && nsplit > 1) {
     int cb = head_dim_ < 256 ? head_dim_ : 256;
     void* a2[] = {&psc, &po, &nh, &d, &ns, &stride};
@@ -4702,6 +4720,10 @@ void DenseRunner::load_config_snapshot() {
   prefill_f16_min_macs_ = cfg.get_int("prefill_f16_min_macs");
   attn_pre_rows_ = static_cast<int>(cfg.get_int("attn_pre_rows"));
   attn_gqa_ = cfg.get_bool("attn_gqa");
+  attn_gqa_decode_ = cfg.get_bool("attn_gqa_decode");
+  attn_gqa_wide_ = cfg.get_bool("attn_gqa_wide");
+  attn_gqa_min_ctx_ = static_cast<int>(cfg.get_int("attn_gqa_min_ctx"));
+  if (attn_gqa_min_ctx_ < 0) attn_gqa_min_ctx_ = 0;
   prefill_f16_acc_ = cfg.get_bool("prefill_f16_acc");
   prefill_graph_ = cfg.get_bool("prefill_graph");
   prefill_logits_rows_ = static_cast<int>(cfg.get_int("prefill_logits_rows"));

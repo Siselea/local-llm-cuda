@@ -308,6 +308,18 @@ const OptionDef kDefs[] = {
      0, 0,
      "prefill attention: one warp owns a query row and the whole GQA group of its KV "
      "head (f32 KV, head_dim 256; the per-head arithmetic is unchanged)"},
+    {"attn_gqa_decode", "ENGINE_NO_ATTN_GQA", "no-attn-gqa", false, true, Type::Bool, "true",
+     0, 0,
+     "decode attention: one block per KV head with the rep query heads of the GQA group "
+     "sharing each K/V row through L1 (same math/scratch as attn_tiled, fewer DRAM reads)"},
+    {"attn_gqa_min_ctx", "ENGINE_ATTN_GQA_MIN_CTX", "attn-gqa-min-ctx", true, false, Type::Int,
+     "0", 0, 262144,
+     "only use the GQA-grouped decode attention when ctx_len >= this (keeps short "
+     "contexts on the tuned per-head kernel if the wider block is slower there)"},
+    {"attn_gqa_wide", "ENGINE_NO_ATTN_GQA_WIDE", "no-attn-gqa-wide", false, true, Type::Bool,
+     "true", 0, 0,
+     "GQA decode kernel: read f32 K/V with float4 (two 512 B coalesced loads per warp) "
+     "instead of eight strided 4 B loads"},
     {"attn_pre_rows", "ENGINE_ATTN_PRE_ROWS", "attn-pre-rows", true, false, Type::Int, "8",
      1, 32,
      "query rows per attention block when prefilling (all warps share the same K/V row "

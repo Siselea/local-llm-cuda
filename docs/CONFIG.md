@@ -169,6 +169,9 @@ KV cache 是 decode 阶段唯一随上下文线性增长的显存与读放来源
 | `prefill_f16_min_macs` | `--prefill-f16-min-macs <v>` | `ENGINE_PREFILL_F16_MIN_MACS` | int | `0` | 每次 matmul 的 MAC 数低于该值时保留原 f32/dequant 路径（0 = 全部走 fp16） |
 | `prefill_f16_acc` | `--prefill-f16-acc[=0]` | `ENGINE_PREFILL_F16_ACC` | bool | `false` | **实验**：fp16 GEMM 用 fp16 累加（`CUBLAS_COMPUTE_16F`），再快 1.85×（22.3 T-MAC/s），代价是 K 方向归约里的 fp16 舍入（每 matmul ~0.3% 相对误差）。实测会把 1.6k 退化 prompt 的 top-1 翻掉（与逐 token 喂不一致），因此**默认关闭** |
 | `prefill_graph` | `--prefill-graph[=0]` | `ENGINE_PREFILL_GRAPH` | bool | `false` | **实验**：按 chunk token 数捕获整条 prefill 流水线的 CUDA Graph（2341 次 launch → 1 次）。本机实测无收益（prefill 已是 GPU-bound，host 发射被完全掩盖），默认关闭 |
+| `attn_gqa_decode` | `--no-attn-gqa` | `ENGINE_NO_ATTN_GQA` | bool | `true` | decode attention 按 KV head 分组：一个 block 放该 GQA 组的 rep 个 query head（每 warp 一个），同一 block 内 K/V 行由 L1 共享 ⇒ K/V DRAM 读从 n_head 次降为 n_kv 次/行；数学与 scratch 布局同 `attn_tiled`，逐位一致 |
+| `attn_gqa_min_ctx` | `--attn-gqa-min-ctx` | `ENGINE_ATTN_GQA_MIN_CTX` | int | `0` | 仅当 ctx_len ≥ 该值时使用 GQA 分组 decode；短 ctx 若实测更慢可设 1024/2048 保留原内核 |
+| `attn_gqa_wide` | `--no-attn-gqa-wide` | `ENGINE_NO_ATTN_GQA_WIDE` | bool | `true` | GQA decode 的 f32 K/V 用 float4（两次 512B 全合并）读，替代 8 次 strided 4B |
 | `attn_pre_rows` | `--attn-pre-rows <v>` | `ENGINE_ATTN_PRE_ROWS` | int [1,32] | `8` | prefill attention 每 block 的 query 行数：同 block 的 8 个 warp 走同一份 K/V（L1 复用）。1 = 关（回到每 warp 一个 (token,head)）；实测 444 ms → 138 ms（1622 token 单块，8 层） |
 | `attn_gqa` | `--attn-gqa[=0]` | `ENGINE_ATTN_GQA` | bool | `true` | prefill attention 的 GQA 组共享：一个 warp 负责一个 query 行的**全部 rep 个 q head**，K/V 只读一遍（4× 流量）。每个 head 的算术顺序不变 ⇒ 结果与 `attn_tiled_pre` 逐位一致。仅 f32 KV + head_dim 256（9B/35B） |
 | `kv_split` | `--kv-split <v>` | `ENGINE_KV_SPLIT` | int [1,64] | `32` | decode attention 的 split-K 份数（一条 query 的 key 区间分给多少个 block）。prefill batch 固定用 1（每个 (token,head) 一个 block，寄存器内完成 softmax，不需要 scratch） |

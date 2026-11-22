@@ -3428,6 +3428,155 @@ extern "C" __global__ void attn_tiled(const float* __restrict__ q,
 
 // Merge the nsplit partial (m, s, acc[D]) records of attn_tiled.
 // Grid: (n_tokens, n_head), blockDim = D threads (capped at 256).
+// GQA-grouped decode attention: one block per (token, KV head, split) with `rep` warps
+// (one warp per query head of that KV group).  All warps walk the same K/V rows in lock
+// step, so the row one warp fetches is served from L1 to the other rep-1 warps -- the
+// decode analogue of what attn_tiled_pre does for prefill.  The per-lane math, dot
+// order, online softmax, scratch layout and combine step are identical to attn_tiled,
+// so the numerics do not change; only the number of DRAM reads of K/V drops from
+// n_head to n_kv per row.
+inline const char* kAttnTiledGqa = R"cuda(
+extern "C" __global__ void attn_tiled_gqa(const float* __restrict__ q,
+                                         const float* __restrict__ Kf,
+                                         const float* __restrict__ Vf,
+                                         const unsigned char* __restrict__ Kq,
+                                         const unsigned char* __restrict__ Vq,
+                                         float* __restrict__ out,
+                                         float* __restrict__ scratch,
+                                         const int* __restrict__ pstart, int n_head, int n_kv,
+                                         int D, int max_seq, int kv_type, int nsplit,
+                                         int scratch_stride, int rep, int wide) {
+  const int i = blockIdx.x;
+  const int kvh = blockIdx.y;
+  const int sp = blockIdx.z;
+  const int warp = threadIdx.x >> 5;
+  const int h = kvh * rep + warp;
+  if (h >= n_head) return;
+  const int qpos = *pstart + i;
+  const int lane = threadIdx.x & 31;
+  const float scale = rsqrtf((float)D);
+  const int EL = D / 32;
+  const int e0 = lane * EL;
+  const int grp = 32 / EL;
+  const int qblk = lane / grp;
+  const int qoff = (lane % grp) * EL;
+  const int rowb = kv_row_bytes(kv_type, D);
+  const long long row0 = (long long)kvh * max_seq;
+  const bool f32_wide = (kv_type == 0 && wide && EL == 8);
+  float qr[8];
+  const float* qh = q + ((long long)i * n_head + h) * D + e0;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) qr[e] = (e < EL) ? __ldg(qh + e) : 0.f;
+  float m = -1e30f, s = 0.f;
+  float acc[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+  for (int j = sp; j <= qpos; j += nsplit) {
+    float dot = 0.f;
+    float4 v0, v1;
+    if (f32_wide) {
+      const float* kp = Kf + (row0 + j) * D + e0;
+      const float4 k0 = *reinterpret_cast<const float4*>(kp);
+      const float4 k1 = *reinterpret_cast<const float4*>(kp + 4);
+      dot = qr[0] * k0.x + qr[1] * k0.y + qr[2] * k0.z + qr[3] * k0.w + qr[4] * k1.x +
+            qr[5] * k1.y + qr[6] * k1.z + qr[7] * k1.w;
+      const float* vp = Vf + (row0 + j) * D + e0;
+      v0 = *reinterpret_cast<const float4*>(vp);
+      v1 = *reinterpret_cast<const float4*>(vp + 4);
+    } else if (kv_type == 0) {
+      const float* kp = Kf + (row0 + j) * D + e0;
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        if (e < EL) dot += qr[e] * __ldg(kp + e);
+    } else if (kv_type == 1) {
+      const unsigned char* kp = Kq + (row0 + j) * rowb + qblk * 34;
+      const float dq = half_to_float(*(const unsigned short*)kp);
+      const signed char* qs = (const signed char*)(kp + 2) + qoff;
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        if (e < EL) dot += qr[e] * (float)qs[e];
+      dot *= dq;
+    } else {
+      const unsigned char* kp = Kq + (row0 + j) * rowb + qblk * 18;
+      const float dq = half_to_float(*(const unsigned short*)kp);
+      const unsigned char* nb = kp + 2;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        if (e < EL) {
+          const int idx = qoff + e;
+          const unsigned char byte = nb[idx & 15];
+          const int qv = (idx < 16) ? (int)(byte & 0xF) : (int)(byte >> 4);
+          dot += qr[e] * (float)(qv - 8);
+        }
+      }
+      dot *= dq;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+    dot *= scale;
+    if (dot > m) {
+      const float corr = expf(m - dot);
+      s *= corr;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[e] *= corr;
+      m = dot;
+    }
+    const float p = expf(dot - m);
+    s += p;
+    if (f32_wide) {
+      acc[0] += p * v0.x;
+      acc[1] += p * v0.y;
+      acc[2] += p * v0.z;
+      acc[3] += p * v0.w;
+      acc[4] += p * v1.x;
+      acc[5] += p * v1.y;
+      acc[6] += p * v1.z;
+      acc[7] += p * v1.w;
+    } else if (kv_type == 0) {
+      const float* vp = Vf + (row0 + j) * D + e0;
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        if (e < EL) acc[e] += p * __ldg(vp + e);
+    } else if (kv_type == 1) {
+      const unsigned char* vp = Vq + (row0 + j) * rowb + qblk * 34;
+      const float dq = half_to_float(*(const unsigned short*)vp);
+      const signed char* qs = (const signed char*)(vp + 2) + qoff;
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        if (e < EL) acc[e] += p * ((float)qs[e] * dq);
+    } else {
+      const unsigned char* vp = Vq + (row0 + j) * rowb + qblk * 18;
+      const float dq = half_to_float(*(const unsigned short*)vp);
+      const unsigned char* nb = vp + 2;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        if (e < EL) {
+          const int idx = qoff + e;
+          const unsigned char byte = nb[idx & 15];
+          const int qv = (idx < 16) ? (int)(byte & 0xF) : (int)(byte >> 4);
+          acc[e] += p * ((float)(qv - 8) * dq);
+        }
+      }
+    }
+  }
+  if (nsplit == 1) {
+    float* op = out + ((long long)i * n_head + h) * D + e0;
+    const float inv = s > 0.f ? 1.f / s : 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+      if (e < EL) op[e] = acc[e] * inv;
+  } else {
+    float* base = scratch + (long long)((i * n_head + h) * nsplit + sp) * scratch_stride;
+    base[D] = m;
+    base[D + 1] = s;
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+      if (e < EL) base[e0 + e] = acc[e];
+  }
+}
+)cuda";
+
+
 inline const char* kAttnCombine = R"cuda(
 extern "C" __global__ void attn_combine(const float* __restrict__ scratch,
                                         float* __restrict__ out, int n_head, int D,

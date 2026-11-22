@@ -351,6 +351,9 @@ class DenseRunner {
   long long prefill_f16_min_macs_ = 0;   // below this per-call MAC count keep the f32 path
   int attn_pre_rows_ = 8;                // query rows per attention block at prefill (1 = off)
   bool attn_gqa_ = true;                 // prefill: GQA group shares one K/V stream
+  bool attn_gqa_decode_ = true;          // decode: one block per KV head (GQA-grouped)
+  bool attn_gqa_wide_ = true;            // decode: f32 K/V reads via float4 (D==256)
+  int attn_gqa_min_ctx_ = 0;             // decode: only use the kernel at ctx >= this
   // fp16-accumulate prefill GEMM: 1.85x the fp32-accumulate tensor rate, at the price
   // of fp16 rounding inside the K reduction (validated numerically in PRE-FILL-REPORT).
   bool prefill_f16_acc_ = false;
@@ -702,6 +705,7 @@ class DenseRunner {
   void* k_kvwriteq_ = nullptr;       // quantizing KV write (q8_0 / q4_0)
   void* k_attntiled_ = nullptr;
   void* k_attntiledpre_ = nullptr;   // prefill: several query rows per block
+  void* k_attntiledgqa_ = nullptr;   // decode: one block per KV head, rep query heads share K/V
   void* k_attntiledpregqa_ = nullptr;  // prefill: GQA group shares one K/V stream      // tiled online-softmax attention over f32/quant KV
   void* k_attncombine_ = nullptr;    // split-K merge for attntiled_
   void* k_silu_ = nullptr;
