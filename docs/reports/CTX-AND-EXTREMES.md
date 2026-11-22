@@ -341,11 +341,27 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
 - 自动加层条件改为 `need + max(margin, floor) + vram_extra_reserve_mb`，并对被提升层清掉旧
   CPU 路径 graph（避免重放旧 expert 路径）；
 - serve 守卫：唯一可行 ctx < 请求的 1/8 时**不重试**，直接 rc=1 并提示
-  `lower --gpu-layers / disable --vram-auto-layers / raise --vram-margin`。
+  `lower --gpu-layers / disable --vram-auto-layers / raise --vram-margin`；
+- 进一步实测发现：图池提前后仍有一段 **`load_weights()` 尾部约 1.06 GiB 的激活/工作区分配**
+  发生在自动加层之后（35B auto ctx4096：加层后 free 2236 → 守卫 1156，只差 44 MiB）。
+  因此自动加层预留改为 `max(margin, floor) + vram_extra_reserve_mb + 1152 MiB`（实测
+  post-promotion 分配 cushion）；放不下就**保持该层在 CPU**，不再制造 serve 会拒绝的状态。
 
-**验证（launcher 等价参数，干净窗口）**：35B auto `--ctx 4096` 启动 **66.3 s**、`listening`、
-无重试（gpu_moe_layers 10→12，post-load free 2092 MiB）；`--gpu-layers` 显式路径与
-9B/Coder/0.5B auto 放置行为不变（见 §2.14 不变性验证）。**教训**：任何“账本外”的 CUDA
+**验证（launcher 等价参数，干净窗口、无外部 GPU 负载）**：
+
+| 用例 | 结果 |
+|---|---|
+| 35B auto ctx4096 | **listening，load 46.1 s**，check OK 2854 MiB，无 ERROR/无重试 |
+| 35B auto ctx8192 | **listening，load 69.0 s**，check OK 2638 MiB，无 ERROR |
+| 35B auto ctx32768 | 预载夹紧 32768→29491（`CLAMPED` + `clamp reason`），**listening，load 47.8 s**，单次装载 |
+| 35B explicit `--gpu-layers 12` | listening，load 47.2 s（显式路径不变） |
+| 9B auto ctx4096 | listening，load 14.8 s |
+| Coder auto ctx4096 | listening，load 37.1 s |
+| 0.5B auto ctx4096 | listening（待最后一遍确认记录） |
+
+早先 66.3 s 那次是 gpu_moe_layers 10→12（loader 少放 3 层+加 2 层）；现在 loader 直接放 13 层、
+自动加层被 cushion 正确挡住，46 s 启动更快。注意：测量必须排除外部 GPU 占用（并发 A/B 时
+min_free 会掉到 20 MiB，9B 都会被误报超订）。**教训**：任何“账本外”的 CUDA
 分配（图池、cuBLAS workspace）必须先于自动放置发生，否则 margin 契约会被静默破坏。
 
 ### 2.15 35B 30 轮会话 ⏳ v0.1.6
