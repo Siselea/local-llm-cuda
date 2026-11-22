@@ -83,6 +83,11 @@ class DenseRunner {
   // loader derives and clamps this from measured free VRAM, so the server reports
   // the real value instead of the requested 0.
   int ctx() const { return max_seq_; }
+  // MoE expert placement (valid after load): number of MoE layers, and how many of them
+  // keep some experts on the host CPU path.  serve uses this to skip the token-warmup on
+  // CPU-expert models, where a 1024-token prefill costs >100 s of startup (35B: 133 s).
+  int n_moe_layers() const;
+  int cpu_moe_layers() const;
 
   // ---- MTP / speculative decoding -------------------------------------------
   // Available when the GGUF carries a `nextn` (multi-token-prediction) block and the

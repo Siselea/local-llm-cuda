@@ -1243,20 +1243,26 @@ int main(int argc, char** argv) {
       // the final /props + startup log show requested -> actual and the clamp reason.
       int ctx_try = o.ctx;
       int rc = -1;
-      for (int attempt = 0; attempt < 4; ++attempt) {
+      // At most 2 measured-clamp retries (3 attempts): a reload of a 20 GiB MoE model
+      // costs 60-90 s, and the pre-load split-MoE budget above should make the first
+      // attempt fit; the retry chain is only a fallback for estimates we cannot make
+      // before loading.
+      constexpr int kServeAttempts = 3;
+      for (int attempt = 0; attempt < kServeAttempts; ++attempt) {
         engine::serve::Options opts_try = o;
         opts_try.ctx = ctx_try;
         opts_try.ctx_suggested = 0;
         rc = engine::serve::run(opts_try);
-        if (rc == 4 && opts_try.ctx_suggested > 0 && opts_try.ctx > 0 && attempt < 3) {
+        if (rc == 4 && opts_try.ctx_suggested > 0 && opts_try.ctx > 0 &&
+            attempt + 1 < kServeAttempts) {
           std::fprintf(stderr,
                        "[ctx] measured clamp: requested %d does not fit; retrying with --ctx %d "
-                       "(attempt %d/4)\n",
-                       o.ctx_requested, opts_try.ctx_suggested, attempt + 1);
+                       "(attempt %d/%d: adjusting ctx from measured free VRAM)\n",
+                       o.ctx_requested, opts_try.ctx_suggested, attempt + 1, kServeAttempts);
           ctx_try = opts_try.ctx_suggested;
           continue;
         }
-        if (rc == 5 && probe.ok && o.ctx > 0 && attempt < 3) {
+        if (rc == 5 && probe.ok && o.ctx > 0 && attempt + 1 < kServeAttempts) {
           // Load OOM with a positive ctx.  Estimate the largest ctx that fits from the
           // model structure + measured free VRAM, then let serve measure it again.
           const int kv_type = kv_type_from_cfg();
@@ -1269,8 +1275,8 @@ int main(int argc, char** argv) {
           if (next >= ctx_try) next = std::max(1, ctx_try * 3 / 4);
           std::fprintf(stderr,
                        "[ctx] load failed with ctx=%d; retrying with --ctx %d (max ctx that fits "
-                       "the VRAM budget=%d, attempt %d/4)\n",
-                       ctx_try, next, fit.max_ctx, attempt + 1);
+                       "the VRAM budget=%d, attempt %d/%d)\n",
+                       ctx_try, next, fit.max_ctx, attempt + 1, kServeAttempts);
           ctx_try = next;
           continue;
         }

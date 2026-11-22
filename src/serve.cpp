@@ -2357,7 +2357,16 @@ int run(Options& opts) {
   // own prefill-graph capture - that part needs the runner-side bucket fix).
   // Warm the canonical chunk and the decode graph once here, then reset the KV/SSM
   // state so request #1 starts from a clean cache.  ENGINE_NO_PREWARM=1 disables.
-  if (std::getenv("ENGINE_NO_PREWARM") == nullptr) {
+  const int n_moe = st.model->n_moe_layers();
+  const int cpu_moe = st.model->cpu_moe_layers();
+  if (n_moe > 0 && cpu_moe > 0) {
+    // Warming 1024 tokens on a CPU-expert model is CPU-bandwidth bound: measured 133 s on
+    // the 35B (14/40 GPU layers) and it dominates startup.  The first request pays the
+    // graph captures instead (a few hundred ms), which is a much better trade.
+    std::printf("[serve] prewarm   : skipped (CPU MoE experts on %d/%d MoE layers: a 1024-token "
+                "warm would dominate startup)\n", cpu_moe, n_moe);
+    std::fflush(stdout);
+  } else if (std::getenv("ENGINE_NO_PREWARM") == nullptr) {
     const int chunk = std::max(1, st.model->prefill_chunk());
     // Warm only a bounded slice of the canonical chunk.  Warming the full 2048-token
     // chunk costs ~1.6 s of startup for a first-request saving far smaller than that

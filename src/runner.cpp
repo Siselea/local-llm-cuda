@@ -930,29 +930,79 @@ void DenseRunner::derive_ctx_limit(int requested) {
   const int pre_rows = static_cast<int>(cfg.get_int("prefill_rows"));
   const int row_cap = pre_rows > 0 ? pre_rows : 1;
   // weights that stay resident (file bytes are the resident bytes for quantized GGUFs)
-  size_t weights = static_cast<size_t>(ir_.fixed_bytes());
-  const size_t reserve = (static_cast<size_t>(cfg.get_int("vram_margin_mb")) << 20) +
-                         (static_cast<size_t>(cfg.get_int("workspace_mb")) << 20);
+  const size_t weights = static_cast<size_t>(ir_.fixed_bytes());
+  const size_t margin = static_cast<size_t>(cfg.get_int("vram_margin_mb")) << 20;
+  const size_t workspace = static_cast<size_t>(cfg.get_int("workspace_mb")) << 20;
+  const size_t reserve = margin + workspace;
   const size_t free_at_load = cuda::mem_info().free_bytes;
   // activation bytes as a function of the number of rows actually allocated
   auto act_bytes = [&](int rows) -> size_t { return activation_bytes(rows); };
-  // closed form: try the requested length, then recompute the activation reserve with
-  // the (smaller) row cap the reduced length implies and iterate until stable.
+
+  // ---- MoE CPU-offload models: the KV cache competes with GPU-resident experts -----
+  // The old budget only subtracted ir_.fixed_bytes(), so on a 35B (20.33 GiB of experts,
+  // 11-15 layers kept on the GPU) it claimed ctx 32768 fit while post-load free VRAM was
+  // 1160 MiB < margin -> serve measured-clamped and reloaded the 60-90 s model three
+  // times (258 s startup).  For a *large* KV request on a split MoE model, estimate the
+  // bytes of experts that will stay on the GPU plus the calibrated load overhead
+  // (workspace + vram_extra_reserve + allocator slack) before loading, so the clamp
+  // happens on the first load.  Small-KV cases (MLA models, default 4096) stay on the
+  // old path: their KV is tiny and the measured-clamp fallback is cheap.
+  const bool split_moe =
+      ir_.moe.n_expert > 0 && ir_.expert_bytes() > 0 && ir_.total_bytes() > free_at_load;
+  const uint64_t want_kv = kv_per_token * static_cast<uint64_t>(want);
+  // Only long explicit/auto requests are worth a pre-load clamp: small contexts (Coder's
+  // 4096 default, 35B at 4096) keep the old verbatim path and the cheap measured-clamp
+  // fallback, so this optimisation cannot change their behaviour.
+  const bool budget_split = split_moe && want >= 16384 && want_kv > (256ull << 20);
+  const size_t ledger_gap =
+      static_cast<size_t>(std::max<int64_t>(0, cfg.get_int("vram_extra_reserve_mb"))) << 20;
+  // Predict the loader's own residency: it keeps fixed + KV + workspace resident and
+  // fills the remaining free VRAM with experts, leaving vram_margin(+96 MiB) free.
+  // Measured on the 35B: the driver/allocator also eats ~vram_extra_reserve_mb beyond the
+  // ledger (calibrated by that knob), so count it here as well.
+  auto split_experts_at = [&](int seq, size_t* kv_out) -> size_t {
+    const size_t overhead = workspace + ledger_gap + (96ull << 20);
+    const int rows = std::min(seq, row_cap);
+    const size_t kv = kv_per_token * static_cast<size_t>(seq);
+    if (kv_out) *kv_out = kv;
+    const size_t base_req = weights + kv + act_bytes(rows) + overhead + margin;
+    return free_at_load > base_req
+               ? std::min<size_t>(static_cast<size_t>(ir_.expert_bytes()),
+                                   free_at_load - base_req)
+               : 0;
+  };
   int seq = want;
   int fit = want;
-  for (int it = 0; it < 4; ++it) {
-    const int rows = std::min(seq, row_cap);
-    const size_t act = act_bytes(rows);
-    const size_t avail = free_at_load > weights + act + reserve
-                             ? free_at_load - weights - act - reserve
-                             : 0;
-    fit = kv_per_token ? static_cast<int>(avail / kv_per_token) : want;
-    fit = std::min(fit, want);
-    if (fit >= seq) break;
-    seq = fit;
-    if (seq < 1) seq = 1;
+  if (budget_split) {
+    // Keep the expert residency of the requested length fixed: the loader's adaptive
+    // placement only promotes another layer once a full expert layer of free VRAM
+    // appears, so this small clamp does not trigger a promotion.
+    size_t kv_req = 0;
+    const size_t experts = split_experts_at(want, &kv_req);
+    const size_t overhead = workspace + ledger_gap + (96ull << 20);
+    const size_t safety = 128ull << 20;
+    const int rows = std::min(want, row_cap);
+    const size_t base_fit = weights + experts + act_bytes(rows) + overhead + margin + safety;
+    const size_t avail = free_at_load > base_fit ? free_at_load - base_fit : 0;
+    const int next = kv_per_token ? static_cast<int>(avail / kv_per_token) : want;
+    fit = std::min(want, std::max(1, next));
+    (void)kv_req;
+  } else {
+    for (int it = 0; it < 4; ++it) {
+      const int rows = std::min(seq, row_cap);
+      const size_t act = act_bytes(rows);
+      const size_t avail = free_at_load > weights + act + reserve
+                               ? free_at_load - weights - act - reserve
+                               : 0;
+      fit = kv_per_token ? static_cast<int>(avail / kv_per_token) : want;
+      fit = std::min(fit, want);
+      if (fit >= seq) break;
+      seq = fit;
+      if (seq < 1) seq = 1;
+    }
   }
-  const int final_seq = ctx_auto ? std::min(want, fit) : want;
+  const bool split_clamp = budget_split && fit < want;
+  const int final_seq = (ctx_auto || split_clamp) ? std::min(want, fit) : want;
   const size_t kv_bytes = kv_per_token * static_cast<size_t>(final_seq);
   std::fprintf(stderr,
                "[ctx] requested=%d->%d kv_type=%s kv/token=%zu B (%.2f KiB) "
@@ -961,12 +1011,28 @@ void DenseRunner::derive_ctx_limit(int requested) {
                kv_per_token / 1024.0, n_kv_layers_, ir_.n_layer,
                kv_bytes / 1048576.0);
   const int rows_used = std::min(final_seq, row_cap);
-  std::fprintf(stderr,
-               "[ctx] budget: free=%.0f MiB - weights=%.0f MiB - act(rows=%d)=%.0f MiB "
-               "- reserve=%.0f MiB -> max_ctx=%d (%s)\n",
-               free_at_load / 1048576.0, weights / 1048576.0, rows_used,
-               act_bytes(rows_used) / 1048576.0, reserve / 1048576.0, fit,
-               ctx_auto ? "ctx_auto on" : "ctx_auto off");
+  size_t experts_used = 0;
+  if (budget_split) {
+    size_t kv_tmp = 0;
+    experts_used = split_experts_at(want, &kv_tmp);
+  }
+  if (budget_split) {
+    std::fprintf(stderr,
+                 "[ctx] split budget: free=%.0f MiB - fixed=%.0f MiB - gpu_experts=%.0f MiB "
+                 "- act(rows=%d)=%.0f MiB - reserve=%.0f MiB - ledger_gap=%.0f MiB -> "
+                 "max_ctx=%d (split MoE: KV competes with GPU-resident experts)\n",
+                 free_at_load / 1048576.0, weights / 1048576.0,
+                 experts_used / 1048576.0, rows_used,
+                 act_bytes(rows_used) / 1048576.0, reserve / 1048576.0,
+                 ledger_gap / 1048576.0, fit);
+  } else {
+    std::fprintf(stderr,
+                 "[ctx] budget: free=%.0f MiB - weights=%.0f MiB - act(rows=%d)=%.0f MiB "
+                 "- reserve=%.0f MiB -> max_ctx=%d (%s)\n",
+                 free_at_load / 1048576.0, weights / 1048576.0, rows_used,
+                 act_bytes(rows_used) / 1048576.0, reserve / 1048576.0, fit,
+                 ctx_auto ? "ctx_auto on" : "ctx_auto off");
+  }
   if (final_seq < requested) {
     std::fprintf(stderr,
                  "[ctx] CLAMPED: %d > max_ctx %d for kv_type=%s (would need %.0f MiB, "
@@ -988,6 +1054,15 @@ void DenseRunner::derive_ctx_limit(int requested) {
                    pt ? static_cast<int>(avail / pt) : 0);
       kv_type_ = save;
     }
+    if (budget_split) {
+      size_t kv_tmp = 0;
+      const size_t ex = split_experts_at(want, &kv_tmp);
+      std::fprintf(stderr,
+                   "[ctx] clamp reason: VRAM budget for a split MoE model - KV competes with "
+                   "~%.0f MiB of GPU-resident experts + %.0f MiB ledger gap; one load is "
+                   "enough (no reload chain)\n",
+                   ex / 1048576.0, ledger_gap / 1048576.0);
+    }
     if (cfg.get_bool("kv_offload"))
       std::fprintf(stderr,
                    "[ctx]   kv_offload=on: host-mapped KV is not implemented in this build; "
@@ -995,6 +1070,20 @@ void DenseRunner::derive_ctx_limit(int requested) {
   }
   max_seq_ = final_seq;
   kv_override_ctx_ = true;
+}
+
+int DenseRunner::n_moe_layers() const {
+  int n = 0;
+  for (const auto& ly : layers_)
+    if (ly.is_moe) ++n;
+  return n;
+}
+
+int DenseRunner::cpu_moe_layers() const {
+  int n = 0;
+  for (const auto& ly : layers_)
+    if (ly.is_moe && ly.cpu_begin >= 0) ++n;
+  return n;
 }
 
 void DenseRunner::alloc_kv_cache(LayerW& w) {
