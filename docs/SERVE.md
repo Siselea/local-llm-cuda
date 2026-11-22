@@ -444,6 +444,22 @@ restore=0.6 ms、save=0.6 ms；长上下文慢点定位见 `docs/reports/SERVE-P
   (requested R, clamped to M), over by X tokens; shorten the prompt, raise --ctx, or use a
   smaller kv_type`。
 
+### 5.10 响应编码保证：非流式 JSON 一定是合法 UTF-8（2026-11-22 修复）
+
+模型在 `max_tokens` 处被截断时可能把**多字节字符切半**（尤其 emoji、CJK 扩展 B 这类 byte-fallback
+token）。旧实现把不完整的 UTF-8 尾字节直接写进 `content`，`json::Writer` 又原样透传，导致
+`/completion`、`/v1/chat/completions` 的**非流式响应体不是合法 UTF-8**——严格客户端
+（`json.loads(raw_bytes)`、浏览器/JS SDK）会直接抛
+`'utf-8' codec can't decode bytes ... invalid continuation byte`；SSE 路径碰巧被浏览器容错掩盖。
+
+修复（`perf` 之外的协议正确性，v0.1.6 hotfix）：
+1. `generate()` 最终 force-flush 前丢弃不完整的 UTF-8 尾字节（被 token 预算截断的半个字符本就不存在）；
+2. `json::Writer::quote` 校验 UTF-8：合法序列原样透传，非法序列（孤立 continuation / 截断 /
+   overlong / surrogate）替换为 **U+FFFD**，保证任何响应都能被严格解析。
+回归：`tests/test_json_utf8.cpp`（7 类非法/合法序列）+ `tools/serve_edge_cases.py` 的 K1
+（非流式 max_tokens=1/2/3 严格 UTF-8 解码 + JSON 解析）；旧二进制 30 请求 10 个非法 → 修复后 0 个
+（`build/logs/utf8_repro.json`）。
+
 ### 5.9 MTP 的限制（`--mtp`）
 
 `--mtp` 的 verify 是 (k+1) 行 batch 前向，与单 token greedy decode 的数值路径不同：
