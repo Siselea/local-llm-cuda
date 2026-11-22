@@ -95,7 +95,7 @@ Q5_K 12288x4096  = q5k_dp4a_s
 | key | CLI | env | 类型 | 默认 | 说明 |
 |---|---|---|---|---|---|
 | `model` | `--model <v>` | `ENGINE_MODEL` | — | string | `""` | 模型路径：`.gguf` 文件或 safetensors 目录（自动识别，不依赖扩展名） |
-| `ctx` | `--ctx <v>` | `ENGINE_CTX` | int [1, 1M] | `256` | 上下文长度（决定 KV cache 大小）；不设置时生成入口按 prompt+n 自动估算 |
+| `ctx` | `--ctx <v>` | `ENGINE_CTX` | int [1, 1M] | `256` | 上下文长度 = **总序列预算**（prompt+生成，决定 KV cache 大小），**接受 1..1048576 任意正整数**；`0` = 自动按空闲显存推导。只有物理放不下时才夹紧（`ctx_auto` 预算 / 装载后实测 / KV OOM），并打印 requested→actual 账目；`/props` 有 `n_ctx_requested`/`actual_ctx`/`ctx_clamped`。详见 §3.3.2 |
 | `threads` | `--threads <v>` | `ENGINE_THREADS` | int [0,4096] | `0` | CPU 专家 GEMV 线程数，0 = 自动：能读到 SMT=2 拓扑时 = **2×物理核**（本机 6C/12T → 12，且默认 `win_affinity=2` 成对绑核），否则回退历史公式 `hardware_concurrency - max(2, hw/4)`（本机 9）。实测 12/11/10 成对比 9 不绑快 4–12%，见 `reports/THREAD-AFFINITY-REPORT.md` |
 | `gpu_layers` | `--gpu-layers <v>` | `ENGINE_GPU_LAYERS` | int [-1,4096] | `-1` | 放显存的 MoE 层数（层粒度，类似 llama.cpp `--n-gpu-layers`）；`auto`/`-1` = 自动推算；实际装载时还会按实测空闲显存自适应下调 |
 | `gpu_experts` | `--gpu-experts <v>` | `ENGINE_GPU_EXPERTS` | int [-1,1e5] | `-1` | 每层放显存的专家数（旧语义，固定切分；-1 = 自动/层粒度） |
@@ -187,6 +187,42 @@ run_attn_legacy / derive_ctx_limit / activation_bytes`（`src/runner.cpp`）；
   `n_tokens>8` 时 `nsplit=1`、每个 (token,head) 一个 block、softmax 在寄存器内完成（prefill）。
   `head_dim` 不是 32 的倍数或大于 256 时无法走分块内核：f32 回退历史内核，量化 KV 直接报错。
 
+
+### 3.3.2 任意上下文长度（requested vs actual，2026-11-22）
+
+`--ctx` **不是预设集合**：1、7、100、1000、12345、32768、131072…任意 1..1048576 的整数都合法
+（`0` = auto）。语义是**总序列预算**（prompt + 生成；不是“生成窗口”），所以：
+
+- prompt 占满 ctx 时请求返回 **400**：`prompt is too long: N tokens >= actual context C,
+  over by K tokens; shorten the prompt, raise --ctx, ...`（若请求值被夹紧，消息里同时给出
+  requested/actual）。
+- `ctx=1` 可以**加载**（`/props` 正常），但任何非空 prompt 都放不下 → 明确 400；
+  `ctx=2` 起可用（1-token prompt + 1-token 生成）。
+- 超过模型训练长度只提示 `ctx_train_exceeded=true`，不阻止（用户要自由输入，就给自由）。
+
+**夹紧只发生在物理放不下时，三层、全部可观测**：
+
+1. 装载前预算（`src/runner.cpp` 的 `derive_ctx_limit`）：打印
+   `[ctx] requested=...->... kv/token=...`、`[ctx] budget: free - weights - act - reserve -> max_ctx`，
+   被夹紧时打印 `[ctx] CLAMPED: requested > max_ctx ...`，并列出三种 kv_type 各自的最大 ctx。
+2. 装载后**实测**守卫（`src/serve.cpp`）：若 `free VRAM < vram_margin_mb`，用
+   “实测 free + 真实 KV bytes/token” 算出可行 ctx（`ctx_suggested`，含 256 MiB 安全余量），
+   `engine serve` **自动重试最多 4 次**并保留原始请求值；每次重试打印
+   `[ctx] measured clamp: requested X ...; retrying with --ctx Y`。
+3. KV 分配 OOM：按模型结构 + 实测 free 估算可行 ctx 后同样重试（rc=5）。
+
+启动日志与 `/props`：
+
+```
+[serve] ctx        : requested 262144 -> actual 75775 (CLAMPED: the requested KV cache does not physically fit; see [ctx] CLAMPED ledger)
+```
+```json
+"n_ctx": 75775, "n_ctx_requested": 262144, "requested_ctx": 262144,
+"actual_ctx": 75775, "ctx_clamped": true, "ctx_train_exceeded": true
+```
+
+launcher 的“上下文长度”是可编辑数字框（1..1048576）+ 对数滑块 + “自动”勾选；非法值红字提示并
+拒绝启动。实测矩阵与极端条件数据见 [docs/reports/CTX-AND-EXTREMES.md](reports/CTX-AND-EXTREMES.md)。
 
 ### 3.4 模型语义覆盖（默认从 IR/GGUF metadata 推导）
 
@@ -568,7 +604,8 @@ curl -s http://127.0.0.1:7030/completion -H "Content-Type: application/json" \
 ### 7.3 行为与限制
 
 - **串行**：同一时刻只跑一个请求；生成中客户端断开 → SSE 写失败 → 立即中止生成（不浪费 GPU）。
-- **上下文**：`--ctx` / `--serve-ctx` 是硬上限，prompt 超限返回 400。
+- **上下文**：`--ctx` / `--serve-ctx` 是硬上限（总序列预算），prompt 超限返回 400，消息里带
+  `over by N`，若请求值被物理夹紧还会带 `requested X, clamped to Y`；任意正整数 ctx 见 §3.3.2。
 - **多轮前缀缓存（默认开，`--prefix-cache=0` 可关）**：请求的对话历史与上一轮缓存前缀比较，
   命中就复用 KV cache（qwen35 混合层还会恢复 SSM conv/rec 状态快照），只 prefill 新增 token。
   快照点对齐 `prefill_rows`（serve 默认 128）边界，缓存路径与整段 prefill 的 chunk 序列完全一致，

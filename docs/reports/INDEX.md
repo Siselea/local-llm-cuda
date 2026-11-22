@@ -8,6 +8,7 @@
 
 | 文件 | 标题 | 一句话说明 |
 | --- | --- | --- |
+| [CTX-AND-EXTREMES.md](CTX-AND-EXTREMES.md) | 任意上下文长度 + 极端情况矩阵（CTX-AND-EXTREMES） | `--ctx` 任意正整数、只在物理放不下时夹紧、requested/actual 可观测；极小/极大 ctx、极短/极长 prompt、显存紧张、30 轮长会话、空输入的实测矩阵与问题清单。 |
 | [CPU-GEMV-BW-REPORT.md](CPU-GEMV-BW-REPORT.md) | CPU 量化 GEMV 带宽优化 — 交付报告 | CPU 量化 GEMV 的带宽/DRAM 天花板测量与优化（cpu_matvec 行内核）。 |
 | [CPU-OCCUPANCY-REPORT.md](CPU-OCCUPANCY-REPORT.md) | decode 期间 CPU 占用实测报告（CPU-OCCUPANCY） | decode 期间 CPU 占用实测：为何用户看到 CPU 不忙、如何让专家层吃满 CPU。 |
 | [CPU-REPACK-REPORT.md](CPU-REPACK-REPORT.md) | CPU 专家路径「权重 repack / 带宽」方向 — 取证与结论报告 | CPU 专家路径「权重 repack / 带宽」取证与结论（含两级 int8）。 |
