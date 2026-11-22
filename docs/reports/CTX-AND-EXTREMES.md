@@ -293,12 +293,19 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
   1. 启动时初始 `4096` 的 EN_CHANGE 在 `g_ctx_edit` 赋值前触发 → 初始就红字“非法”且不再自动恢复；
   2. **中文 IME 下数字框收不到键入**（IME 组合吞掉 WM_CHAR，ES_NUMBER 只有粘贴能用）；
      修复：数字 EDIT 解除 IMM 绑定 + WM_KEYDOWN 数字/退格/删除子类化直接改文本，任何 IME 下可用。
-- `tests/test_launcher.py` 已更新覆盖任意值/非法提示/自动勾选/滑块映射，`py_compile` 通过；
-  **完整 19 步 GUI 验收在本环境会挂起 >10 min**（旧 harness 会真的启动 0.5B/35B、35B load≈60 s，
-  且与发布门禁争 GPU），本轮按 lead 分工把 GPU 让给 v0.1.6 门禁，**完整 GUI 验收标 TODO**；
-  已交付：UI 截图 4 张（上）、launcher `--ctx` 任意值路径（截图 11/12/13）、测试用例代码。
-- 另一个已知环境限制：launcher 测试的 `start/stop` 段依赖桌面焦点/HTTP 轮询，在本 VM 多次挂起
-  （非 ctx 代码路径；上一轮完整 76/76 验收是 2026-11-15 环境）。
+- `tests/test_launcher.py` 已更新覆盖任意值/非法提示/自动勾选/滑块映射，`py_compile` 通过。
+- **额外真实 GUI 证据（本轮新拍）**：launcher 以 `--ctx 12345` 启动并选中 0.5B 后，界面完整显示
+  “上下文长度 **12345** · 手动 12345 tokens · KV 显存 ≈ 289 MB（每 token 24.0 KB）· 权重+KV+工作区
+  ≈ 1.48 GB / 9.06 GB · 可输入任意整数（1..1048576）”，底部 args 摘要为
+  `ctx 12345`（截图 `build/launcher-20-gui-ctx12345.png`、`build/launcher-21-gui-05b-selected.png`）。
+- **完整 19 步 GUI 验收（含 UI 点击启动/停止 0.5B）本轮未完成 → TODO**：旧 harness 在本环境
+  （1) 它的 ctx 合成输入走 `WM_CHAR`/跨进程 `WM_SETTEXT`，会让 launcher 的 ctx 输入框停在“非法”
+  状态；2) 随后点“启动引擎”触发 launcher 自己的 modal “启动失败”/“引擎已在运行” MessageBox，
+  `SendMessage(WM_COMMAND)` 被模态循环阻塞 → 测试挂起 >10 min）。这是 **测试 harness 与跨进程
+  合成输入的兼容问题，不是 ctx 功能回归**（截图 11/12/13/20/21 + `/props` 已验 UI/参数路径）。
+  2026-11-15 的完整 76/76 验收是当时环境；下次在有交互式桌面的环境里重跑即可。
+- 改进项：`tests/test_launcher.py` 的 ctx 段应改用真实键盘输入（SendInput）或 `--ctx` 启动参数，
+  避免跨进程 EDIT 合成输入；launcher 的“非法输入拒绝启动”可考虑非模态状态栏提示，利于自动化。
 
 ---
 
