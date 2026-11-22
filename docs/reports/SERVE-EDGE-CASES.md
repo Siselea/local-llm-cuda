@@ -133,3 +133,22 @@ s=socket.create_connection(("127.0.0.1",PORT)); s.sendall(b"POST /v1/chat/comple
 - bug #1/#2/#4/#5 + prewarm 跳过问题已修（本文档"修复"节），动态用例与定向验收 PASS。
 - bug #3 撤销：坏请求本来就走 400，已有测试覆盖（A1–A5），无需改代码。
 - 遗留（非本轮）：单线程 HTTP 的排队问题（线程池 v0.2）；MTP 需独立 SSM slot 才能与 prefix cache 共存。
+
+
+## 发布闸门验证（2026-11-22 17:33–17:46，干净 worktree @ `53396ef`）
+
+| 项 | 结果 |
+|---|---|
+| `build.sh`（干净 worktree） | OK |
+| `verify.sh` | **ALL GREEN** |
+| `smoke_models.sh` | **PASS**（40716/185/2614/2614） |
+| `gen_regression.sh` | **10/10 GREEN**（含 coder_v2_lite=185；`dd96fa8` 修复后复验） |
+| `verify_generality.sh` | **26/26 GREEN** |
+| `verify_serve.sh` | 0.5B 22/22 + 9B 21/21 **GREEN** |
+| `test_sampler.exe` | **PASS** |
+| `tools/check_clean_build.sh --quick`（HEAD `8d1f1b1`） | **build OK / CLEAN BUILD GATE GREEN** |
+
+过程发现并修复的两个"commit 不自洽"问题（已单独 commit）：
+`3ca98ad` 的 `serve::run(Options&)` 定义与 `serve.h` 声明不一致（clean checkout 链接失败）→ `47555d2` 修复；
+`gen_regression` 9/10 的一次假失败 = 主树 `generalize` 未提交 Wemma4 WIP 的加载污染（clean HEAD 10/10），
+不是已提交 commit 的回归（真回归是 `d9bb37c` 的 MLA `upload_norm` → `dd96fa8` 已修并复验）。
