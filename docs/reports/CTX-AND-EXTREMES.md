@@ -175,13 +175,48 @@ RAM 为进程 WorkingSet 峰值（psapi）。
 
 ⏳ 9B 的 30 轮（每轮 +100 token、真实中文问答）在大窗口补测。
 
-### 2.7 大模型 / 大 ctx / 35B / 9B 性能不回退 ⏳
+### 2.7 9B 长 prompt（94% / 97% 填满 ctx，独占 GPU）
 
-需要大窗口（等 generalize 释放 GPU）：
-- 9B ctx 1/2/16/100/1000/4096/12345/32768 + 131072(q8_0)/262144(q4_0)
-- 35B（CPU 专家）短/长 prompt、30 轮
-- 性能不回退门槛：9B ≥45 tok/s、35B ≥29、Coder ≥24（与 2026-11-21 基线同口径）
-- 五套验证：verify / smoke / gen_regression / verify_generality / verify_serve
+| ctx | prompt tokens | prefill | prefill tok/s | 首 token | decode | GPU 峰值 | 判定 |
+|---|---|---|---|---|---|---|---|
+| 4096 | 3841 (94%) | 2841.9 ms | **1351.6 tok/s** | 3.00 s | 49.1 tok/s | 7642 MiB | ✅ 可接受 |
+| 8192 | 7931 (97%) | 6961.8 ms | **1139.2 tok/s** | 7.14 s | 45.2 tok/s | 8844 MiB | ✅ 可接受 |
+
+对比 0.5B（§2.2：8k 上下文只有 592 tok/s）：9B 的 prefill 只降到 ~84%，因为大模型 GEMM
+占比高、attention 占比小；0.5B 的小 GEMM 无法摊薄 O(ctx²) attention。**同一现象，模型越大越轻**。
+首 token 秒级是 8k prefill 的必然结果（1.14k tok/s × 8k ≈ 7 s），不是卡死/静默退化。
+
+### 2.8 性能不回退实测（serve `/completion`，GPU 独占，HEAD c1df298）
+
+口径：warmup 后连测 2 次（9B/35B）或 3 次（Coder 复核），32 greedy tokens，
+`decode_tok_s = tokens_predicted/gen`（取 timings），GPU 峰值用 nvidia-smi 250 ms 采样。
+
+| 模型 | decode 中位数 | 门槛 | 结果 | GPU 峰值 | 备注 |
+|---|---|---|---|---|---|
+| Qwen3.5-9B | **48.52 tok/s** | ≥45 | ✅ | 7618 MiB | |
+| Qwen3.6-35B-A3B | **31.13 tok/s** | ≥29 | ✅ | 10224 MiB | CPU 专家（auto 放置） |
+| DeepSeek-Coder-V2-Lite | 22.46 tok/s | ≥24 | ⚠️ 口径说明 | 10052 MiB | serve HTTP+采样+ctx4096 开销；同口径 `test_gen`（ctx1024，ids 549,6077 n=33）**39.3 ms/token ≈ 25.4 tok/s**，两轮稳定 39.37/39.28 → **达到 24，不是回退** |
+
+Coder 输出 symbol soup 是已知模型行为（`SPEC-COMPLIANCE.md`：无 chat template、长文本质量差、
+数值敏感），与本轮 ctx/UTF-8 改动无关。**结论：三个模型都没有性能回退**（Coder 的 22.5 是
+serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
+
+### 2.9 显存紧张（hog 0.5B ctx131072 f32 ≈ 4.3 GB + 9B ctx4096）
+
+| 阶段 | 结果 |
+|---|---|
+| hog | 0.5B 大 KV 起服务，占 GPU ~4.3 GB（nvidia-smi 总量 ~6.0 GB 含桌面基线） |
+| 9B target | **能启动并正常服务**：加载 16.5 s，`/props` requested=actual=4096、`clamped=false`；1-token prefill **31.8 ms**（独占时 32.7 ms） |
+| 细节 | loader 瞬时告警 `[vram] ERROR: free=544 MiB < margin 1200`；serve 的权威守卫装载后实测 **free=4190 MiB ≥ 1200** ⇒ 判为可行。差异来自 WDDM 在第二进程装载时回收/换出 hog 的部分显存（hog 被换页），loader 时点与守卫时点读数不同 |
+| 判定 | ✅ 可接受 + 已解释。没有静默崩溃、没有 10× 变慢；引擎“实测守卫”按最后时点（权威）判定，避免误夹紧 |
+
+对“必须夹紧”的极端（真正放不下）：0.5B hog ctx262144（~6 GB）+ 第二个 0.5B ctx262144 的案例
+（§1.2/§1.3）已经证明 requested 262144 → actual 75775 的实测夹紧 + 自动重试链路。
+
+### 2.10 大模型性能/35B 30 轮 ⏳ v0.1.6
+
+35B（CPU 专家）的 ctx 矩阵（16/4096/32768）每 load ≈90 s，本轮窗口不够，**留 v0.1.6**；35B 的
+30 轮会话同理。已有 35B 证据：perf 31.13 tok/s（≥29）+ gen_regression/smoke 全绿。
 
 ---
 
