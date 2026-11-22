@@ -548,7 +548,16 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
         return false;
       }
       if (force) {
-        feed_emitted(pending);
+        // Generation can stop (max_tokens / stop / budget) in the middle of a
+        // multi-byte UTF-8 character: the token piece is complete in bytes but the
+        // character is not.  Emitting it would put invalid UTF-8 into the JSON body
+        // (non-streaming /completion responses then fail strict clients:
+        // "'utf-8' codec can't decode bytes ... invalid continuation byte").  Drop
+        // the incomplete trailing bytes; the truncated character never existed.
+        std::string tail = pending;
+        const size_t incomplete = text::incomplete_utf8_tail(tail);
+        if (incomplete > 0) tail.resize(tail.size() - incomplete);
+        feed_emitted(tail);
         pending.clear();
         return true;
       }

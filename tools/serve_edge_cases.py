@@ -55,6 +55,19 @@ def http(port, method, path, body=None, timeout=300, raw_body=None):
         return {"status": None, "secs": round(time.time() - t0, 3), "error": repr(e)}
 
 
+def http_bytes(port, path, body, timeout=300):
+    """POST and return the raw response bytes (strict UTF-8 / JSON validity checks)."""
+    url = BASE.format(port=port) + path
+    data = json.dumps(body, ensure_ascii=False).encode()
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
 def _try_json(s):
     try:
         return json.loads(s)
@@ -342,6 +355,36 @@ def main() -> int:
         check(results, "J1 seeded sampling reproduces with cache on/off",
               a["status"] == 200 and b["status"] == 200 and ida == idb,
               f"cache_ids={ida} plain_ids={idb} plain_new={tb.get('prefilled_tokens')}")
+
+        # ---------------- K. non-stream JSON must be valid UTF-8 ----------------
+        # Generation can stop in the middle of a multi-byte character (max_tokens).
+        # The JSON body must still be valid UTF-8 / parseable by strict clients.
+        cut_ok = True
+        cut_detail = []
+        for mt in (1, 2, 3):
+            st_code, raw = http_bytes(port, "/completion",
+                                      {"prompt": "请用一句完整的中文介绍杭州，并说明它为什么值得一去。",
+                                       "max_tokens": mt, "temperature": 0})
+            try:
+                text = raw.decode("utf-8")  # strict
+                json.loads(text)
+                cut_detail.append(f"mt={mt}: valid utf8+json ({len(raw)}B)")
+            except Exception as e:
+                cut_ok = False
+                cut_detail.append(f"mt={mt}: INVALID ({e}) bytes={raw[-40:]!r}")
+            st2, raw2 = http_bytes(port, "/v1/chat/completions",
+                                   {"messages": [{"role": "user",
+                                                  "content": "请用一句完整的中文介绍杭州。"}],
+                                    "max_tokens": mt, "temperature": 0,
+                                    "chat_template_kwargs": {"enable_thinking": False}})
+            try:
+                raw2.decode("utf-8")
+                json.loads(raw2)
+            except Exception as e:
+                cut_ok = False
+                cut_detail.append(f"chat mt={mt}: INVALID ({e})")
+        check(results, "K1 non-stream JSON valid UTF-8 for mid-character cuts",
+              cut_ok, "; ".join(cut_detail))
 
         # ---------------- Wipe/done ----------------
         summary = {"passed": sum(1 for x in results if x["ok"]),

@@ -120,6 +120,12 @@ else
     fail "test_sampler"
     tail -5 sampler_gate.log >&2
   fi
+  if [ -x build/test_json_utf8.exe ] && ! ./build/test_json_utf8.exe > json_utf8_gate.log 2>&1; then
+    fail "test_json_utf8 (JSON writer must sanitise invalid UTF-8)"
+    tail -5 json_utf8_gate.log >&2
+  else
+    echo "[gate]   json writer UTF-8 sanitisation GREEN"
+  fi
 fi
 
 echo

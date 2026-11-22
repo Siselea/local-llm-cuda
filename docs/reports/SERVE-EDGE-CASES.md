@@ -152,3 +152,23 @@ s=socket.create_connection(("127.0.0.1",PORT)); s.sendall(b"POST /v1/chat/comple
 `3ca98ad` 的 `serve::run(Options&)` 定义与 `serve.h` 声明不一致（clean checkout 链接失败）→ `47555d2` 修复；
 `gen_regression` 9/10 的一次假失败 = 主树 `generalize` 未提交 Wemma4 WIP 的加载污染（clean HEAD 10/10），
 不是已提交 commit 的回归（真回归是 `d9bb37c` 的 MLA `upload_norm` → `dd96fa8` 已修并复验）。
+
+
+## 追加发现（2026-11-22 18:0x，feature-polish 探针命中）：非流式 JSON 含非法 UTF-8
+
+**场景**：9B 贪心生成在 `max_tokens` 处把多字节字符（emoji/CJK 扩展 B 的 byte-fallback token）切半，
+`generate()` 的 force-flush 把不完整 UTF-8 字节直接写进 `out.content`，`json::Writer` 又原样透传
+⇒ `/completion`、`/v1/chat/completions` 非流式响应体不是合法 UTF-8，严格客户端（`json.loads(raw_bytes)`、
+浏览器/JS SDK）报 `'utf-8' codec can't decode bytes ... invalid continuation byte`；SSE 路径浏览器容错。
+
+**复现**（9B，旧二进制 vs 修复后；`build/logs/utf8_repro.json`）：prompt 含 `𠀀`/emoji/罕见字，
+`max_tokens=1..6`，30 个请求中旧二进制 **10 个响应严格 UTF-8 解码失败**（例：`byte 0xf0 ... invalid`、
+`generated_token_ids` 尾部仍有完整 id，说明是文字截断不是写坏），修复后 **0/30**。
+
+**修复**（两层，均已提交）：
+1. `serve.cpp`：force-flush 前用 `text::incomplete_utf8_tail` 丢弃不完整尾字节（被 max_tokens 截断的半个字符
+   本来就不存在）；
+2. `include/engine/json.h`：`Writer::quote` 做 UTF-8 校验，非法序列替换为 **U+FFFD**（overlong/surrogate/
+   截断都覆盖；合法序列原样透传），保证任何响应在严格客户端都可解析。
+回归测试：`tests/test_json_utf8.cpp`（7 类非法/合法序列，build.sh 构建，`tools/check_clean_build.sh` 执行）；
+`tools/serve_edge_cases.py` 新增 **K1**（0.5B/9B 26/26 PASS，非流式 JSON 严格解码+解析）。
