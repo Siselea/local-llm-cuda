@@ -41,7 +41,8 @@ struct Options {
 //       opts.ctx_suggested holds a feasible value and the caller may retry
 //   5 = model load failed while a positive ctx was requested (possible OOM from the
 //       requested ctx; the caller may retry with a smaller ctx)
-int run(Options opts);
+// The options are taken by reference (in/out) because run() writes ctx_suggested back.
+int run(Options& opts);
 
 }  // namespace serve
 }  // namespace engine
