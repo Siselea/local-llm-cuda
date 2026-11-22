@@ -310,6 +310,44 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
 **结论**：极端长 ctx + 大模型（最坏情况）的启动时间 258 s → 66.7 s，且第一次就给出诚实账目；
 普通用例（0.5B/9B/Coder）零额外开销、verbatim 行为不变。
 
+### 2.16 35B 自动放置失败复盘（`cuMemAlloc failed`，用户默认路径）
+
+**症状**（launcher 默认打开 35B：自动层数 + `--vram-auto-layers=1` + layer graphs + dev-route）：
+装载时 `gpu_moe_layers=13 → adaptive 13→9`、ledger gap 异常大（6035 MiB）、`free=0`、
+最终 `cuMemAlloc failed`；或 serve 守卫失败后用“可行 ctx=1”重载 20 GiB 模型再次失败。
+
+**复现（当前 HEAD 二进制，launcher 等价参数）**：
+```
+[vram] post-load used=9378 MiB free=2910 MiB (gpu_moe_layers=13)   # 装载完还 OK
+[placement] auto-vram: promoted blk.13 (498 MiB)  free 2910 -> 2289
+[placement] auto-vram: promoted blk.14 (432 MiB)  free 2289 -> 1777
+[ctx] prefill chunk 512 -> 32 rows ... (free=660 after weights+KV)
+[serve] ERROR: only 644 MiB VRAM free after load, below 1200 MiB margin
+[ctx] measured clamp: requested 4096 ... retrying with --ctx 1   # → 重载 20 GiB → cuMemAlloc
+```
+
+**根因（三个叠加）**：
+1. **账本外的 CUDA graph 池 + 时序**：decode/layer 图池在 35B 上约 **1.1 GiB**，且是在
+   `apply_auto_vram_layers()` **之后**才捕获的——自动加层先花掉 margin，图池再吃 1.1 GiB，
+   serve 的 `--vram-margin` 守卫必然失败。ledger gap 突增（1211 → 6035 MiB）就是图池/驱动内存。
+2. **自动加层的预留只看 900 MiB hard floor**（`vram_margin_floor_bytes_`），小于 serve 的
+   `--vram-margin` 1200 MiB，所以它能合法地造出 serve 守卫会拒绝的状态。
+3. **无望的 ctx 建议仍触发重载**：短缺超过整个 KV 时 suggested 退化为 `1`，重试等于把 20 GiB
+   模型再装一遍（还可能 cuMemAlloc）。
+
+**修复（commit `8a9a7c8`）**：
+- 把 **graph 捕获移到 `check_post_load_vram()` / `apply_auto_vram_layers()` 之前**，放置/守卫
+  看到包含图池的真实 free VRAM；
+- 自动加层条件改为 `need + max(margin, floor) + vram_extra_reserve_mb`，并对被提升层清掉旧
+  CPU 路径 graph（避免重放旧 expert 路径）；
+- serve 守卫：唯一可行 ctx < 请求的 1/8 时**不重试**，直接 rc=1 并提示
+  `lower --gpu-layers / disable --vram-auto-layers / raise --vram-margin`。
+
+**验证（launcher 等价参数，干净窗口）**：35B auto `--ctx 4096` 启动 **66.3 s**、`listening`、
+无重试（gpu_moe_layers 10→12，post-load free 2092 MiB）；`--gpu-layers` 显式路径与
+9B/Coder/0.5B auto 放置行为不变（见 §2.14 不变性验证）。**教训**：任何“账本外”的 CUDA
+分配（图池、cuBLAS workspace）必须先于自动放置发生，否则 margin 契约会被静默破坏。
+
 ### 2.15 35B 30 轮会话 ⏳ v0.1.6
 
 35B 在 CPU 专家模式下每轮 decode 受 CPU 专家带宽限制（perf 31.13 tok/s），30 轮会话预计
