@@ -1,8 +1,10 @@
 # ARCH-GENERALITY: metadata-driven architecture support
 
-Status: 2026-11-22. Owner: generalize. Related commits: `8099b6c`, `d9bb37c`
-(plus a follow-up commit that flips `arch_ext` to default `off` until gemma4
-numerical parity is complete).
+Status: 2026-11-22. Owner: generalize. Commits: `8099b6c` (generic substrate),
+`d9bb37c` (extended dense path + gemma4), `dd96fa8` (legacy-path regression fix +
+`arch_ext` default off), `5014cc6` (this report).  Verification on an isolated
+worktree build of main+fixes: `tools/smoke_models.sh` 4/4 green and
+`tools/gen_regression.sh` **10/10 PASS** (incl. coder_v2_lite 185).
 
 ## 1. Why this work exists
 
@@ -61,6 +63,18 @@ Two things are deliberately separated:
 coder case as FAIL in one run while the shared tree was being rebuilt by
 multiple agents; treat that as environment noise until re-run on an idle tree.
 
+### Regression fix (found by an independent full-suite run)
+
+`d9bb37c` briefly regressed MLA first-token output (DeepSeek-Coder-V2-Lite:
+expected 185, got 75723).  Root cause was not the MLA code path (the hard rails
+kept it on its own loader), but the final-norm upload: the generic work replaced
+`upload_norm()` with a plain upload for every model, bypassing upload_norm's
+`deepseek2` zero-centering convention.  `dd96fa8` restores `upload_norm()` for
+all legacy paths (the plain upload now only serves the explicit
+`arch_norm_mode=plus1` override) and also stops the IR from rewriting the
+stack-wide key/value lengths unless the GGUF really carries per-layer geometry.
+Verified after the fix: smoke 4/4, gen_regression 10/10.
+
 ### gemma4-12b parity detail
 
 The real checkpoint now loads through the generic path and produces plausible
@@ -79,6 +93,16 @@ tokens, but is **not numerically aligned** with llama.cpp yet:
   k_eq_v = weightless RMSNorm(raw K projection), sandwich norms after the
   projections, final layer scalar, attention scale 1.0, repeat_interleave GQA
   (h/rep) mapping, `window` = attend current + previous `window-1`.
+- Additional evidence that the remaining gap is *quantized-backend numerics*,
+  not layer semantics: (a) llama.cpp itself disagrees between CPU and GPU on the
+  real checkpoint (top-2 log-prob gap -0.63 on CPU vs -0.34 on GPU; final hidden
+  norm 220.2 vs 213.6), while the engine lands between them; (b) on a truncated
+  8-layer copy of the real checkpoint our f32 reference deviates from llama.cpp
+  CPU by relL2 7.6e-2 already after 8 layers (F32 tiny model: 6.7e-5), which is
+  the expected footprint of llama.cpp's runtime activation quantization
+  accumulating with depth.  Exact greedy parity with llama.cpp on a Q4_K
+  checkpoint is therefore backend-numerics-bound at near-ties (top-2 separation
+  ~0.3 logit), not a missing architecture rule.
 - Therefore the layer *math* is right; the real-checkpoint difference is in
   something only the real file has.  Ruled out so far: architecture-name
   heuristics, activation, embedding scale, sandwich/scalar placement, V
