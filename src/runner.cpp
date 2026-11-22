@@ -136,6 +136,71 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   vocab_ = static_cast<int>(ir_.vocab);
   rope_base_ = static_cast<float>(ir_.attn.rope_freq_base);
   if (inter_ <= 0) inter_ = hidden_ * 4;
+
+  // ---- generic architecture blocks (metadata/tensor driven) ----------------
+  // The IR derives per-layer geometry + optional ops from metadata structure;
+  // these switches only let the user veto/override them.  The architecture name
+  // is never consulted.
+  {
+    const std::string ext_cfg = cfg.get_string("arch_ext");
+    // Hard safety rails: the generic path replaces the whole dense loader/forward,
+    // so it must never take over architectures with dedicated, verified paths
+    // (hybrid SSM, MLA, MoE).  Those keep the legacy code unconditionally.
+    const bool ext_arch_ok = ir_.ssm.variant == "none" && ir_.attn.variant != "mla" &&
+                             ir_.moe.n_expert == 0;
+    ext_enabled_ = ir_.caps.extended && ext_arch_ok && ext_cfg != "off";
+    if (ir_.caps.extended && !ext_arch_ok)
+      std::fprintf(stderr,
+                   "[arch] metadata has extended features but this model uses a dedicated "
+                   "path (ssm=%s mla=%d moe=%d); keeping the legacy path\n",
+                   ir_.ssm.variant.c_str(), (int)(ir_.attn.variant == "mla"),
+                   ir_.moe.n_expert);
+    if (ext_cfg == "on" && !ir_.caps.extended)
+      std::fprintf(stderr,
+                   "[arch] arch_ext=on but the metadata needs no extended path; "
+                   "keeping the legacy dense path\n");
+    ext_gelu_ = ir_.caps.gelu_mlp;
+    const std::string act = cfg.get_string("arch_act");
+    if (act == "gelu") ext_gelu_ = true;
+    else if (act == "silu") ext_gelu_ = false;
+    ext_embed_scale_ = ir_.caps.embed_scale;
+    const std::string es = cfg.get_string("arch_embed_scale");
+    if (es == "none") ext_embed_scale_ = 1.0;
+    else if (es == "sqrt") ext_embed_scale_ = std::sqrt(static_cast<double>(hidden_));
+    ext_attn_scale_ = ir_.caps.attn_scale > 0.0 ? ir_.caps.attn_scale : -1.0;
+    const std::string as = cfg.get_string("arch_attn_scale");
+    if (as == "1.0") ext_attn_scale_ = 1.0;
+    else if (as == "rsqrt") ext_attn_scale_ = -1.0;
+    ext_logit_softcap_ = ir_.caps.logit_softcap;
+    const std::string sc = cfg.get_string("arch_softcap");
+    if (sc == "off") ext_logit_softcap_ = 0.0;
+    const std::string nm = cfg.get_string("arch_norm_mode");
+    ext_norm_plus1_ = nm == "plus1" ? 1 : (nm == "direct" ? 0 : -1);
+    if (ext_enabled_) {
+      use_graph_ = false;          // per-layer geometry: keep the plain launch path
+      prefill_graph_ = false;
+      no_graph_cfg_ = true;
+      if (kv_type_ != 0) {
+        std::fprintf(stderr, "[kv] extended attention path keeps f32 KV (kv_type %d -> 0)\n",
+                     kv_type_);
+        kv_type_ = 0;
+      }
+      std::fprintf(stderr,
+                   "[arch] extended path: per_layer=%d qk_norm=%d v_norm=%d sandwich=%d "
+                   "layer_scalar=%d gelu=%d embed_scale=%.3f attn_scale=%.3f softcap=%.1f "
+                   "k_eq_v_layers=%d\n",
+                   (int)ir_.caps.per_layer_attn, (int)ir_.caps.qk_norm, (int)ir_.caps.v_norm,
+                   (int)ir_.caps.sandwich_norm, (int)ir_.caps.layer_scalar,
+                   (int)ext_gelu_, ext_embed_scale_,
+                   ext_attn_scale_ > 0 ? ext_attn_scale_ : -1.0, ext_logit_softcap_,
+                   [&] {
+                     int n = 0;
+                     for (int i = 0; i < ir_.n_layer; ++i)
+                       if (!ir_.layers[i].attn.has_v) ++n;
+                     return n;
+                   }());
+    }
+  }
   // ---- KV quantization + adaptive context length ---------------------------
   // Must run before any layer allocates its cache: it may clamp max_seq_ to what
   // the VRAM budget can actually hold and picks the activation row cap used by
@@ -285,7 +350,8 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
                     kernels::kTopkFinal + kernels::kKvQuantCommon + kernels::kKvWriteQ +
                     kernels::kAttnTiled + kernels::kAttnCombine + kernels::kDequantF16 +
                     kernels::kAttnTiledPre + kernels::kAttnTiledPreGqa + kernels::kGdDelta128Smem +
-                    kernels::kGdDelta128Reg + kernels::kF16ToF32;
+                    kernels::kGdDelta128Reg + kernels::kF16ToF32 + kernels::kGeluMul +
+                    kernels::kScaleInplace + kernels::kSoftcapInplace + kernels::kAttnCfg;
   mod_ = std::make_unique<cuda::Module>(cuda::compile_ptx(src, "runner.cu"));
   k_rms_ = mod_->kernel("rmsnorm");
   k_rms4_ = mod_->kernel("rmsnorm4");
@@ -298,6 +364,10 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   k_add_ = mod_->kernel("add_inplace");
   k_add3_ = mod_->kernel("add_three_inplace");
   k_bias_ = mod_->kernel("add_bias");
+  k_gelumul_ = mod_->kernel("gelu_mul");
+  k_scale_ = mod_->kernel("scale_inplace");
+  k_softcap_ = mod_->kernel("softcap_inplace");
+  k_attncfg_ = mod_->kernel("attn_cached_cfg");
   k_gather_ = mod_->kernel("gather_rows");
   k_scatter_ = mod_->kernel("scatter_add_weighted");
   k_ropestrided_ = mod_->kernel("rope_strided");
@@ -1222,6 +1292,267 @@ std::vector<float> DenseRunner::tensor_f32(const std::string& name) const {
   return out;
 }
 
+// ===========================================================================
+// Generic extended dense path (metadata-driven architectures)
+// ===========================================================================
+// One "extended" layer is built from optional tensor blocks, each enabled by the
+// presence of its tensors in the GGUF:
+//   attn_norm / ffn_norm                  pre-norms
+//   attn_q / attn_k / attn_v / attn_output projections (v optional -> k_eq_v)
+//   attn_q_norm / attn_k_norm             per-head QK RMSNorm
+//   post_attention_norm / post_ffw_norm   sandwich (output) norms
+//   layer_output_scale                    per-layer output scalar
+//   ffn_gate / ffn_up / ffn_down          MLP (GELU-tanh or SiLU)
+// and per-layer geometry comes from ir::LayerAttn (head counts / head dims /
+// rope dim+base / sliding window), which the IR derives from metadata arrays.
+
+void DenseRunner::load_ext_layer(int i, LayerW& w) {
+  auto gg = std::static_pointer_cast<gguf::Model>(gguf_);
+  auto find_t = [&](const std::string& name) -> const gguf::TensorInfo* {
+    for (const auto& t : gg->tensors)
+      if (t.name == name) return &t;
+    return nullptr;
+  };
+  const std::string p = "blk." + std::to_string(i) + ".";
+  w.ext = true;
+  w.ext_attn = ir_.layers[i].attn;
+  const auto& la = w.ext_attn;
+  w.q_dim = n_head_ * la.key_dim;
+  w.kv_dim = la.n_kv * la.key_dim;
+
+  auto norm_w = [&](const std::string& name) {
+    std::vector<float> v = tensor_f32(name);
+    if (ext_norm_plus1_ > 0)
+      for (float& x : v) x += 1.0f;
+    return upload(v);
+  };
+  w.ln1 = norm_w(p + "attn_norm.weight");
+  w.ln2 = norm_w(p + "ffn_norm.weight");
+  if (la.sandwich) {
+    w.post_attn_norm = norm_w(p + "post_attention_norm.weight");
+    w.post_ffw_norm = norm_w(p + "post_ffw_norm.weight");
+  }
+  if (la.layer_scalar) {
+    std::vector<float> sv = tensor_f32(p + "layer_output_scale.weight");
+    if (!sv.empty()) w.layer_scalar = static_cast<double>(sv[0]);
+  }
+  if (la.qk_norm) {
+    w.q_norm_w = upload(tensor_f32(p + "attn_q_norm.weight"));
+    w.k_norm_w = upload(tensor_f32(p + "attn_k_norm.weight"));
+  }
+  if (la.v_norm || !la.has_v) {
+    std::vector<float> ones(static_cast<size_t>(la.value_dim), 1.0f);
+    w.ones_head = upload(ones);
+  }
+
+  // attention projections: prefer the quantized-resident path (decode bandwidth)
+  const bool qq = load_qtensor(p + "attn_q.weight", w.qq);
+  const bool qk = load_qtensor(p + "attn_k.weight", w.qk);
+  const bool qo = load_qtensor(p + "attn_output.weight", w.qo);
+  const bool qv = la.has_v ? load_qtensor(p + "attn_v.weight", w.qv) : true;
+  w.is_quant = qq && qk && qo && qv;
+  if (!w.is_quant) {
+    w.qq = QTensor(); w.qk = QTensor(); w.qo = QTensor(); w.qv = QTensor();
+    w.q = upload(tensor_f32(p + "attn_q.weight"));
+    w.k = upload(tensor_f32(p + "attn_k.weight"));
+    if (la.has_v) w.v = upload(tensor_f32(p + "attn_v.weight"));
+    w.o = upload(tensor_f32(p + "attn_output.weight"));
+  }
+  const bool fg = load_qtensor(p + "ffn_gate.weight", w.qg);
+  const bool fu = load_qtensor(p + "ffn_up.weight", w.qu);
+  const bool fd = load_qtensor(p + "ffn_down.weight", w.qd);
+  if (!(fg && fu && fd)) {
+    w.qg = QTensor(); w.qu = QTensor(); w.qd = QTensor();
+    w.gate = upload(tensor_f32(p + "ffn_gate.weight"));
+    w.up = upload(tensor_f32(p + "ffn_up.weight"));
+    w.down = upload(tensor_f32(p + "ffn_down.weight"));
+  }
+
+  // per-layer rotary frequencies (same convention as the rope kernels:
+  // angle = position * freqs[i], freqs[i] = base^(-2i/rope_dim))
+  const int nr = la.rope_dim > 0 ? la.rope_dim : la.key_dim;
+  std::vector<float> fr(static_cast<size_t>(nr / 2));
+  for (int k = 0; k < nr / 2; ++k)
+    fr[static_cast<size_t>(k)] =
+        static_cast<float>(std::pow(la.rope_base, -2.0 * static_cast<double>(k) / nr));
+  w.rope_freqs = cuda::Buffer(fr.size() * 4);
+  w.rope_freqs.upload(fr.data(), fr.size() * 4);
+
+  // per-layer KV cache, [n_kv][max_seq][head_dim]
+  const size_t kc_n = static_cast<size_t>(la.n_kv) * max_seq_ *
+                      static_cast<size_t>(la.key_dim > la.value_dim ? la.key_dim : la.value_dim);
+  w.kc = cuda::Buffer(kc_n * 4);
+  w.vc = cuda::Buffer(kc_n * 4);
+  if (debug_)
+    std::fprintf(stderr,
+                 "[arch] layer %2d n_kv=%d d=%d vd=%d rope_dim=%d base=%.0f window=%d "
+                 "has_v=%d qk_norm=%d v_norm=%d sandwich=%d scalar=%.3f quant=%d\n",
+                 i, la.n_kv, la.key_dim, la.value_dim, la.rope_dim, la.rope_base, la.window,
+                 (int)la.has_v, (int)la.qk_norm, (int)la.v_norm, (int)la.sandwich,
+                 w.layer_scalar, (int)w.is_quant);
+}
+
+void DenseRunner::ext_attention(LayerW& L, int n_tokens, int start_pos) {
+  const auto& la = L.ext_attn;
+  const int d = la.key_dim;
+  const int vd = la.value_dim;
+  const int nh = n_head_;
+  const int nkv = la.n_kv;
+  auto proj = [&](QTensor& qt, cuda::Buffer& f32w, int n_out, int n_in, cuda::Buffer& in,
+                  cuda::Buffer& out) {
+    if (qt.valid) {
+      matmul(qt, n_tokens, in, out);
+    } else if (n_tokens == 1) {
+      matvec_f32(f32w, n_out, n_in, in, out);
+    } else {
+      cublas::gemm_f32_nt(n_tokens, n_out, n_in, static_cast<const float*>(in.data()),
+                          static_cast<const float*>(f32w.data()),
+                          static_cast<float*>(out.data()));
+    }
+  };
+  auto rms_rows = [&](cuda::Buffer& x, cuda::Buffer& wt, cuda::Buffer& y, int rows, int n) {
+    int nn = n;
+    float e = eps_;
+    void* px = x.data();
+    void* pw = wt.data();
+    void* py = y.data();
+    void* args[] = {&px, &pw, &py, &nn, &e};
+    const size_t sh = 256 * sizeof(float);
+    cuda::launch(k_rms_, rows, 1, 1, 256, 1, 1, sh, args);
+  };
+  auto rope_dev = [&](cuda::Buffer& buf, int heads, int stride, int rope_dim,
+                      cuda::Buffer& freqs) {
+    int nhh = heads, hs = stride, rd = rope_dim, off = 0;
+    float ms = 1.0f;
+    void* px = buf.data();
+    void* pp = pos_dev_.data();
+    void* pf = freqs.data();
+    void* args[] = {&px, &pp, &nhh, &hs, &rd, &off, &pf, &ms};
+    const int threads = 128;
+    cuda::launch(k_ropestrided_, n_tokens, heads, 1, threads, 1, 1, 0, args);
+  };
+
+  // q / k / v projections (k raw is also the source of V for k_eq_v layers)
+  proj(L.qq, L.q, L.q_dim, hidden_, hn_, q_);
+  proj(L.qk, L.k, nkv * d, hidden_, hn_, k_);
+  if (la.has_v) {
+    proj(L.qv, L.v, nkv * vd, hidden_, hn_, v_);
+  } else {
+    // attention_k_eq_v: V = weightless RMSNorm(K_proj) (before k-norm / rope)
+    rms_rows(k_, L.ones_head, v_, n_tokens * nkv, vd);
+  }
+  if (la.has_v && la.v_norm) rms_rows(v_, L.ones_head, v_, n_tokens * nkv, vd);
+  if (la.qk_norm) {
+    rms_rows(k_, L.k_norm_w, k_, n_tokens * nkv, d);
+    rms_rows(q_, L.q_norm_w, q_, n_tokens * nh, d);
+  }
+  rope_dev(q_, nh, d, la.rope_dim > 0 ? la.rope_dim : d, L.rope_freqs);
+  rope_dev(k_, nkv, d, la.rope_dim > 0 ? la.rope_dim : d, L.rope_freqs);
+
+  // KV cache write (f32 path; extended models keep f32 KV)
+  {
+    int nk = nkv, dd = d, ms = max_seq_;
+    void* pk = k_.data();
+    void* pv = v_.data();
+    void* pK = L.kc.data();
+    void* pV = L.vc.data();
+    void* pp = pos_dev_.data();
+    void* args[] = {&pk, &pv, &pK, &pV, &pp, &nk, &dd, &ms};
+    cuda::launch(k_kvwrite_, n_tokens * nkv, 1, 1, 32, 1, 1, 0, args);
+  }
+  // attention (configurable scale + sliding window)
+  {
+    float scale = ext_attn_scale_ > 0 ? static_cast<float>(ext_attn_scale_)
+                                      : 1.0f / std::sqrt(static_cast<float>(d));
+    int window = la.window;
+    int nhh = nh, nk = nkv, dd = d, ms = max_seq_;
+    void* pq = q_.data();
+    void* pK = L.kc.data();
+    void* pV = L.vc.data();
+    void* po = attn_.data();
+    void* pp = pos_dev_.data();
+    void* args[] = {&pq, &pK, &pV, &po, &pp, &nhh, &nk, &dd, &ms, &scale, &window};
+    const size_t sh = (static_cast<size_t>(max_seq_) + 32) * sizeof(float);
+    cuda::launch(k_attncfg_, n_tokens, nh, 1, 32, 1, 1, sh, args);
+  }
+  // output projection + sandwich norm + residual
+  proj(L.qo, L.o, hidden_, L.q_dim, attn_, proj_);
+  if (la.sandwich) rms_rows(proj_, L.post_attn_norm, proj_, n_tokens, hidden_);
+  {
+    void* px = x_.data();
+    void* pb = proj_.data();
+    long long total = static_cast<long long>(n_tokens) * hidden_;
+    void* args[] = {&px, &pb, &total};
+    cuda::launch(k_add_, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
+  }
+}
+
+void DenseRunner::ext_ffn(LayerW& L, int n_tokens) {
+  auto proj = [&](QTensor& qt, cuda::Buffer& f32w, int n_out, int n_in, cuda::Buffer& in,
+                  cuda::Buffer& out) {
+    if (qt.valid) {
+      matmul(qt, n_tokens, in, out);
+    } else if (n_tokens == 1) {
+      matvec_f32(f32w, n_out, n_in, in, out);
+    } else {
+      cublas::gemm_f32_nt(n_tokens, n_out, n_in, static_cast<const float*>(in.data()),
+                          static_cast<const float*>(f32w.data()),
+                          static_cast<float*>(out.data()));
+    }
+  };
+  auto rms_rows = [&](cuda::Buffer& x, cuda::Buffer& wt, cuda::Buffer& y, int rows, int n) {
+    int nn = n;
+    float e = eps_;
+    void* px = x.data();
+    void* pw = wt.data();
+    void* py = y.data();
+    void* args[] = {&px, &pw, &py, &nn, &e};
+    const size_t sh = 256 * sizeof(float);
+    cuda::launch(k_rms_, rows, 1, 1, 256, 1, 1, sh, args);
+  };
+  rms_rows(x_, L.ln2, hn_, n_tokens, hidden_);
+  proj(L.qg, L.gate, inter_, hidden_, hn_, gate_);
+  proj(L.qu, L.up, inter_, hidden_, hn_, up_);
+  {
+    long long total = static_cast<long long>(n_tokens) * inter_;
+    void* pg = gate_.data();
+    void* pu = up_.data();
+    void* pa = act_.data();
+    void* args[] = {&pg, &pu, &pa, &total};
+    void* fn = ext_gelu_ ? k_gelumul_ : k_silu_;
+    cuda::launch(fn, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
+  }
+  proj(L.qd, L.down, hidden_, inter_, act_, proj_);
+  if (L.ext_attn.sandwich) rms_rows(proj_, L.post_ffw_norm, proj_, n_tokens, hidden_);
+  {
+    void* px = x_.data();
+    void* pb = proj_.data();
+    long long total = static_cast<long long>(n_tokens) * hidden_;
+    void* args[] = {&px, &pb, &total};
+    cuda::launch(k_add_, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
+  }
+  if (L.layer_scalar != 1.0) {
+    void* px = x_.data();
+    float sc = static_cast<float>(L.layer_scalar);
+    long long total = static_cast<long long>(n_tokens) * hidden_;
+    void* args[] = {&px, &sc, &total};
+    cuda::launch(k_scale_, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
+  }
+}
+
+void DenseRunner::run_layer_ext(int layer, int n_tokens, int start_pos) {
+  auto& L = layers_[layer];
+  const auto& la = L.ext_attn;
+  // pre-norm -> attention block -> sandwich norm -> residual
+  rms_buf(x_, L.ln1, hn_, n_tokens, hidden_);
+  ext_attention(L, n_tokens, start_pos);
+  // pre-norm -> MLP block -> sandwich norm -> residual -> layer scalar
+  ext_ffn(L, n_tokens);
+  if (debug_ && layer == 0 && n_tokens > 0)
+    std::fprintf(stderr, "[arch] layer 0 ran (n_tokens=%d pos=%d n_kv=%d d=%d)\\n", n_tokens,
+                 start_pos, la.n_kv, la.key_dim);
+}
+
 void DenseRunner::load_weights() {
   const bool gguf = container_ == Container::Gguf;
   auto L = [&](int i, const char* suffix) {
@@ -1262,11 +1593,20 @@ void DenseRunner::load_weights() {
   tied_head_ = !has(head_name);
   embed_lazy_f32_ = container_ == Container::Gguf;
   if (tied_head_) lm_head_host_ = embed_host_;
-  w_final_norm_ = upload_norm(tensor_f32(gguf ? "output_norm.weight" : "model.norm.weight"));
+  {
+    std::vector<float> fv = tensor_f32(gguf ? "output_norm.weight" : "model.norm.weight");
+    if (ext_enabled_ && ext_norm_plus1_ > 0)
+      for (float& x : fv) x += 1.0f;
+    w_final_norm_ = upload(fv);
+  }
 
   layers_.resize(static_cast<size_t>(ir_.n_layer));
   for (int i = 0; i < ir_.n_layer; ++i) {
     auto& w = layers_[i];
+    if (ext_enabled_ && gguf) {
+      load_ext_layer(i, w);
+      continue;
+    }
     if (ir_.ssm.variant != "none" && gguf) {
       if (ir_.layers[i].kind == "linear")
         load_q35_linear(i, w);
@@ -1754,6 +2094,10 @@ void DenseRunner::run_layer(int layer, int n_tokens, int start_pos) {
 void DenseRunner::run_layer_body(int layer, int n_tokens, int start_pos) {
   auto& L = layers_[layer];
   const bool kDebug = debug_;
+  if (L.ext) {
+    run_layer_ext(layer, n_tokens, start_pos);
+    return;
+  }
   if (L.is_linear) {
     run_q35_linear(layer, n_tokens, start_pos);
     return;
@@ -2179,6 +2523,15 @@ void DenseRunner::run_pipeline(int n, int start_pos, bool last_row_only) {
                         static_cast<const float*>(w_lm_.data()),
                         static_cast<float*>(logits_.data()));
   }
+  // Generic final-logit softcapping (metadata final_logit_softcapping): applied
+  // before the device top-k head so every consumer sees the same logits.
+  if (ext_logit_softcap_ > 0.0 && logits_.data()) {
+    long long total = static_cast<long long>(rows) * vocab_;
+    void* px = logits_.data();
+    float sc = static_cast<float>(ext_logit_softcap_);
+    void* args[] = {&px, &sc, &total};
+    cuda::launch(k_softcap_, static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1, 0, args);
+  }
   // Decode head: reduce the logits row to its top-k on the device (two ~5 us kernels)
   // so forward()/forward_topk() only copy back k pairs instead of the whole row.
   // Recorded into the decode CUDA graph like the rest of the head.
@@ -2262,10 +2615,16 @@ std::vector<float> DenseRunner::forward_impl(const std::vector<int>& tokens, int
       for (int b = 0; b < row_blocks; ++b)
         cpu::dequant_block(embed_type_, row + static_cast<size_t>(b) * embed_bb_,
                            dst + static_cast<size_t>(b) * embed_be_);
+      if (ext_enabled_ && ext_embed_scale_ != 1.0)
+        for (int d = 0; d < hidden_; ++d) dst[d] *= static_cast<float>(ext_embed_scale_);
     } else {
       std::memcpy(x.data() + static_cast<size_t>(i) * hidden_,
                   embed_host_.data() + static_cast<size_t>(tok) * hidden_,
                   static_cast<size_t>(hidden_) * 4);
+      if (ext_enabled_ && ext_embed_scale_ != 1.0) {
+        float* dst = x.data() + static_cast<size_t>(i) * hidden_;
+        for (int d = 0; d < hidden_; ++d) dst[d] *= static_cast<float>(ext_embed_scale_);
+      }
     }
   }
   // Async so the token loop does not pay a WDDM queue flush before the first kernel

@@ -232,6 +232,18 @@ class DenseRunner {
     std::unique_ptr<cuda::Graph> attn_graph[3];
     int attn_graph_state[3] = {0, 0, 0};   // 0 = run normally, 1 = capture pending, 2 = replay
     int attn_graph_bucket = 0;
+    // ---- generic extended attention path (metadata/tensor driven) ----------
+    // Active on layers whose geometry/capabilities were derived from per-layer
+    // metadata arrays or optional tensors (see ir::LayerAttn).  The rest of the
+    // LayerW fields above are not used by this path.
+    bool ext = false;
+    ir::LayerAttn ext_attn;
+    cuda::Buffer q_norm_w, k_norm_w;   // per-head RMSNorm weights
+    cuda::Buffer ones_head;            // [value_dim] ones -> weightless V norm
+    cuda::Buffer rope_freqs;           // [rope_dim/2] inv frequencies (device)
+    cuda::Buffer post_attn_norm, post_ffw_norm;  // sandwich norms
+    double layer_scalar = 1.0;
+    int q_dim = 0, kv_dim = 0;         // q projection out / per-kv-head dim
     // deepseek2 MLA: the decode attention segment (ln1 norm + attention + ln2 norm) as
     // one per-layer CUDA graph.  Valid only when the MLA projections are all quantized
     // (matmul GEMV path) and the q layout is not the cuBLAS "global" variant.
@@ -277,6 +289,18 @@ class DenseRunner {
   int head_argmax_mtp();
   void mtp_prefill_ctx(const std::vector<int>& toks, int n);
   void verify_rows_forward(const std::vector<int>& tokens, int pos);
+
+  // ---- generic extended dense path (metadata-driven architectures) --------
+  void load_ext_layer(int i, LayerW& w);
+  void run_layer_ext(int layer, int n_tokens, int start_pos);
+  void ext_attention(LayerW& L, int n_tokens, int start_pos);
+  void ext_ffn(LayerW& L, int n_tokens);
+  bool ext_enabled_ = false;       // model uses the extended path (config may veto)
+  double ext_embed_scale_ = 1.0;   // embedding multiplier actually used
+  bool ext_gelu_ = false;
+  double ext_attn_scale_ = -1.0;   // <0 = legacy rsqrt(d)
+  double ext_logit_softcap_ = 0.0;
+  int ext_norm_plus1_ = -1;        // -1 auto/direct, 0 direct, 1 (1+w)
 
   void load_weights();
   void run_layer(int layer, int n_tokens, int start_pos);
@@ -676,6 +700,10 @@ class DenseRunner {
   void* k_attntiledpregqa_ = nullptr;  // prefill: GQA group shares one K/V stream      // tiled online-softmax attention over f32/quant KV
   void* k_attncombine_ = nullptr;    // split-K merge for attntiled_
   void* k_silu_ = nullptr;
+  void* k_gelumul_ = nullptr;
+  void* k_scale_ = nullptr;
+  void* k_softcap_ = nullptr;
+  void* k_attncfg_ = nullptr;
   void* k_add_ = nullptr;
   void* k_add3_ = nullptr;  // a += (b + c) fused host-part + residual add
   void* k_bias_ = nullptr;
