@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -35,11 +36,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gguf
-from gemma4_ref import GGUFTensors, Config, rms_norm, rope, gelu  # noqa: E402
+from gemma4_ref import GGUFTensors, Config, rms_norm, rope, gelu, default_gemma_model  # noqa: E402
 
-SRC = Path("U:/AI/gemma-4-12b-it-Q4_K_M.gguf")
-TRUNC = Path("U:/AI/_gemma4_trunc.gguf")
-LLAMA = Path("U:/llama/llama-server.exe")
+SRC = default_gemma_model()
+TRUNC = Path(os.environ.get("TRUNC_GGUF", "_gemma4_trunc.gguf"))
+LLAMA = Path(os.environ.get("LLAMA_SERVER", "llama-server.exe"))
 PORT = 8097
 
 

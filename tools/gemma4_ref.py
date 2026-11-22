@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 import urllib.request
 from pathlib import Path
@@ -46,7 +47,17 @@ try:
 except ImportError:  # pragma: no cover
     raise SystemExit("需要 pip install gguf (llama.cpp 的 gguf-py)")
 
-MODEL = Path("U:/AI/gemma-4-12b-it-Q4_K_M.gguf")
+def default_gemma_model() -> Path:
+    """GEMMA_MODEL, else MODEL_DIR/gemma-4-12b-it-Q4_K_M.gguf, else bare name."""
+    explicit = os.environ.get("GEMMA_MODEL")
+    if explicit:
+        return Path(explicit)
+    model_dir = os.environ.get("MODEL_DIR", "")
+    name = "gemma-4-12b-it-Q4_K_M.gguf"
+    return Path(model_dir) / name if model_dir else Path(name)
+
+
+MODEL = default_gemma_model()
 SERVER = "http://127.0.0.1:8099"
 TOP = 10
 

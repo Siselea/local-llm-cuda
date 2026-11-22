@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gemma4_ref import GGUFTensors, Config, post, rms_norm, rope, gelu  # noqa: E402
+from gemma4_ref import GGUFTensors, Config, post, rms_norm, rope, gelu, default_gemma_model  # noqa: E402
 
 SERVER = "http://127.0.0.1:8099"
 
@@ -56,7 +56,7 @@ def variants() -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", default="Hello")
-    ap.add_argument("--model", default="U:/AI/gemma-4-12b-it-Q4_K_M.gguf")
+    ap.add_argument("--model", default=str(default_gemma_model()))
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--top", type=int, default=18)
     opts = ap.parse_args()

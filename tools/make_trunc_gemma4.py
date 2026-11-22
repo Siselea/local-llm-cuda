@@ -8,12 +8,14 @@ llama-server /embedding.  Zeroing a layer's attn_output.weight + ffn_down.weight
 (and setting its layer_output_scale to 1) then makes that layer an exact
 identity, which allows layer-by-layer bisection inside the small file.
 
-Usage: python tools/make_trunc_gemma4.py --n 8 [--out U:/AI/_gemma4_trunc8.gguf]
+Usage: python tools/make_trunc_gemma4.py --n 8 [--out _gemma4_trunc8.gguf]
+The full checkpoint comes from GEMMA_MODEL or MODEL_DIR/gemma-4-12b-it-Q4_K_M.gguf.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 from pathlib import Path
 
@@ -22,7 +24,16 @@ import numpy as np
 
 import fuzz_gguf as F
 
-SRC = Path("U:/AI/gemma-4-12b-it-Q4_K_M.gguf")
+def default_src() -> Path:
+    explicit = os.environ.get("GEMMA_MODEL")
+    if explicit:
+        return Path(explicit)
+    model_dir = os.environ.get("MODEL_DIR", "")
+    name = "gemma-4-12b-it-Q4_K_M.gguf"
+    return Path(model_dir) / name if model_dir else Path(name)
+
+
+SRC = default_src()
 BLOCK_KEYS = ("head_count_kv", "sliding_window_pattern")
 
 
@@ -34,7 +45,8 @@ def main() -> int:
     opts = ap.parse_args()
     n = opts.n
     src = Path(opts.src)
-    out = Path(opts.out) if opts.out else Path(f"U:/AI/_gemma4_trunc{n}.gguf")
+    out_dir = Path(os.environ.get("OUT_DIR", "."))
+    out = Path(opts.out) if opts.out else out_dir / f"_gemma4_trunc{n}.gguf"
     r = gguf.GGUFReader(str(src), "r")
     fields = r.fields
 

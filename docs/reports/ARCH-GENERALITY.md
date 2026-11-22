@@ -174,9 +174,9 @@ tokens, but is **not numerically aligned** with llama.cpp yet:
 ```bash
 # tiny oracle + parity anchor (needs llama-server; CPU is enough)
 python tools/make_tiny_gemma4.py
-U:/llama/llama-server.exe -m build/fixtures/tiny_gemma4/model.gguf --ctx-size 128 \
+llama-server.exe -m build/fixtures/tiny_gemma4/model.gguf --ctx-size 128 \
     -ngl 0 --port 8098 --temp 0 --top-k 1 --parallel 1 --embeddings &
 python tools/tiny_gemma4_grid.py --ids 5,7,9
 # real checkpoint (GPU): load + generate
-./build/test_gen.exe "U:/AI/gemma-4-12b-it-Q4_K_M.gguf" 9259 8 --ctx 64 --arch-ext auto
+./build/test_gen.exe "${GEMMA_MODEL:-$MODEL_DIR/gemma-4-12b-it-Q4_K_M.gguf}" 9259 8 --ctx 64 --arch-ext auto
 ```
