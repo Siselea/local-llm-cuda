@@ -265,7 +265,52 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
 - 代价：这次 3 次装载重试共 **258 s**（35B 每次重载 ~75–90 s），来自“先按预估算装、实测后
   回退重试”的诚实策略；改进项见 §7（把 ledger gap 建模进装载前预算可减少重试）。
 
-### 2.14 35B 30 轮会话 ⏳ v0.1.6
+### 2.14 启动时间与装载次数（35B 长上下文的单次装载优化，commit `dd674ae`）
+
+**问题（用户可感知）**：35B（20.33 GiB 权重、11–15 层 MoE 专家在 GPU、其余走 CPU）请求
+`--ctx 32768` 时，旧实现 **装载 3 次、启动 258 s**，用户等 4 分多钟才被告知“实际只有 5217”。
+
+**根因**：
+1. 装载前的 ctx 预算只减 `ir_.fixed_bytes()`（1.65 GiB 固定权重），**没有算将驻留 GPU 的专家**，
+   于是算出 `max_ctx=32768`、按请求值装载；
+2. 装载后实测 free VRAM 1160 MiB < margin 1200 → serve 返回可行 ctx 重试；
+3. 但每次减小 ctx 释放的 KV 又立刻被**自适应专家放置**拿去多放一层专家（~500 MiB/层），
+   free VRAM 一直在 margin 附近徘徊 → 重试链 3 次才收敛。
+4. 另外 35B 的 serve 自预热会跑 1024-token prefill（CPU 专家带宽受限，实测 **133 s**），
+   也计入启动时间。
+
+**修复**：
+- `derive_ctx_limit`：当 **ctx 请求 ≥16384 且是 split-MoE 模型** 时，装载前就把
+  “GPU 驻留专家字节 + 校准 ledger gap（`vram_extra_reserve_mb`）+ allocator slack” 计入预算，
+  第一次装载就夹紧并打印 `requested 32768 -> actual XXXX (CLAMPED: VRAM budget)` /
+  `clamp reason: VRAM budget for a split MoE model`；不再重载。
+- serve：CPU 专家模型**跳过 1024-token 自预热**（收益是首次请求几百 ms，代价是启动 133 s）；
+  纯 GPU 模型保留预热。
+- `main`：实测夹紧重试上限 4 → **2 次**（`attempt i/3` 进度打印），仅兜底。
+- 小 ctx（Coder 4096、35B 4096）与稠密模型（0.5B/9B）**保留原 verbatim 路径**，行为不变。
+
+**35B 启动前后对比（同一 35B Q4_K_M，独占 GPU）**
+
+| 请求 ctx | 修复前 | 修复后 | 变化 |
+|---|---|---|---|
+| 16 | 75.0 s（1 次装载） | **61.2 s**（1 次） | −18%（预热跳过） |
+| 4096 | 57.6 s（1 次） | 84.8 s（1 次，磁盘/页缓存波动范围内） | 波动，仍 1 次装载、无夹紧 |
+| **32768** | **258.0 s（3 次装载，actual 5217）** | **66.7 s（1 次装载，actual 29491）** | **−74% 启动时间；实际可用上下文从 5217 提升到 29491（5.6×）** |
+
+**行为不变性验证（同一修复后二进制，独占 GPU）**
+
+| 用例 | 结果 |
+|---|---|
+| 0.5B ctx262144 f32 | 10 s，`requested==actual=262144`，无夹紧，预热正常（0.3 s） |
+| 9B ctx262144 q4_0 | 34 s，verbatim 262144，无夹紧，预热正常（0.97 s） |
+| Coder ctx4096 | 32 s，verbatim 4096，无夹紧（小 ctx 走原路径；预热跳过因为 CPU 专家） |
+| 35B ctx4096 | 60 s，verbatim 4096，无夹紧 |
+| 35B ctx32768 | 66.7 s，**1 次装载**，actual 29491，`ctx_clamped=true`，200 |
+
+**结论**：极端长 ctx + 大模型（最坏情况）的启动时间 258 s → 66.7 s，且第一次就给出诚实账目；
+普通用例（0.5B/9B/Coder）零额外开销、verbatim 行为不变。
+
+### 2.15 35B 30 轮会话 ⏳ v0.1.6
 
 35B 在 CPU 专家模式下每轮 decode 受 CPU 专家带宽限制（perf 31.13 tok/s），30 轮会话预计
 ~3 min/30 轮 + 1 次装载；本轮不做，留 v0.1.6。
@@ -343,6 +388,7 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
 | `bd0b477` | `serve` 静默 `max(32, ctx)`（--ctx 1/2/16 被悄悄改成 32，日志还显示 requested=32）；无 requested/actual；物理放不下只会整进程失败 | 任意正整数透传；/props 5 个新字段；启动日志 requested→actual；装载后实测夹紧→返回可行 ctx→自动重试（最多 4 次）；OOM 也走估算重试；dense+超预估 ctx 不再直接拒绝。 |
 | `fix(serve)` 后续（HEAD 47555d2 附近） | `ctx_suggested` 按值传参丢失 → 实测夹紧重试从未生效（§1.2 暴露） | `serve::run(Options&)` in/out 引用；重试链路实测生效（hog 场景 requested 262144 → actual 75775 成功）。 |
 | `d04d755` | launcher ctx 数字框：初始即红字非法；**中文 IME 下键入数字被吞**（只有粘贴可用）；跨进程写入后画面不刷新 | 初始化时屏蔽 EN_CHANGE（g_ctx_sync）+ 每次刷新从输入框内容自愈；数字 EDIT 解除 IMM 绑定 + WM_KEYDOWN 数字/退格/删除子类化；截图脚本强制重绘。 |
+| `dd674ae` | 35B + `--ctx 32768` 需装载 3 次、启动 258 s（装载前预算不含 GPU 驻留专家；每次释放的 KV 又被自适应专家放置吃掉；自预热 133 s） | split-MoE 长 ctx 装载前预算计入专家+ledger gap → **单次装载**（35B ctx32768：258 s→66.7 s，actual 5217→29491）；CPU 专家模型跳过自预热；重试上限 4→2。 |
 
 ---
 
@@ -400,6 +446,11 @@ python tools/ctx_extremes_probe.py --scenario short_prompt,tiny_ctx,empty_input,
 
 # 显存紧张下的实测夹紧（hog + 第二个 serve）
 python build/vram_tight_05b.py        # 开发脚本，输出 build/ctx_extremes/vram_tight_05b.json
+
+# 35B 长 ctx 启动时间/装载次数（修复后应 1 次装载、≤90 s）
+python tools/ctx_extremes_probe.py --scenario ctx_matrix \
+  --model "$MODEL_DIR/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-Q4_K_M.gguf" \
+  --ctx-list "16,4096,32768" --out build/logs/ctx35b_after.json
 
 # 手工验证 requested/actual
 ./build/engine.exe serve <model> --port 7030 --ctx 262144 --kv-type q4_0
