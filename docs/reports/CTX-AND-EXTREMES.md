@@ -213,10 +213,48 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
 对“必须夹紧”的极端（真正放不下）：0.5B hog ctx262144（~6 GB）+ 第二个 0.5B ctx262144 的案例
 （§1.2/§1.3）已经证明 requested 262144 → actual 75775 的实测夹紧 + 自动重试链路。
 
-### 2.10 大模型性能/35B 30 轮 ⏳ v0.1.6
+### 2.10 9B 30 轮连续会话（ctx 8192，真实多轮 chat）
+
+| turn | wall s | prompt tokens | prefill ms | decode ms | 说明 |
+|---|---|---|---|---|---|
+| 1 | 1.81 | 111 | 335.8 | 1474 | 首轮，decode 80 tokens（think budget 实际生成） |
+| 5 | 2.26 | 801 | 537.2 | 1705 | |
+| 10 | 2.30 | 1677 | 556.5 | 1737 | |
+| 20 | 2.39 | 3427 | 564.9 | 1815 | |
+| 30 | 2.53 | 5185 | 613.3 | 1887 | 前缀缓存 `cached 5120 / new 67`（98.7% 命中） |
+
+- 30/30 全部 200；总 wall 70.7 s（≈2.36 s/轮，随历史缓慢线性增长，不是全量重算）；
+- prefill 336→613 ms（只算新增 ~67–247 token + 恢复前缀快照）；decode 80 tokens ≈ 42 tok/s（与 perf 的 48.5 一致）；
+- RSS 峰值 1823 MiB、post-load free 稳定 5666 MiB，30 轮无泄漏趋势；
+- 判定：✅ 可接受；“每轮变慢”来自新 token 的 prefill + 增长的前缀快照，不是 O(n²) 全量。
+
+### 2.11 9B 背靠背 10 请求
+
+10/10 200；单请求 wall **0.28–0.29 s**（prefill ≈126 ms + 8 token decode ≈150 ms）；无排队/串行
+问题（单用户单线程设计），第 1 个与第 10 个无差异。
+
+### 2.12 五套验证（干净 HEAD worktree 构建）
+
+| 套件 | 结果 | 证据 |
+|---|---|---|
+| `verify.sh` | **ALL GREEN**（含 test_sampler PASS） | server-mode 干净 worktree @ HEAD 53396ef |
+| `smoke_models.sh` | 40716 / 185 / 2614 / 2614，EXIT=0 | 本任务 `build/logs/smoke_head53396ef.log` |
+| `gen_regression.sh` | **10/10 GREEN** | 本任务 `build/logs/genreg_head53396.log` |
+| `verify_generality.sh` | 26/26 | server-mode |
+| `verify_serve.sh` | 22/22 + 21/21 | server-mode |
+| `tools/check_clean_build.sh --quick` | build OK / GREEN（HEAD 8d1f1b1） | server-mode |
+| 完整 `check_clean_build.sh` | **CLEAN BUILD GATE GREEN: ff46e37 is ready to tag** | server-mode |
+
+说明：`c1df298`（非流式 JSON 非法 UTF-8 修复）在完整 gate `ff46e37` 之后合入，属 v0.1.6 hotfix；
+本轮 ctx/极端矩阵的所有测量在 c1df298 的干净 HEAD worktree engine 上完成（ctx9b 在 53396ef 上，
+两者对 ctx 行为无可测差异）。
+
+### 2.13 35B ctx 矩阵 / 35B 30 轮 ⏳ v0.1.6
 
 35B（CPU 专家）的 ctx 矩阵（16/4096/32768）每 load ≈90 s，本轮窗口不够，**留 v0.1.6**；35B 的
-30 轮会话同理。已有 35B 证据：perf 31.13 tok/s（≥29）+ gen_regression/smoke 全绿。
+30 轮会话同理。已有 35B 证据：perf 31.13 tok/s（≥29）+ gen_regression/smoke 全绿 + 35B 的
+`gpu_moe_layers=12/40` CPU 专家自动放置日志正常。v0.1.6 补测时用：
+`bash build/run_big_window.sh ctx35b`（脚本已就绪）。
 
 ---
 
@@ -241,8 +279,12 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
   1. 启动时初始 `4096` 的 EN_CHANGE 在 `g_ctx_edit` 赋值前触发 → 初始就红字“非法”且不再自动恢复；
   2. **中文 IME 下数字框收不到键入**（IME 组合吞掉 WM_CHAR，ES_NUMBER 只有粘贴能用）；
      修复：数字 EDIT 解除 IMM 绑定 + WM_KEYDOWN 数字/退格/删除子类化直接改文本，任何 IME 下可用。
-- `tests/test_launcher.py` 已更新覆盖任意值/非法提示/自动勾选/滑块映射；完整 GUI 验收（起 0.5B +
-  启动/停止 + 证据 JSON）在大窗口后重跑并记录结果。
+- `tests/test_launcher.py` 已更新覆盖任意值/非法提示/自动勾选/滑块映射，`py_compile` 通过；
+  **完整 19 步 GUI 验收在本环境会挂起 >10 min**（旧 harness 会真的启动 0.5B/35B、35B load≈60 s，
+  且与发布门禁争 GPU），本轮按 lead 分工把 GPU 让给 v0.1.6 门禁，**完整 GUI 验收标 TODO**；
+  已交付：UI 截图 4 张（上）、launcher `--ctx` 任意值路径（截图 11/12/13）、测试用例代码。
+- 另一个已知环境限制：launcher 测试的 `start/stop` 段依赖桌面焦点/HTTP 轮询，在本 VM 多次挂起
+  （非 ctx 代码路径；上一轮完整 76/76 验收是 2026-11-15 环境）。
 
 ---
 
