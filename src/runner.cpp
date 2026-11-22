@@ -1593,11 +1593,15 @@ void DenseRunner::load_weights() {
   tied_head_ = !has(head_name);
   embed_lazy_f32_ = container_ == Container::Gguf;
   if (tied_head_) lm_head_host_ = embed_host_;
-  {
+  if (ext_enabled_ && ext_norm_plus1_ > 0) {
+    // explicit override only for the generic path (arch_norm_mode=plus1)
     std::vector<float> fv = tensor_f32(gguf ? "output_norm.weight" : "model.norm.weight");
-    if (ext_enabled_ && ext_norm_plus1_ > 0)
-      for (float& x : fv) x += 1.0f;
+    for (float& x : fv) x += 1.0f;
     w_final_norm_ = upload(fv);
+  } else {
+    // upload_norm() keeps the architecture-specific zero-centering convention
+    // (e.g. deepseek2 MLA); never bypass it for the legacy paths.
+    w_final_norm_ = upload_norm(tensor_f32(gguf ? "output_norm.weight" : "model.norm.weight"));
   }
 
   layers_.resize(static_cast<size_t>(ir_.n_layer));

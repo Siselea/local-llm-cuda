@@ -465,8 +465,10 @@ const OptionDef kDefs[] = {
     // ---------------- generic architecture blocks (metadata driven) ----------------
     // These only affect models whose GGUF metadata/tensor layout asks for the
     // corresponding feature; the defaults are "use it if the metadata says so".
-    {"arch_ext", "ENGINE_ARCH_EXT", "arch-ext", true, false, Type::String, "auto",
-     0, 0, "generic per-layer dense path: auto (metadata decides) | on | off"},
+    {"arch_ext", "ENGINE_ARCH_EXT", "arch-ext", true, false, Type::String, "off",
+     0, 0,
+     "generic per-layer dense path: off (default; experimental paths disabled) | "
+     "auto (metadata decides) | on"},
     {"arch_act", "ENGINE_ARCH_ACT", "arch-act", true, false, Type::String, "auto",
      0, 0, "MLP activation: auto | silu | gelu (gelu-tanh for gemma-family metadata)"},
     {"arch_embed_scale", "ENGINE_ARCH_EMBED_SCALE", "arch-embed-scale", true, false,

@@ -364,9 +364,17 @@ Model build_from_gguf(const gguf::Model& g) {
       caps.sandwich_norm |= la.sandwich;
       caps.layer_scalar |= la.layer_scalar;
     }
+    // Only rewrite the stack-wide geometry when the model actually uses
+    // per-layer metadata to vary it.  For every other architecture (MLA,
+    // hybrid-SSM, plain dense) these scalar fields are consumed by dedicated
+    // code paths and must stay exactly as parsed -- e.g. MLA checkpoints carry
+    // attention.value_length = 0 and the MLA cache sizing relies on that.
+    const bool per_layer_geom = kv_per_layer || swa_per_layer;
     if (kv_per_layer) a.n_head_kv = max_kv;
-    a.key_length = max_kd;
-    a.value_length = max_vd;
+    if (per_layer_geom) {
+      a.key_length = max_kd;
+      a.value_length = max_vd;
+    }
     caps.logit_softcap = meta_float(g, m.arch, "final_logit_softcapping", 0.0);
     caps.attn_logit_softcap = meta_float(g, m.arch, "attention.logit_softcapping", 0.0);
     // Family traits (metadata / tensor structure, not the architecture name):
