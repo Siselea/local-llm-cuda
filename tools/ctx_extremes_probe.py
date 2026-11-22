@@ -640,7 +640,7 @@ def main() -> int:
         except Exception as e:  # keep the probe going
             rows = [{"scenario": name, "ok": False, "error": f"probe exception: {e}"}]
         for r in rows:
-            print(json.dumps(r, ensure_ascii=False)[:400], flush=True)
+            print(json.dumps(r, ensure_ascii=True)[:400], flush=True)
         results.extend(rows)
 
     if "ctx_matrix" in todo:
