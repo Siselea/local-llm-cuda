@@ -1585,12 +1585,80 @@ HWND mk_static(HWND parent, const std::wstring& text, int id, Role role, DWORD e
 
 std::map<HWND, bool> g_edit_controls;  // edit boxes get a custom 1px frame
 
+// Numeric edit boxes must not go through the Chinese IME: with a Chinese input method
+// active, typed digits start an IME composition and never reach the ES_NUMBER edit
+// (real keystrokes are lost; only paste/Ctrl shortcuts work).  Two layers:
+//   1) detach the IMM context (imm32 loaded lazily, build.sh link flags unchanged);
+//   2) subclass the edit: WM_KEYDOWN 0-9/backspace edits the text directly, so the
+//      field still accepts digits when a TSF/IME layer swallows WM_CHAR.
+std::map<HWND, WNDPROC> g_numeric_old_proc;
+
+std::wstring window_text_of(HWND h) {
+  wchar_t buf[64] = {0};
+  GetWindowTextW(h, buf, 63);
+  return std::wstring(buf);
+}
+
+LRESULT CALLBACK numeric_edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+  auto it = g_numeric_old_proc.find(h);
+  WNDPROC old = it != g_numeric_old_proc.end() ? it->second : nullptr;
+  if (msg == WM_KEYDOWN) {
+    if (wp >= L'0' && wp <= L'9') {
+      std::wstring t = window_text_of(h);
+      if (t.size() < 16) t.push_back(static_cast<wchar_t>(wp));
+      SetWindowTextW(h, t.c_str());
+      return 0;
+    }
+    if (wp == VK_BACK) {
+      std::wstring t = window_text_of(h);
+      if (!t.empty()) t.pop_back();
+      SetWindowTextW(h, t.c_str());
+      return 0;
+    }
+    if (wp == VK_DELETE) {
+      SetWindowTextW(h, L"");
+      return 0;
+    }
+  }
+  if (msg == WM_CHAR && wp >= L'0' && wp <= L'9') {
+    // Locale-typed digits already handled in WM_KEYDOWN; if IME disabled both arrive.
+    if (window_text_of(h).size() < 16) {
+      std::wstring t = window_text_of(h);
+      t.push_back(static_cast<wchar_t>(wp));
+      SetWindowTextW(h, t.c_str());
+    }
+    return 0;
+  }
+  return old != nullptr ? CallWindowProcW(old, h, msg, wp, lp)
+                        : DefWindowProcW(h, msg, wp, lp);
+}
+
+void detach_ime(HWND h) {
+  static HIMC(WINAPI * assoc)(HWND, HIMC) = nullptr;
+  static bool resolved = false;
+  if (!resolved) {
+    resolved = true;
+    HMODULE imm = LoadLibraryW(L"imm32.dll");
+    if (imm != nullptr) {
+      assoc = reinterpret_cast<HIMC(WINAPI*)(HWND, HIMC)>(
+          GetProcAddress(imm, "ImmAssociateContext"));
+      // do not FreeLibrary: the window keeps using the IMM context
+    }
+  }
+  if (assoc != nullptr) assoc(h, nullptr);
+}
+
 HWND mk_edit(HWND parent, const std::wstring& text, int id, DWORD extra_style = 0) {
   HWND h = CreateWindowExW(0, L"EDIT", text.c_str(),
                            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT | extra_style, 0, 0,
                            0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                            nullptr, nullptr);
   if (h == nullptr) return nullptr;
+  if ((extra_style & ES_NUMBER) != 0) {
+    detach_ime(h);
+    g_numeric_old_proc[h] = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+        h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(numeric_edit_proc)));
+  }
   SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
   g_ctrl_font_pt[h] = 10;
   g_edit_controls[h] = true;
@@ -2254,6 +2322,20 @@ void update_gpu_controls() {
 void update_ctx_controls() {
   if (g_ctx_slider == nullptr) return;
   const bool loaded = g_meta.loaded;
+  // The red "invalid" state must always describe what is in the box right now: a stale
+  // flag from control creation (or from a value that has since been fixed) is cleared
+  // here, and a valid typed value becomes the authoritative ctx_value.
+  if (loaded && !g_ui.ctx_auto && g_ctx_edit != nullptr && !g_ctx_sync) {
+    wchar_t cur[32] = {0};
+    GetWindowTextW(g_ctx_edit, cur, 32);
+    long long v = 0;
+    if (cur[0] != L'\0' && parse_ll(cur, &v) && v >= 1 && v <= kCtxMax) {
+      g_ui.ctx_value = static_cast<int>(v);
+      g_ui.ctx_invalid = false;
+    } else if (cur[0] != L'\0') {
+      g_ui.ctx_invalid = true;
+    }
+  }
   const bool manual = loaded && !g_ui.ctx_auto;
   const int shown = g_ui.ctx_auto ? (g_est.auto_ctx > 0 ? g_est.auto_ctx : 4096) : g_ui.ctx_value;
   slider_range(g_ctx_slider, 0, kCtxSliderSteps);
@@ -2734,8 +2816,10 @@ void create_main_controls() {
   g_gpu_slider = mk_slider(g_hwnd, IDC_GPU_SLIDER);
   g_gpu_text = mk_static(g_hwnd, L"", IDC_GPU_TEXT, Role::Dim, 0, g_font_small);
   g_label_ctx = mk_static(g_hwnd, L"上下文长度", 0, Role::Normal, 0, g_font);
+  g_ctx_sync = true;  // the initial edit text fires EN_CHANGE before g_ctx_edit is set
   g_ctx_edit = mk_edit(g_hwnd, wnum(g_ui.ctx_value), IDC_CTX_EDIT, ES_NUMBER);
   g_ctx_auto = mk_toggle(g_hwnd, L"自动（按空闲显存推导）", IDC_CTX_AUTO);
+  g_ctx_sync = false;
   g_ctx_slider = mk_slider(g_hwnd, IDC_CTX_SLIDER);
   g_ctx_text = mk_static(g_hwnd, L"", IDC_CTX_TEXT, Role::Dim, 0, g_font_small);
   g_label_kv = mk_static(g_hwnd, L"KV 量化", 0, Role::Normal, 0, g_font);
@@ -4360,7 +4444,9 @@ void on_advanced_control_changed(int ctrl_id, int code) {
 
 void on_edit_changed(int ctrl_id) {
   if (ctrl_id == IDC_CTX_EDIT) {
-    if (g_ctx_sync) return;
+    // EN_CHANGE also fires while the control is created (before g_ctx_edit is assigned);
+    // reading through a null handle used to mark the initial 4096 as invalid.
+    if (g_ctx_sync || g_ctx_edit == nullptr) return;
     wchar_t buf[32] = {0};
     GetWindowTextW(g_ctx_edit, buf, 32);
     long long v = 0;
