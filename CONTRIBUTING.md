@@ -23,6 +23,33 @@ bash build.sh
 - 如果 Python 不在 PATH：`PY=<python路径> bash build.sh`。
 - **不要提交** `build/`、`.exe`、模型权重、日志、`*.pre*`/`*.v1` 历史快照。
 
+### 1.1 共享 `build/` 只由「干净 HEAD worktree」构建（团队规则，2026-11-22）
+
+`build/` 是所有验证脚本共用的产物目录。**绝不要在含未提交 WIP 的工作区直接跑 `bash build.sh`**
+——它会把实验性 WIP 编进共享的 `engine.exe`/`test_gen.exe`/…，其他人拿到的就是“坏的共享二进制”
+（实际踩过的坑：Gemma4 WIP 编进 test_gen 后 `gen_regression` 9/10 FAIL、`got` 全空，
+qwen35 报 `missing tensor blk.N.ffn_norm.weight`；而干净 HEAD 构建 10/10 全绿）。
+
+规则：
+
+1. **共享 `build/` 的二进制只从已提交 HEAD 的独立 worktree 构建**：
+
+   ```bash
+   cd <repo>
+   git worktree add ../engine_clean HEAD
+   cd ../engine_clean
+   PY=<python> bash build.sh
+   # 确认主仓库没有验证进程占用后，复制回共享 build/
+   cp build/*.exe ../<repo>/build/
+   ```
+
+2. **含 WIP 的实验编译**去自己的 worktree（如 `../engine_arch`），产物**不要**覆盖共享 `build/`；
+   需要别人用你的实验二进制时，明确写清 worktree 路径/二进制名。
+3. 覆盖共享 `build/` 前先看 `tasklist | grep -E "test_gen|engine.exe"` 与 `nvidia-smi`，
+   确认没有验证进程在用（Windows 上正在运行的 exe 无法覆盖，会报 `Device or resource busy`）。
+4. `bash tools/check_clean_build.sh` 用于检查“当前工作区是否 dirty”与“build/ 是否来自 HEAD”
+   （该脚本由 server-mode 维护；没有脚本时按本节步骤人工检查）。
+
 ## 2. 跑验证（PR 必须全过）
 
 五套引擎验证（需要自备测试模型，设置 `MODEL_DIR` 指向模型目录）：
