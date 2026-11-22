@@ -602,7 +602,7 @@ placement::Decision compute_decision(const ir::Model& m, int ctx, int kv_type,
 
 // Ledger + policy gate.  Returns 0 to continue, or the process exit code when an
 // explicitly requested / impossible placement must stop the launch.
-int announce_placement(const ir::Model& m, int ctx, int kv_type) {
+int announce_placement(const ir::Model& m, int ctx, int kv_type, bool explicit_ctx) {
   engine::config::Config& cfg = engine::config::Config::get();
   const placement::MemoryInfo vram = placement::device_memory();
   const placement::MemoryInfo host = placement::host_memory();
@@ -654,6 +654,21 @@ int announce_placement(const ir::Model& m, int ctx, int kv_type) {
       std::fprintf(stderr,
                    "[placement] WARN : continuing because --allow-oversubscribe is set; the driver "
                    "will page, expect single-digit tok/s\n");
+      return 0;
+    }
+    // Arbitrary-ctx contract: for a dense model the only reason a big ctx lands in the
+    // "ssd" bucket is that fixed weights + KV do not fit the pre-load *estimate*.  The
+    // server can still attempt the load and clamp to a measured-feasible ctx (see the
+    // [serve] ctx clamp / retry lines), so do not refuse that case here -- only a model
+    // whose non-expert weights alone cannot fit stays a hard error.
+    const bool kv_only_overflow =
+        d.dense_offload_unsupported && d.fixed_bytes + d.kv_bytes + d.workspace_bytes > d.vram_usable;
+    if (explicit_ctx && kv_only_overflow) {
+      std::fprintf(stderr,
+                   "[placement] note   : requested ctx %d does not fit the pre-load budget for this "
+                   "dense model; attempting a measured load (the server clamps to a measured "
+                   "feasible ctx and reports requested -> actual)\n",
+                   ctx);
       return 0;
     }
     std::fprintf(stderr,
@@ -1195,6 +1210,7 @@ int main(int argc, char** argv) {
       if (serve_ctx > 0) o.ctx = serve_ctx;
       else if (cfg.was_set("ctx")) o.ctx = static_cast<int>(cfg.get_int("ctx"));
       else o.ctx = 4096;
+      o.ctx_requested = o.ctx;  // /props + clamp ledger report the original request
       // Placement ledger + policy gate: full accounting before the runner allocates
       // the KV cache.  `auto` (the default) is advisory: it prints where the weights
       // will live and refuses only when the model cannot fit at all or the user
@@ -1212,7 +1228,7 @@ int main(int argc, char** argv) {
           if (ledger_ctx <= 0) ledger_ctx = 4096;
           std::fprintf(stderr, "[placement] ctx=auto -> ledger uses %d tokens\n", ledger_ctx);
         }
-        const int rc = announce_placement(probe.model, ledger_ctx, kv_type);
+        const int rc = announce_placement(probe.model, ledger_ctx, kv_type, o.ctx > 0);
         if (rc != 0) return rc;
       }
       o.default_max_tokens = static_cast<int>(cfg.get_int("default_max_tokens"));
@@ -1220,7 +1236,47 @@ int main(int argc, char** argv) {
       o.default_top_p = cfg.get_double("default_top_p");
       o.default_top_k = static_cast<int>(cfg.get_int("default_top_k"));
       o.default_repetition_penalty = cfg.get_double("default_repeat_penalty");
-      return engine::serve::run(o);
+      // `--ctx` accepts any positive integer, and a clamp may only happen when the KV
+      // cache physically does not fit.  serve::run() therefore reports measured
+      // infeasibility back as ctx_suggested (rc=4) or a load failure with positive ctx
+      // (rc=5); retry with the suggested/estimated ctx and keep `ctx_requested` intact so
+      // the final /props + startup log show requested -> actual and the clamp reason.
+      int ctx_try = o.ctx;
+      int rc = -1;
+      for (int attempt = 0; attempt < 4; ++attempt) {
+        engine::serve::Options opts_try = o;
+        opts_try.ctx = ctx_try;
+        opts_try.ctx_suggested = 0;
+        rc = engine::serve::run(opts_try);
+        if (rc == 4 && opts_try.ctx_suggested > 0 && opts_try.ctx > 0 && attempt < 3) {
+          std::fprintf(stderr,
+                       "[ctx] measured clamp: requested %d does not fit; retrying with --ctx %d "
+                       "(attempt %d/4)\n",
+                       o.ctx_requested, opts_try.ctx_suggested, attempt + 1);
+          ctx_try = opts_try.ctx_suggested;
+          continue;
+        }
+        if (rc == 5 && probe.ok && o.ctx > 0 && attempt < 3) {
+          // Load OOM with a positive ctx.  Estimate the largest ctx that fits from the
+          // model structure + measured free VRAM, then let serve measure it again.
+          const int kv_type = kv_type_from_cfg();
+          const placement::MemoryInfo vram = placement::device_memory();
+          const placement::CtxFit fit = placement::estimate_ctx(
+              probe.model, kv_type, vram.valid ? vram.free_bytes : 0,
+              placement_reserve_bytes(), static_cast<int>(cfg.get_int("prefill_rows")));
+          int next = fit.max_ctx > 0 ? std::min(fit.max_ctx, std::max(1, ctx_try - 1))
+                                     : std::max(1, ctx_try * 3 / 4);
+          if (next >= ctx_try) next = std::max(1, ctx_try * 3 / 4);
+          std::fprintf(stderr,
+                       "[ctx] load failed with ctx=%d; retrying with --ctx %d (max ctx that fits "
+                       "the VRAM budget=%d, attempt %d/4)\n",
+                       ctx_try, next, fit.max_ctx, attempt + 1);
+          ctx_try = next;
+          continue;
+        }
+        break;
+      }
+      return rc;
     }
     if (is_run) {
       std::string ids_text = ids_arg;
@@ -1281,7 +1337,8 @@ int main(int argc, char** argv) {
           if (ledger_ctx <= 0) ledger_ctx = 4096;
           std::fprintf(stderr, "[placement] ctx=auto -> ledger uses %d tokens\n", ledger_ctx);
         }
-        const int rc = announce_placement(probe.model, ledger_ctx, kv_type);
+        const int rc = announce_placement(probe.model, ledger_ctx, kv_type,
+                                          ctx_given && ctx_req > 0);
         if (rc != 0) return rc;
       }
       runner::DenseRunner r(path, max_seq, runner::detect_container(path));

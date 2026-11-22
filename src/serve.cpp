@@ -45,6 +45,7 @@
 #include "engine/http_server.h"
 #include "engine/json.h"
 #include "engine/json_parse.h"
+#include "engine/placement.h"
 #include "engine/runner.h"
 #include "engine/sampler.h"
 #include "engine/text_util.h"
@@ -214,7 +215,14 @@ struct ServerState {
   tokenizer::Tokenizer tk;
   std::unique_ptr<runner::DenseRunner> model;
   Options opts;
-  int ctx = 4096;
+  // Context length is a hard total-sequence budget (prompt + generated tokens).
+  // `ctx_requested` is what the user asked for (0 = auto) and `ctx` is what the
+  // loader could actually allocate; both are reported in /props and the startup log,
+  // and a clamp (which now only happens when the KV cache physically does not fit)
+  // is never silent.
+  int ctx = 4096;                 // actual, after the loader's VRAM pass
+  int ctx_requested = 0;          // 0 = auto was requested
+  bool ctx_clamped = false;       // requested > 0 and actual != requested
   std::string model_name;
   bool thinking_aware = false;  // chat template opens a <think> block
   PrefixCache pc;
@@ -906,8 +914,21 @@ void handle_props(const ServerState& st, http::Conn& conn) {
   w.end_arr();
   w.key("n_ctx");
   w.integer(st.ctx);
+  // Requested vs actual context length (task: arbitrary ctx input must be observable).
+  // n_ctx above stays the llama.cpp-compatible "actual" value; these aliases make the
+  // clamp explicit for launcher/webui/ops clients.
+  w.key("n_ctx_requested");
+  w.integer(st.ctx_requested);
+  w.key("requested_ctx");
+  w.integer(st.ctx_requested);
+  w.key("actual_ctx");
+  w.integer(st.ctx);
+  w.key("ctx_clamped");
+  w.boolean(st.ctx_clamped);
   w.key("ctx_train");
   w.integer(m.ctx_train);
+  w.key("ctx_train_exceeded");
+  w.boolean(m.ctx_train > 0 && st.ctx > m.ctx_train);
   w.key("n_vocab");
   w.integer(st.tk.vocab_size());
   w.key("arch");
@@ -2029,10 +2050,14 @@ runner::Container detect_container(const std::string& path) {
 
 }  // namespace
 
-int run(const Options& opts) {
+int run(Options opts) {
   ServerState st;
   st.opts = opts;
-  st.ctx = std::max(32, opts.ctx);
+  // Any positive integer is a valid --ctx here.  Only the model loader may clamp it
+  // (KV cache + weights + reserve must physically fit); 0 means "auto" and is
+  // derived from free VRAM.  Never silently round a tiny/huge value here.
+  st.ctx = opts.ctx;
+  st.ctx_requested = opts.ctx_requested > 0 ? opts.ctx_requested : opts.ctx;
   st.model_name = base_name(opts.model);
 
   std::printf("[serve] model      : %s\n", opts.model.c_str());
@@ -2107,22 +2132,43 @@ int run(const Options& opts) {
                                                      detect_container(opts.model));
   } catch (const std::exception& e) {
     std::fprintf(stderr, "[serve] ERROR: model load failed: %s\n", e.what());
+    if (opts.ctx > 0) {
+      // The requested ctx may simply be too large for this GPU (KV allocation OOM).
+      // Distinguish that from a broken model file so the caller can retry with a
+      // measured-feasible ctx and report requested/actual instead of failing hard.
+      std::fprintf(stderr,
+                   "[serve] hint : --ctx %d may be physically too large for this GPU "
+                   "(KV cache allocation failed); retrying with a smaller ctx is possible\n",
+                   opts.ctx);
+      return 5;
+    }
     std::fprintf(stderr, "[serve] hint: try a smaller --ctx (e.g. --ctx 2048)\n");
     return 1;
   }
   {
-    // The loader may clamp the requested ctx (ctx_auto, kv_type budget) or reduce it
-    // while fitting the prefill chunk.  Always take the REAL ctx from the model: the
-    // prompt-length checks must reject an over-long prompt with 400 instead of letting
-    // forward() throw "bad token count" (observed as HTTP 500 for an 11k prompt when
-    // ctx 32768 had been clamped to 8053).
+    // The loader may clamp the requested ctx (KV budget / physical VRAM) or the
+    // context may be auto-derived.  Always take the REAL ctx from the model and print
+    // the requested -> actual pair with the reason, so "actual" is never a silent
+    // surprise.  The detailed KV accounting is printed by the runner as the
+    // `[ctx] requested=... / [ctx] budget ... / [ctx] CLAMPED ...` ledger above.
+    const int requested = st.ctx_requested;
     const int real_ctx = st.model->ctx();
-    if (real_ctx != st.ctx)
-      std::printf("[serve] ctx clamp  : requested %d -> %d tokens (VRAM budget)\n", st.ctx,
-                  real_ctx);
     st.ctx = real_ctx;
-    if (opts.ctx <= 0)
-      std::printf("[serve] auto ctx   : %d tokens (derived from free VRAM)\n", st.ctx);
+    st.ctx_clamped = requested > 0 && real_ctx != requested;
+    if (requested <= 0) {
+      std::printf(
+          "[serve] ctx        : requested auto -> actual %d tokens (derived from free "
+          "VRAM; see [ctx] ledger)\n",
+          real_ctx);
+    } else if (st.ctx_clamped) {
+      std::printf(
+          "[serve] ctx        : requested %d -> actual %d (CLAMPED: the requested KV cache "
+          "does not physically fit; see [ctx] CLAMPED ledger)\n",
+          requested, real_ctx);
+    } else {
+      std::printf("[serve] ctx        : requested %d -> actual %d (no clamp)\n", requested,
+                  real_ctx);
+    }
   }
   const double load_ms = ms_since(t_load0);
   std::printf("[serve] model ready: vocab=%d ctx=%d load=%.1f s\n", st.model->vocab(), st.ctx,
@@ -2160,18 +2206,53 @@ int run(const Options& opts) {
   // margin.  In the worst case the driver starts paging and decode collapses from
   // ~25 tok/s to 3-4 tok/s, which is much worse than failing fast: refuse to start
   // unless the operator explicitly allows oversubscription.
+  //
+  // Arbitrary-ctx contract: when a positive ctx was requested and the measured free
+  // VRAM misses the margin, do not just fail -- quantify a feasible ctx from the
+  // MEASURED free VRAM and the real KV bytes/token and return it as ctx_suggested so
+  // the caller can retry.  That makes the clamp physically justified ("only clamp when
+  // it does not fit") and reports requested -> actual on the retried start.
   if (!engine::config::get_bool("allow_oversubscribe")) {
     const size_t margin_bytes =
         static_cast<size_t>(engine::config::get_int("vram_margin_mb")) << 20;
     const cuda::MemInfo mem = cuda::mem_info();
     if (mem.free_bytes < margin_bytes) {
+      uint64_t kv_bpt = 0;
+      {
+        const std::string kvt = engine::config::get_string("kv_type");
+        int kv_type = 0;
+        if (kvt == "q8_0" || kvt == "q8" || kvt == "8") kv_type = 1;
+        else if (kvt == "q4_0" || kvt == "q4" || kvt == "4") kv_type = 2;
+        kv_bpt = placement::kv_bytes_per_token(st.model->ir(), kv_type);
+      }
+      const int64_t shortfall =
+          static_cast<int64_t>(margin_bytes) - static_cast<int64_t>(mem.free_bytes);
+      // 256 MiB of headroom for the measured estimate error (CUDA context/cuBLAS).
+      constexpr int64_t kSafety = 256ll << 20;
+      opts.ctx_suggested = 0;
+      if (opts.ctx > 0 && kv_bpt > 0) {
+        const int64_t reduce = (shortfall + kSafety + static_cast<int64_t>(kv_bpt) - 1) /
+                               static_cast<int64_t>(kv_bpt);
+        int suggested = static_cast<int>(std::max<int64_t>(1, st.ctx - reduce));
+        if (suggested >= st.ctx) suggested = std::max(1, st.ctx - std::max(1, st.ctx / 10));
+        opts.ctx_suggested = suggested;
+        std::fprintf(stderr,
+                     "[serve] ctx clamp  : requested %d -> %d measured-infeasible "
+                     "(free %.0f MiB after load < margin %zu MiB; KV %.2f KiB/token); "
+                     "suggested --ctx %d\n",
+                     st.ctx_requested, st.ctx,
+                     static_cast<double>(mem.free_bytes) / 1048576.0, margin_bytes >> 20,
+                     static_cast<double>(kv_bpt) / 1024.0, suggested);
+      }
       std::fprintf(stderr,
                    "[serve] ERROR: only %.0f MiB VRAM free after load, below the %zu MiB "
                    "margin: the CUDA driver will page and decode can collapse to a few "
                    "tok/s. Lower --ctx / --gpu-layers, free VRAM, or pass "
-                   "--allow-oversubscribe to start anyway.\n",
-                   static_cast<double>(mem.free_bytes) / 1048576.0, margin_bytes >> 20);
-      return 1;
+                   "--allow-oversubscribe to start anyway.%s\n",
+                   static_cast<double>(mem.free_bytes) / 1048576.0, margin_bytes >> 20,
+                   opts.ctx_suggested > 0 ? " Retrying is possible with the suggested ctx."
+                                          : "");
+      return opts.ctx_suggested > 0 ? 4 : 1;
     }
   }
 

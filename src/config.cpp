@@ -31,8 +31,11 @@ const OptionDef kDefs[] = {
      0, 0, "model path (.gguf file or safetensors directory)"},
     {"ctx", "ENGINE_CTX", "ctx", true, false, Type::Int, "256",
      0, 1 << 20,
-     "context length in tokens (max_seq; KV cache is sized from it); 0 = derive the "
-     "maximum that fits from free VRAM and the configured kv_type (ctx_auto)"},
+     "context length in tokens = hard total-sequence budget (prompt + generated; "
+     "KV cache is sized from it). Any integer 1..1048576 is accepted verbatim and is "
+     "only reduced when the KV cache physically does not fit free VRAM (the loader "
+     "prints the requested->actual ledger). 0 = auto: derive the largest length that "
+     "fits from free VRAM and the configured kv_type"},
     {"threads", "ENGINE_THREADS", "threads", true, false, Type::Int, "0",
      0, 4096, "CPU worker threads for MoE experts, 0 = auto: 2 x physical cores when SMT=2 "
      "topology is available (12 on a 6C/12T host, paired with win_affinity=2), else the "
@@ -394,7 +397,8 @@ const OptionDef kDefs[] = {
     {"serve_ctx", "ENGINE_SERVE_CTX", "serve-ctx", true, false, Type::Int, "0",
      0, 1 << 20,
      "context size used by `engine serve`; 0 = --ctx when given, else 4096 (KV is "
-     "allocated at startup, so this is the per-request prompt+generation limit)"},
+     "allocated at startup, so this is the per-request prompt+generation limit). "
+     "/props reports n_ctx (actual) and n_ctx_requested (0 = auto)"},
     {"default_max_tokens", "ENGINE_DEFAULT_MAX_TOKENS", "default-max-tokens", true, false,
      Type::Int, "1048576", 1, 1 << 20,
      "serve: max_tokens when the request does not set it (default = unlimited within ctx; "
