@@ -17,7 +17,9 @@ Also checks, with machine-readable evidence in build/launcher-evidence.json:
   * launcher.exe is a GUI-subsystem binary (no console window)
   * every `engine.exe serve --print-config --json` option has a control (100%)
   * tooltips are registered for the controls
-  * the GPU-layer / context sliders update the live estimate labels
+  * the GPU-layer slider and the editable arbitrary-context box (any positive
+    integer, not just presets) update the live estimate labels; an invalid context
+    value shows an error hint instead of silently launching
   * the SSD switch is disabled with a rationale when the model fits VRAM+RAM,
     becomes enabled when it does not, and warns that SSD streaming is unimplemented
   * a real start/stop of the 0.5B model through the UI (engine /health reachable)
@@ -104,7 +106,7 @@ gdi32.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
 IDS = {
     "model": 100, "refresh": 102, "model_info": 103, "scan_status": 104, "refresh": 102,
     "gpu_slider": 110, "gpu_auto": 111, "gpu_text": 112,
-    "ctx_slider": 120, "ctx_text": 121,
+    "ctx_slider": 120, "ctx_text": 121, "ctx_edit": 122, "ctx_auto": 123,
     "kv": 130, "kv_text": 131,
     "ssd": 140, "ssd_note": 141,
     "dev_route": 142, "layer_graph": 143, "cpu_int8": 144, "win_priority": 145,
@@ -118,6 +120,8 @@ IDS = {
 }
 IDC_ADV_BASE = 1000
 WM_COMMAND = 0x0111
+WM_SETTEXT = 0x000C
+WM_CHAR = 0x0102
 WM_VSCROLL = 0x0114
 WM_MOUSEWHEEL = 0x020A
 BN_CLICKED = 0
@@ -1117,11 +1121,29 @@ def main():
     time.sleep(0.3)
     print("[10] GPU slider live:", checks["live_gpu_slider"], "over-warning:", checks["over_vram_warning"])
 
-    # context slider + KV type affect the KV estimate
-    user32.SendMessageW(user32.GetDlgItem(hwnd, IDS["ctx_slider"]), WM_APP_SLIDER_SET, 2, 0)
-    time.sleep(0.5)
+    # context: editable arbitrary number box + log-scale slider + auto checkbox
+    edit = user32.GetDlgItem(hwnd, IDS["ctx_edit"])
+    slider = user32.GetDlgItem(hwnd, IDS["ctx_slider"])
+
+    def set_ctx_text(txt):
+        # WM_SETTEXT does not reliably notify the parent; send EN_CHANGE explicitly
+        user32.SendMessageW(edit, WM_SETTEXT, 0, ctypes.c_wchar_p(txt))
+        user32.SendMessageW(hwnd, WM_COMMAND,
+                            (EN_CHANGE << 16) | IDS["ctx_edit"], edit)
+
+    def type_ctx(txt):
+        set_ctx_text("")
+        for ch in txt:
+            user32.SendMessageW(edit, WM_CHAR, ord(ch), 0)
+
+    type_ctx("12345")  # arbitrary value, not one of the old presets
+    time.sleep(0.6)
+    ctx12345 = get_text(hwnd, "ctx_text")
+    evidence["ctx_text_12345"] = ctx12345
+    type_ctx("8192")
+    time.sleep(0.4)
     ctx8k = get_text(hwnd, "ctx_text")
-    user32.SendMessageW(user32.GetDlgItem(hwnd, IDS["ctx_slider"]), WM_APP_SLIDER_SET, 1, 0)
+    type_ctx("4096")
     time.sleep(0.4)
     ctx4k = get_text(hwnd, "ctx_text")
     kv_f32 = parse_mb(ctx4k, "KV 显存 ≈")
@@ -1129,15 +1151,42 @@ def main():
     time.sleep(0.5)
     kv_q4_text = get_text(hwnd, "ctx_text")
     kv_q4 = parse_mb(kv_q4_text, "KV 显存 ≈")
+    # invalid input (empty box) must show the red hint, not silently launch
+    set_ctx_text("")
+    time.sleep(0.5)
+    ctx_bad = get_text(hwnd, "ctx_text")
+    evidence["ctx_text_invalid"] = ctx_bad
+    # slider is the coarse helper: position 500 maps into the log range (not 4096)
+    set_ctx_text("4096")
+    time.sleep(0.3)
+    user32.SendMessageW(slider, WM_APP_SLIDER_SET, 500, 0)
+    time.sleep(0.5)
+    ctx_slider = get_text(hwnd, "ctx_text")
+    evidence["ctx_text_slider500"] = ctx_slider
+    # auto checkbox -> engine "--ctx 0" path, then back to manual 4096 for the start test
+    command(hwnd, "ctx_auto")
+    time.sleep(0.5)
+    ctx_auto_text = get_text(hwnd, "ctx_text")
+    evidence["ctx_text_auto"] = ctx_auto_text
+    command(hwnd, "ctx_auto")
+    time.sleep(0.4)
+    type_ctx("4096")
+    time.sleep(0.4)
     evidence["ctx_text_8192"] = ctx8k
     evidence["ctx_text_4096_f32"] = ctx4k
     evidence["ctx_text_4096_q4"] = kv_q4_text
+    checks["ctx_editable_arbitrary"] = bool(
+        "12345 tokens" in ctx12345 and "可输入任意整数" in ctx12345)
     checks["ctx_slider_live"] = ("8192 tokens" in ctx8k) and ("4096 tokens" in ctx4k)
+    checks["ctx_invalid_hint"] = "必须是" in ctx_bad
+    checks["ctx_slider_maps_value"] = ("tokens" in ctx_slider and
+                                       "4096 tokens" not in ctx_slider)
+    checks["ctx_auto_toggle"] = "自动" in ctx_auto_text
     checks["kv_quant_estimate"] = kv_f32 is not None and kv_q4 is not None and kv_q4 < kv_f32
     combo_select(hwnd, "kv", 0)  # back to f32
     time.sleep(0.4)
-    print("[11] ctx/kv:", checks["ctx_slider_live"], checks["kv_quant_estimate"],
-          (kv_f32, kv_q4))
+    print("[11] ctx/kv:", checks["ctx_editable_arbitrary"], checks["ctx_slider_live"],
+          checks["ctx_invalid_hint"], (kv_f32, kv_q4))
 
     # ---- [11b] existing engine guard: never start a second instance ----------
     ext = subprocess.Popen([ENGINE, "serve",

@@ -44,6 +44,7 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -906,6 +907,8 @@ enum : int {
   IDC_GPU_TEXT = 112,
   IDC_CTX_SLIDER = 120,
   IDC_CTX_TEXT = 121,
+  IDC_CTX_EDIT = 122,
+  IDC_CTX_AUTO = 123,
   IDC_KV_COMBO = 130,
   IDC_KV_TEXT = 131,
   IDC_SSD_TOGGLE = 140,
@@ -1060,7 +1063,10 @@ struct UiState {
   bool model_auto = true;    // first combo item: --model auto (largest model)
   bool gpu_auto = true;      // gpu_layers = -1
   int gpu_layers = 0;        // explicit layer count (0..n_moe)
-  int ctx_slot = 1;          // 0 = auto, else index into kCtxPresets
+  // Context length is freely editable: any positive integer 1..kCtxMax.
+  bool ctx_auto = false;     // auto = derive the largest length that fits free VRAM
+  int ctx_value = 4096;      // manual value (mirrors the edit box)
+  bool ctx_invalid = false;  // edit box currently holds something that is not 1..kCtxMax
   int kv_sel = 0;            // 0 f32 / 1 q8_0 / 2 q4_0
   bool ssd = false;
   bool dev_route = true;
@@ -1084,10 +1090,25 @@ struct UiState {
 };
 UiState g_ui;
 
-const int kCtxPresets[] = {0, 4096, 8192, 16384, 32768, 65536, 131072};
-const wchar_t* const kCtxNames[] = {L"自动", L"4096", L"8192", L"16384", L"32768", L"65536",
-                                    L"131072"};
-constexpr int kCtxSlotCount = static_cast<int>(sizeof(kCtxPresets) / sizeof(kCtxPresets[0]));
+// Arbitrary context length: the edit box is the precise input; the slider is a
+// log-scale helper covering the whole legal range 1..1,048,576 (the engine's own
+// config bound).  Log scale keeps useful resolution where people actually pick
+// values (512..131072) instead of wasting 99% of the travel above 300k.
+constexpr int kCtxMax = 1 << 20;
+constexpr int kCtxSliderSteps = 1000;
+int ctx_from_slider(int pos) {
+  const double steps = static_cast<double>(kCtxSliderSteps);
+  const double t = static_cast<double>(std::max(0, std::min(kCtxSliderSteps, pos))) / steps;
+  const double v = std::pow(static_cast<double>(kCtxMax), t);
+  return std::max(1, std::min(kCtxMax, static_cast<int>(std::llround(v))));
+}
+int ctx_to_slider(int value) {
+  if (value <= 1) return 0;
+  const double steps = static_cast<double>(kCtxSliderSteps);
+  const double v = static_cast<double>(std::max(1, std::min(kCtxMax, value)));
+  const double p = std::log(v) / std::log(static_cast<double>(kCtxMax)) * steps;
+  return std::max(0, std::min(kCtxSliderSteps, static_cast<int>(std::llround(p))));
+}
 const wchar_t* const kKvNames[] = {L"f32（默认，精度最高）", L"q8_0（省 4 倍显存）",
                                    L"q4_0（省 8 倍显存）"};
 const wchar_t* const kKvShort[] = {L"f32", L"q8_0", L"q4_0"};
@@ -1193,6 +1214,7 @@ struct Estimate {
   int max_fit_layers = 0;
   int ctx_used = 0;
   int auto_ctx = 0;
+  int ctx_fit = 0;   // largest ctx that fits the VRAM budget
   bool ctx_auto = false;
   int kv_type_used = 0;
   uint64_t kv_per_token = 0;
@@ -1251,9 +1273,10 @@ Estimate compute_estimate() {
   }
   e.kv_type_used = kv_type;
   e.kv_per_token = g_meta.kv_per_token[kv_type];
-  e.ctx_auto = kCtxPresets[g_ui.ctx_slot] == 0;
+  e.ctx_auto = g_ui.ctx_auto;
   e.auto_ctx = auto_ctx_estimate(e.vram_free, e.vram_reserve, kv_type);
-  e.ctx_used = e.ctx_auto ? e.auto_ctx : kCtxPresets[g_ui.ctx_slot];
+  e.ctx_fit = e.auto_ctx;
+  e.ctx_used = e.ctx_auto ? e.auto_ctx : g_ui.ctx_value;
   if (e.ctx_used <= 0) e.ctx_used = 4096;
   e.kv = e.kv_per_token * static_cast<uint64_t>(e.ctx_used);
   e.need_fixed = e.fixed + e.kv + e.workspace;
@@ -1318,7 +1341,9 @@ void sync_state_from_schema() {
   g_ui.cpu_int8 = static_cast<int>(opt_int("cpu_int8", 1));
   g_ui.win_priority = static_cast<int>(opt_int("win_priority", 1));
   g_ui.unlimited_tokens = opt_int("default_max_tokens", 1048576) >= 1048576;
-  g_ui.ctx_slot = 1;
+  g_ui.ctx_auto = false;
+  g_ui.ctx_value = 4096;
+  g_ui.ctx_invalid = false;
   g_ui.gpu_auto = true;
   g_ui.gpu_layers = 0;
 }
@@ -1379,7 +1404,7 @@ LaunchSpec build_launch_spec(bool write_cfg = true) {
   else cmd += L" --model " + quote_arg(model);
   cmd += L" --host " + quote_arg(g_ui.host);
   cmd += L" --port " + wnum(g_ui.port);
-  const int ctx = kCtxPresets[g_ui.ctx_slot];
+  const int ctx = g_ui.ctx_auto ? 0 : g_ui.ctx_value;
   cmd += L" --ctx " + wnum(ctx);
   cmd += std::wstring(L" --kv-type ") + kKvShort[g_ui.kv_sel];
   cmd += L" --gpu-layers " + wnum(g_ui.gpu_auto ? -1 : g_ui.gpu_layers);
@@ -1440,8 +1465,13 @@ LaunchSpec build_launch_spec(bool write_cfg = true) {
   spec.cmdline = cmd;
   spec.model_index = g_ui.model_auto ? 0 : g_ui.model_index;
 
+  std::wstring ctx_text;
+  if (ctx == 0)
+    ctx_text = g_est.auto_ctx > 0 ? (L"自动→" + wnum(g_est.auto_ctx)) : std::wstring(L"自动");
+  else
+    ctx_text = wnum(ctx);
   spec.summary = L"模型 " + current_model_label() + L" · 端口 " + wnum(g_ui.port) + L" · ctx " +
-                 (ctx == 0 ? std::wstring(L"自动") : wnum(ctx)) + L" · KV " +
+                 ctx_text + L" · KV " +
                  widen(kKvKeys[g_ui.kv_sel]) + L" · GPU层 " +
                  (g_ui.gpu_auto ? std::wstring(L"自动") : wnum(g_ui.gpu_layers)) + L" · 线程 " +
                  (g_ui.threads_auto ? std::wstring(L"自动") : wnum(g_ui.threads)) +
@@ -1472,7 +1502,10 @@ HWND g_gpu_slider = nullptr;
 HWND g_gpu_auto = nullptr;
 HWND g_gpu_text = nullptr;
 HWND g_ctx_slider = nullptr;
+HWND g_ctx_edit = nullptr;
+HWND g_ctx_auto = nullptr;
 HWND g_ctx_text = nullptr;
+bool g_ctx_sync = false;  // suppress EN_CHANGE while update_ctx_controls writes the box
 HWND g_kv_combo = nullptr;
 HWND g_kv_text = nullptr;
 HWND g_ssd_toggle = nullptr;
@@ -2220,27 +2253,59 @@ void update_gpu_controls() {
 
 void update_ctx_controls() {
   if (g_ctx_slider == nullptr) return;
-  slider_range(g_ctx_slider, 0, kCtxSlotCount - 1);
-  slider_set(g_ctx_slider, g_ui.ctx_slot, false);
-  slider_ticks(g_ctx_slider, kCtxSlotCount);
-  std::wstring text;
-  if (!g_meta.loaded) {
-    SetWindowTextW(g_ctx_text, L"（选择模型后显示 KV 显存估算）");
+  const bool loaded = g_meta.loaded;
+  const bool manual = loaded && !g_ui.ctx_auto;
+  const int shown = g_ui.ctx_auto ? (g_est.auto_ctx > 0 ? g_est.auto_ctx : 4096) : g_ui.ctx_value;
+  slider_range(g_ctx_slider, 0, kCtxSliderSteps);
+  slider_ticks(g_ctx_slider, 0);
+  slider_set(g_ctx_slider, ctx_to_slider(shown), false);
+  EnableWindow(g_ctx_slider, manual ? TRUE : FALSE);
+  if (g_ctx_edit != nullptr) {
+    EnableWindow(g_ctx_edit, manual ? TRUE : FALSE);
+    // Only rewrite the box when it does not already show the value we are about to
+    // display (auto numbers always rewrite; user input is never disturbed mid-typing).
+    wchar_t cur[32] = {0};
+    GetWindowTextW(g_ctx_edit, cur, 32);
+    long long cur_v = 0;
+    const bool cur_ok = parse_ll(cur, &cur_v);
+    if (!g_ui.ctx_invalid && (!manual || !cur_ok || cur_v != shown)) {
+      g_ctx_sync = true;
+      SetWindowTextW(g_ctx_edit, wnum(shown).c_str());
+      g_ctx_sync = false;
+    }
+  }
+  if (g_ctx_auto != nullptr) toggle_set(g_ctx_auto, g_ui.ctx_auto);
+  if (!loaded) {
+    SetWindowTextW(g_ctx_text, L"（选择模型后显示 KV 显存估算；可输入任意正整数，如 1000 / 12345）");
     set_label_role(g_ctx_text, Role::Dim);
     return;
   }
-  if (g_est.ctx_auto) {
+  if (g_ui.ctx_invalid) {
+    SetWindowTextW(g_ctx_text,
+                   L"⚠ 上下文长度必须是 1..1048576 的整数（任意值均可；当前输入不能启动）");
+    set_label_role(g_ctx_text, Role::Danger);
+    return;
+  }
+  std::wstring text;
+  if (g_ui.ctx_auto) {
     text = L"自动：预计最多 " + wnum(g_est.ctx_used) + L" tokens（由空闲显存推导；按 KV " +
            kKvShort[g_est.kv_type_used] + std::wstring(L" 计算）");
   } else {
-    text = wnum(g_est.ctx_used) + L" tokens";
+    text = L"手动 " + wnum(g_est.ctx_used) + L" tokens";
   }
   text += L" · KV 显存 ≈ " + fmt_size(g_est.kv) + L"（每 token " +
           fmt_size(g_est.kv_per_token) + L"）· 权重+KV+工作区 ≈ " +
           fmt_size(g_est.need_fixed) + L" / 可用 " + fmt_size(g_est.vram_usable);
+  bool danger = g_est.need_fixed > g_est.vram_usable;
+  if (!g_ui.ctx_auto && g_est.ctx_fit > 0 && g_est.ctx_used > g_est.ctx_fit) {
+    text += L"  ⚠ 超过当前显存可容纳的 " + wnum(g_est.ctx_fit) +
+            L" tokens：引擎实测放不下时会自动夹紧并打印 requested→actual 账目";
+    danger = true;
+  }
   if (g_est.mla_kv_forced_f32) text += L" · MLA 模型强制 f32 KV";
+  text += L" · 可输入任意整数（1..1048576）";
   SetWindowTextW(g_ctx_text, text.c_str());
-  set_label_role(g_ctx_text, g_est.need_fixed > g_est.vram_usable ? Role::Danger : Role::Normal);
+  set_label_role(g_ctx_text, danger ? Role::Danger : Role::Normal);
 }
 
 void update_kv_hint() {
@@ -2476,6 +2541,7 @@ HWND g_preset_note = nullptr;
 bool is_toggle_id(UINT id) {
   switch (id) {
     case IDC_GPU_AUTO:
+    case IDC_CTX_AUTO:
     case IDC_SSD_TOGGLE:
     case IDC_DEV_ROUTE:
     case IDC_LAYER_GRAPH:
@@ -2499,7 +2565,7 @@ bool is_toggle_id(UINT id) {
 }
 
 bool is_checkbox_style(UINT id) {
-  if (id == IDC_GPU_AUTO) return true;
+  if (id == IDC_GPU_AUTO || id == IDC_CTX_AUTO) return true;
   if (id < IDC_ADV_BASE) return false;
   const auto it = g_adv_id_to_opt.find(id);
   return it != g_adv_id_to_opt.end();
@@ -2668,6 +2734,8 @@ void create_main_controls() {
   g_gpu_slider = mk_slider(g_hwnd, IDC_GPU_SLIDER);
   g_gpu_text = mk_static(g_hwnd, L"", IDC_GPU_TEXT, Role::Dim, 0, g_font_small);
   g_label_ctx = mk_static(g_hwnd, L"上下文长度", 0, Role::Normal, 0, g_font);
+  g_ctx_edit = mk_edit(g_hwnd, wnum(g_ui.ctx_value), IDC_CTX_EDIT, ES_NUMBER);
+  g_ctx_auto = mk_toggle(g_hwnd, L"自动（按空闲显存推导）", IDC_CTX_AUTO);
   g_ctx_slider = mk_slider(g_hwnd, IDC_CTX_SLIDER);
   g_ctx_text = mk_static(g_hwnd, L"", IDC_CTX_TEXT, Role::Dim, 0, g_font_small);
   g_label_kv = mk_static(g_hwnd, L"KV 量化", 0, Role::Normal, 0, g_font);
@@ -2765,6 +2833,11 @@ void create_main_controls() {
   add_tip(g_gpu_auto, tip_for("gpu_layers", L"") + L"\n自动 = 引擎按实测空闲显存逐层放置（--gpu-layers -1）");
   add_tip(g_label_ctx, tip_for("ctx", L""));
   add_tip(g_ctx_slider, tip_for("ctx", L""));
+  add_tip(g_ctx_edit,
+          L"直接输入任意上下文长度（1..1048576 tokens，KV 按它分配）。"
+          L"引擎只在显存物理放不下时才夹紧，并在日志打印 requested→actual 账目；"
+          L"/props 的 n_ctx_requested / actual_ctx 也可查询。");
+  add_tip(g_ctx_auto, L"勾选后由空闲显存自动推导最大可用 ctx（等价 --ctx 0）。");
   add_tip(g_label_kv, tip_for("kv_type", L""));
   add_tip(g_kv_combo, tip_for("kv_type", L""));
   add_tip(g_label_threads, tip_for("threads", L""));
@@ -2847,7 +2920,7 @@ void sync_controls_from_state() {
   }
   toggle_set(g_gpu_auto, g_ui.gpu_auto);
   slider_set(g_gpu_slider, g_ui.gpu_auto ? g_est.gpu_layers_auto : g_ui.gpu_layers, false);
-  slider_set(g_ctx_slider, g_ui.ctx_slot, false);
+  update_ctx_controls();
   SendMessageW(g_kv_combo, CB_SETCURSEL, static_cast<WPARAM>(g_ui.kv_sel), 0);
   toggle_set(g_ssd_toggle, g_ui.ssd);
   toggle_set(g_dev_route, g_ui.dev_route);
@@ -2885,7 +2958,9 @@ void sync_controls_from_state() {
 void apply_preset(int kind) {
   if (kind == 0) {  // 最快
     g_ui.gpu_auto = true;
-    g_ui.ctx_slot = 1;
+    g_ui.ctx_auto = false;
+    g_ui.ctx_value = 4096;
+    g_ui.ctx_invalid = false;
     g_ui.kv_sel = 0;
     g_ui.dev_route = true;
     g_ui.layer_graph_auto = true;
@@ -2900,7 +2975,9 @@ void apply_preset(int kind) {
   } else if (kind == 1) {  // 最省显存
     g_ui.gpu_auto = false;
     g_ui.gpu_layers = 0;
-    g_ui.ctx_slot = 1;
+    g_ui.ctx_auto = false;
+    g_ui.ctx_value = 4096;
+    g_ui.ctx_invalid = false;
     g_ui.kv_sel = 2;
     g_ui.dev_route = true;
     g_ui.layer_graph_auto = true;
@@ -2914,7 +2991,9 @@ void apply_preset(int kind) {
     g_ui.preset_note = L"已应用「最省显存」：KV q4_0、GPU 专家层 0（MoE 专家全部走 CPU）、ctx 4096";
   } else {  // 平衡
     g_ui.gpu_auto = true;
-    g_ui.ctx_slot = 2;
+    g_ui.ctx_auto = false;
+    g_ui.ctx_value = 8192;
+    g_ui.ctx_invalid = false;
     g_ui.kv_sel = 1;
     g_ui.dev_route = true;
     g_ui.layer_graph_auto = true;
@@ -3456,9 +3535,11 @@ int layout_content(bool apply, bool scroll_visible) {
     y += rowH + S(4);
     place(g_gpu_text, M, y, contentW, S(22));
     y += S(22) + S(10);
-    // context
+    // context: [label] [editable number] [auto] [log-scale slider]
     place(g_label_ctx, M, y + S(3), labelW, S(22));
-    place(g_ctx_slider, M + labelW, y, contentW - labelW, rowH);
+    place(g_ctx_edit, M + labelW, y, S(118), rowH);
+    place(g_ctx_auto, M + labelW + S(128), y, S(228), rowH);
+    place(g_ctx_slider, M + labelW + S(366), y, contentW - labelW - S(366), rowH);
     y += rowH + S(4);
     place(g_ctx_text, M, y, contentW, S(22));
     y += S(22) + S(10);
@@ -3900,6 +3981,21 @@ void start_engine() {
     MessageBoxW(g_hwnd, L"请先选择模型", L"启动失败", MB_ICONINFORMATION);
     return;
   }
+  if (!g_ui.ctx_auto) {
+    long long ctx_v = 0;
+    wchar_t buf[32] = {0};
+    if (g_ctx_edit != nullptr) GetWindowTextW(g_ctx_edit, buf, 32);
+    if (!parse_ll(buf, &ctx_v) || ctx_v < 1 || ctx_v > kCtxMax) {
+      MessageBoxW(g_hwnd,
+                  L"上下文长度必须是 1..1048576 之间的整数（任意值都可以，例如\n"
+                  L"1 / 1000 / 12345 / 32768 / 131072 / 262144）。\n"
+                  L"输入框标红时不能启动；留空或非法字符也会被拒绝。",
+                  L"启动失败", MB_ICONERROR);
+      return;
+    }
+    g_ui.ctx_value = static_cast<int>(ctx_v);
+    g_ui.ctx_invalid = false;
+  }
   if (!resolve_existing_engine_before_start()) return;
   if (g_ui.ssd) {
     const int rc = MessageBoxW(g_hwnd,
@@ -4263,6 +4359,21 @@ void on_advanced_control_changed(int ctrl_id, int code) {
 }
 
 void on_edit_changed(int ctrl_id) {
+  if (ctrl_id == IDC_CTX_EDIT) {
+    if (g_ctx_sync) return;
+    wchar_t buf[32] = {0};
+    GetWindowTextW(g_ctx_edit, buf, 32);
+    long long v = 0;
+    const bool ok = parse_ll(buf, &v) && v >= 1 && v <= kCtxMax;
+    g_ui.ctx_invalid = !ok;
+    if (ok) {
+      g_ui.ctx_value = static_cast<int>(v);
+      g_ui.ctx_auto = false;
+    }
+    refresh_estimates(true);
+    update_args_summary();
+    return;
+  }
   if (ctrl_id == IDC_PORT_EDIT) {
     wchar_t buf[64] = {0};
     GetWindowTextW(g_port_edit, buf, 64);
@@ -4317,6 +4428,14 @@ void on_command(int id, int code, HWND ctrl) {
         const int sel = static_cast<int>(SendMessageW(g_kv_combo, CB_GETCURSEL, 0, 0));
         g_ui.kv_sel = std::max(0, std::min(2, sel));
         update_kv_hint();
+        refresh_estimates(true);
+        update_args_summary();
+      }
+      return;
+    case IDC_CTX_AUTO:
+      if (code == BN_CLICKED) {
+        g_ui.ctx_auto = toggle_flip(g_ctx_auto);
+        g_ui.ctx_invalid = false;
         refresh_estimates(true);
         update_args_summary();
       }
@@ -4512,7 +4631,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         refresh_estimates(true);
         update_args_summary();
       } else if (id == IDC_CTX_SLIDER) {
-        g_ui.ctx_slot = std::max(0, std::min(kCtxSlotCount - 1, pos));
+        g_ui.ctx_auto = false;
+        g_ui.ctx_invalid = false;
+        g_ui.ctx_value = ctx_from_slider(pos);
         refresh_estimates(true);
         update_args_summary();
       }
@@ -4670,11 +4791,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     } else if (a == L"--ctx") {
       const std::wstring v = next(L"--ctx");
       long long n = 0;
-      if (parse_ll(v, &n) && n >= 0) {
-        for (int k = 1; k < kCtxSlotCount; ++k)
-          if (kCtxPresets[k] == n) cli_ctx = k;
-        if (cli_ctx < 0) cli_ctx = 1;
-      }
+      if (parse_ll(v, &n) && n >= 0 && n <= kCtxMax) cli_ctx = static_cast<int>(n);
     } else if (a == L"--no-browser") {
       cli_auto_browser = false;
     } else if (a == L"--engine") {
@@ -4696,7 +4813,15 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
   load_schema();
   sync_state_from_schema();
   if (cli_port > 0) g_ui.port = cli_port;
-  if (cli_ctx >= 0) g_ui.ctx_slot = cli_ctx;
+  if (cli_ctx >= 0) {
+    if (cli_ctx == 0) {
+      g_ui.ctx_auto = true;
+    } else {
+      g_ui.ctx_auto = false;
+      g_ui.ctx_value = cli_ctx;
+    }
+    g_ui.ctx_invalid = false;
+  }
   g_ui.auto_browser = cli_auto_browser;
 
   WNDCLASSEXW wc{};
