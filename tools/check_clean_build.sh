@@ -56,7 +56,8 @@ cleanup() {
 trap cleanup EXIT
 
 rm -rf "$WT"
-echo "[gate] HEAD=$REF  worktree=$WT${QUICK:+ (quick)}"
+MODE_LABEL=""; [ "$QUICK" = "1" ] && MODE_LABEL=" (quick build-only)"
+echo "[gate] HEAD=$REF  worktree=$WT$MODE_LABEL"
 git worktree add --detach "$WT" HEAD >/dev/null 2>&1 || { echo "[gate] cannot create worktree"; exit 1; }
 cd "$WT" || exit 1
 

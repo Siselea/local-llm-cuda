@@ -172,3 +172,29 @@ s=socket.create_connection(("127.0.0.1",PORT)); s.sendall(b"POST /v1/chat/comple
    截断都覆盖；合法序列原样透传），保证任何响应在严格客户端都可解析。
 回归测试：`tests/test_json_utf8.cpp`（7 类非法/合法序列，build.sh 构建，`tools/check_clean_build.sh` 执行）；
 `tools/serve_edge_cases.py` 新增 **K1**（0.5B/9B 26/26 PASS，非流式 JSON 严格解码+解析）。
+
+
+## v0.1.6 hotfix 验收（2026-11-22 19:00，HEAD `d623cda`）
+
+### 完整 clean-build gate（新 HEAD，含 UTF-8 修复 + 各 agent 文档）
+`tools/check_clean_build.sh`（MODEL_DIR=/d/p0/models）输出
+**`CLEAN BUILD GATE GREEN: d623cda is ready to tag`**（gate_rc=0）：
+build.sh OK、verify **ALL GREEN**、smoke **OK**、**gen_regression GREEN**、generality **GREEN**、
+verify_serve **GREEN**、JSON UTF-8 unit test **GREEN**。日志 `build/logs/full_gate_v016.log`。
+
+### 真实浏览器 stop+thinking e2e（headless Edge + webui 页面内 fetch）
+`build/run_stop_e2e.py` + `tools/serve_stop_e2e.py --skip-ui`（页面 fetch 非流式，规避 CDP 对
+页面内 SSE 读取的挂起）：
+- 200，耗时 4.6 s，文本 630 字，**`</think>` 存在**、其后 content = `"2"`（非空）、stop `zzz` 未出现 ✓
+- 证据：`build/logs/e2e_stop/result.json` + `01_webui.png` / `02_stop_thinking_done.png`
+  （上一版工具在 UI 流式 settle 上会挂住 → 已改为 UI 轮可选 + 非流式 fetch）。
+
+### prewarm ON/OFF（9B ctx4096，2 次交错，独立 GPU）
+| | startup（中位） | req0 prefill | req1 prefill |
+|---|---|---|---|
+| prewarm ON | **15.92 s** | **429 ms** | 428 ms |
+| prewarm OFF（`ENGINE_NO_PREWARM=1`） | **15.16 s** | **495 ms** | 428 ms |
+
+⇒ 预热（pw_chunk=1024）成本 **+0.76 s 启动**，仅省 **~66 ms** 冷首请求 prefill；本机页面缓存热时收益有限
+（此前 chunk 1024 老代码测到 +0.44 s / −0.5 s，属不同工况）。建议：**默认保持开启但 pw_chunk 可再降到 256/512**，
+或在 launcher 里做成可选；数据存 `build/logs/prewarm_ab.json`。
