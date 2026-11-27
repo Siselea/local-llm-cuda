@@ -5,7 +5,7 @@
 [![build](https://github.com/Siselea/local-llm-cuda/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Siselea/local-llm-cuda/actions/workflows/build.yml)
 
 > **不想自己编译？** 从 [Releases 最新版](https://github.com/Siselea/local-llm-cuda/releases/latest)
-> 下载 Windows x64 zip（当前 **v0.1.8**：engine.exe + launcher.exe + 启动脚本 +
+> 下载 Windows x64 zip（当前 **v0.1.9**：engine.exe + launcher.exe + 启动脚本 +
 > **官方 llama.cpp 聊天界面 `webui/index.html`（MIT）**，不含模型）。
 > 从源码构建时可用 `bash tools/fetch_webui.sh` 获取。
 
