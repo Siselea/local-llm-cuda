@@ -9,7 +9,7 @@ B. slow reader: send a large /tokenize response, read only the headers, and meas
    server, or does it need non-blocking writes + timeout?".
 
 Usage:
-  MODEL_DIR=D:/p0/models python build/http_shutdown_send_probe.py --binary build/engine.exe
+  MODEL_DIR=/path/to/models python build/http_shutdown_send_probe.py --binary build/engine.exe
 Writes build/logs/http_shutdown_send.json.
 """
 from __future__ import annotations
@@ -55,7 +55,10 @@ def server_pid(port):
 
 
 def start_server(binary, port):
-    model = str(Path(os.environ.get("MODEL_DIR") or "D:/p0/models") / MODEL)
+    d = os.environ.get("MODEL_DIR", "")
+    if not d:
+        raise SystemExit("set MODEL_DIR to your models directory")
+    model = str(Path(d) / MODEL)
     log = open(f"build/logs/http_probe_server_{port}.log", "w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen(
         [binary, "serve", model, "--host", "127.0.0.1", "--port", str(port),

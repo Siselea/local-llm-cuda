@@ -10,7 +10,7 @@ B. shutdown races:
    - after shutdown: port closed, process exit code, VRAM released
 
 Usage:
-  MODEL_DIR=D:/p0/models python build/rst_shutdown_test.py [--binary build/engine.exe]
+  MODEL_DIR=/path/to/models python build/rst_shutdown_test.py [--binary build/engine.exe]
 Writes build/logs/rst_shutdown.json.
 """
 from __future__ import annotations
@@ -31,7 +31,9 @@ DEFAULT_MODEL = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
 
 
 def model_path():
-    d = os.environ.get("MODEL_DIR") or "D:/p0/models"
+    d = os.environ.get("MODEL_DIR", "")
+    if not d:
+        raise SystemExit("set MODEL_DIR to your models directory")
     return str(Path(d) / DEFAULT_MODEL)
 
 

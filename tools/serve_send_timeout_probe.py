@@ -3,7 +3,7 @@
 how long /health (another connection) takes to get served.  Decides whether the
 accepted socket inherits the listening socket's 30 s SO_SNDTIMEO or can block forever.
 
-Usage: MODEL_DIR=D:/p0/models python build/send_timeout_bound.py
+Usage: MODEL_DIR=/path/to/models python build/send_timeout_bound.py
 """
 from __future__ import annotations
 
@@ -34,7 +34,10 @@ def health(timeout):
 
 def main():
     env = dict(os.environ)
-    model = str(Path(os.environ.get("MODEL_DIR") or "D:/p0/models") / MODEL)
+    d = os.environ.get("MODEL_DIR", "")
+    if not d:
+        raise SystemExit("set MODEL_DIR to your models directory")
+    model = str(Path(d) / MODEL)
     log = open("build/logs/send_timeout_server.log", "w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen([BIN, "serve", model, "--host", "127.0.0.1", "--port", str(PORT),
                              "--ctx", "256", "--gpu-layers", "0", "--threads", "4",
