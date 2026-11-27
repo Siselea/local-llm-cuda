@@ -143,7 +143,7 @@ Q5_K 12288x4096  = q5k_dp4a_s
 | `layer_graph` | `--layer-graph` | `ENGINE_LAYER_GRAPH` | bool | `false` | 实验性逐层 Graph（默认关闭） |
 | `layer_graph_auto` | `--layer-graph-auto` | `ENGINE_LAYER_GRAPH_AUTO` | bool | `true` | qwen35 MoE 层的 attention/mixer 段逐层 CUDA Graph：每层 ~15 个 kernel 压成 1 次 `cuGraphLaunch`（WDDM 上每次提交 10–20 µs，实测 GPU 层 0.275→0.199 ms）。懒捕获：首次 decode 形状调用正常执行**并在同一次调用内立即录制**（即录制发生在 prefill 里、不进 decode 计时窗口），之后重放 |
 | `cpu_layer_graph` | `--cpu-layer-graph` | `ENGINE_NO_CPU_LAYER_GRAPH`（反转） | bool | `true` | CPU 驻留 MoE 层也录制 attention/mixer 段的逐层 Graph：每层少 ~7 次 WDDM 提交，35B 上 ~1.6 ms/token。早期实测"净变慢"是因为一次性录制落在 decode 计时窗口内；把录制挪到首次执行之后（prefill 内）后净收益为正 |
-| `dev_route` | `--dev-route` | `ENGINE_NO_DEV_ROUTE`（反转）/ `ENGINE_DEV_ROUTE`（强制开） | bool | `true` | GPU 驻留层用设备端路由：省掉每层 router D2H + host 同步 + 路由表 H2D；专家的量化布局里含 `Q5_1` 时自动关闭（该分支数值未验证） |
+| `dev_route` | `--dev-route` | `ENGINE_NO_DEV_ROUTE`（反转）/ `ENGINE_DEV_ROUTE`（强制开） | bool | `true` | GPU 驻留层用设备端路由：省掉每层 router D2H + host 同步 + 路由表 H2D；专家的量化布局里含 `Q5_1` 时自动关闭（该分支数值未验证）。**>256 专家（Kimi-K2 384 等）：加载期接受（上限 4096）但 device router 自动禁用，走通用 host 路由（正确，每层多一次 host round-trip，见 `docs/reports/LARGE-EXPERT-COUNT-PLAN.md`）** |
 | `mla_no_graph` | `--mla-no-graph` | `ENGINE_MLA_NO_GRAPH` | bool | `false` | MLA 模型禁用 Graph（保留历史规则） |
 | `tail_zero_copy` | `--no-tail-zc` | `ENGINE_NO_TAIL_ZC` | bool | `true` | CPU 层 tail：`add_three_inplace` 直接读**mapped pinned**（设备可寻址）的 host 专家部分和（零拷贝 PCIe 读），省掉一次 pinned H2D 拷贝 + 依赖 kernel 的 ~25–35 µs/层 |
 | `cpu_dual_stream` | `--no-cpu-dual-stream` | `ENGINE_NO_CPU_DUAL_STREAM` | bool | `true` | CPU 驻留层的共享专家块放到第二条 stream，与 host routed 专家 GEMV **并发**（该块只依赖 `hn_` 和固定权重，与路由无关）：GPU 工作被 GEMV 窗口（~0.6 ms/层）藏住，主流在 add3 之前 join；kernel 序列与加法次序不变 |

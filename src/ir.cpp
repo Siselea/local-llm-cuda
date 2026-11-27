@@ -600,10 +600,19 @@ std::vector<std::string> validate(Model& m) {
                          " is parsed but not implemented by the kernels: full attention is "
                          "used, so the KV cache is larger than the model requires");
   if (m.moe.n_expert > 0) {
-    if (m.moe.n_expert > 256)
+    // The device-side router (moe_route) formats its routing probabilities in 256 slots
+    // of shared memory; wider expert tables are served by the host router instead (one
+    // host round-trip per MoE layer/token, correct but slower).  Refuse only absurdly
+    // large tables that the host router/logits buffer cannot sensibly hold.
+    if (m.moe.n_expert > 4096) {
       errs.push_back("expert_count " + std::to_string(m.moe.n_expert) +
-                     " > 256: the device-side MoE router kernel only supports up to 256 "
-                     "experts; this model architecture is not supported");
+                     " > 4096: beyond the supported expert-table size");
+    } else if (m.moe.n_expert > 256) {
+      m.warnings.push_back(
+          "expert_count " + std::to_string(m.moe.n_expert) +
+          " > 256: the device-side router is disabled for this model; host-side routing "
+          "is used (correct, slower by one host round-trip per MoE layer)");
+    }
     if (m.moe.n_expert_used <= 0)
       errs.push_back("expert_used_count missing/0 (MoE top-k unknown)");
     else if (m.moe.n_expert_used > m.moe.n_expert)
