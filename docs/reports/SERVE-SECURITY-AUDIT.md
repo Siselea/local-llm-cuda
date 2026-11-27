@@ -1,7 +1,7 @@
 # SERVE 安全与健壮性审计（HTTP / serve / tokenizer）
 
 日期：2026-11-27　范围：`src/serve.cpp`、`src/http_server.cpp`、`src/json_parse.cpp`、`src/sampler.cpp`、`src/tokenizer.cpp`、`include/engine/text_util.h`、`src/main.cpp`
-基线：v0.1.7 源码归档（`D:/v017_src/lingshi`，与 tag 一致）+ 当日修复后的 `dd1c61d`
+基线：v0.1.7 tag 源码归档（本机校验，与 tag 一致）+ 当日修复后的 `dd1c61d`
 修复 commit：**`68270dc`**（tokenizer/HTTP/数值/UTF-8）　相关既有修复：`e0f79d3`（JSON 嵌套深度，generalize）、`c1df298`（非流式 JSON U+FFFD 清洗）
 方法：静态审计 + 原始 socket 构造 + 纯 HTTP/JSON fuzz + 0.5B serve（默认 loopback）+ 独立 worktree 构建；GPU 紧张时用 CPU 路径/离线二进制。
 
@@ -123,7 +123,7 @@
 ## 6. 仍需运行时验证（已由 Lead 决策推迟到 v0.1.9；不阻塞 v0.1.8）
 
 1. **200 次"流式发起后立即 RST"压测**：连续 200 次观察 engine RSS、VRAM、`/health` slot 计数是否稳定（本轮只做了 1–3 次单发断连 + 断连后正确性）。脚本已就绪：`build/rst_shutdown_test.py`（200 cycles 采样 RSS/VRAM + shutdown 并发），v0.1.9 窗口执行。计划命令：
-   `python build/keepalive_rst_stress.py --url http://127.0.0.1:7020 --cycles 200 --max-tokens 16`（启动 0.5B serve；每 25 次采样 RSS/VRAM）。
+   `python build/rst_shutdown_test.py --port 7024`（启动 0.5B serve；200 次 RST 每 25 次采样 RSS/VRAM，随后测 shutdown 并发）。
 2. **慢读客户端 + 大输出**：客户端只读 header 不读 body，服务端 `send()` 是否会阻塞（需要 >socket 缓冲的输出；本机单线程下会体现在服务不可用窗口）。SO_SNDTIMEO 只在 listening socket 上设置，accepted socket 是否继承需实测。
 3. **`/shutdown` 并发变体**：生成中 + 两个 `/shutdown` 同时到达（第二个连接在 backlog 中被处理还是被丢弃？）；shutdown 后进程退出码/端口/VRAM 清理。
 4. **`--host 0.0.0.0` 局域网可达性**：默认 loopback 安全；绑定 0.0.0.0 后无鉴权，/props 暴露 model_path、/tokenize 等可被任意 LAN 客户使用；本次修复让单请求有界，但仍应只在可信网络使用。
@@ -169,7 +169,7 @@
 
 ```bash
 # 启动（0.5B，默认 loopback）
-engine.exe serve D:/models/qwen2.5-0.5b-instruct-q4_k_m.gguf --port 7020 --ctx 4096
+engine.exe serve <MODEL_DIR>/qwen2.5-0.5b-instruct-q4_k_m.gguf --port 7020 --ctx 4096
 
 # D1：1 MB 无空格 CJK（修复前会卡死服务；修复后 400 in ~20 ms）
 python - <<'PY'
