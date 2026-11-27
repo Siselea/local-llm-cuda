@@ -9,7 +9,8 @@ GPU：RTX 3060 12 GB · RAM 32 GB · Windows 11 VM（所有数字为本机实测
 > 背靠背请求、空输入）。每格记录：能否跑通 / 速度 / 显存与 RAM 峰值 / 是否可接受 / 改进项。
 >
 > 状态：0.5B 部分已完成（本机小模型，逻辑与账目测试）；9B/35B 与大 ctx/性能不回退等
-> **需要大窗口**的部分标 `⏳`；0.5B 与 9B 的 ctx 矩阵、9B 大 ctx 已在大窗口补齐（§1.1/§1.2）。
+> 全部 ctx 矩阵（0.5B/9B/35B）、极端输入、35B 30 轮长会话均已实测（§1.1/§1.2/§2.13/§2.15）；
+> 仅剩 launcher 完整 19 步 GUI 验收 marked `⏳`（测试 harness 在本 VM 会挂起，非产品问题）。
 
 ---
 
@@ -173,7 +174,7 @@ RAM 为进程 WorkingSet 峰值（psapi）。
 - 30 轮总 wall 10.4 s；进程 RSS 峰值 569 MiB，VRAM 稳定（post-load free 9216 MiB，无泄漏趋势）
 - 判定：✅ 可接受；长会话成本来自“新增 token 的 prefill”，不是全量重算（cache 命中率 ~93–95% 的 token）。
 
-⏳ 9B 的 30 轮（每轮 +100 token、真实中文问答）在大窗口补测。
+9B 的 30 轮数据见 §2.6（30/30、cache 98.7%、RSS 1823 MiB 无泄漏）；35B 30 轮见 §2.15。
 
 ### 2.7 9B 长 prompt（94% / 97% 填满 ctx，独占 GPU）
 
@@ -267,7 +268,7 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
 - 代价：这次 3 次装载重试共 **258 s**（35B 每次重载 ~75–90 s），来自“先按预估算装、实测后
   回退重试”的诚实策略；改进项见 §7（把 ledger gap 建模进装载前预算可减少重试）。
   该问题已在 §2.14/§2.16 修复（单次装载），上表 ctx32768 是修复前基线。
-- **v0.1.9 复测（2026-11-27，HEAD `1c0f85b`，engine sha `91788b4…`）**：ctx8192 直接 verbatim
+- **v0.1.9 复测（2026-11-27，HEAD `1c0f85b`，engine sha `91788b4…`；§2.15 的 30 轮在最终 HEAD `e63d7f0` 上）**：ctx8192 直接 verbatim
   （load 75.1 s，post-load free 2483 MiB）；ctx16384 走了 **2 次装载（合计 156.8 s）**：
   - 加载瞬间环境干净：`nvidia-smi` 起进程前 used **447 MiB**（桌面 WDDM 未膨胀），
     所以这一行**不是环境问题**，必须按代码账目解释；
@@ -413,16 +414,45 @@ min_free 会掉到 20 MiB，9B 都会被误报超订）。**教训**：任何“
 | 35B `--strict-vram --vram-margin 3000` | **拒绝启动（rc=1）** ✓ 旧行为可恢复 |
 | 35B 同条件不带 strict | **listening**（不再失败） |
 | 9B / Coder / 0.5B auto ctx4096 | 全部 listening（dense 不变；Coder 12→6 层但启动正常） |
+| 9B `--vram-margin 6200`（free 5348 ∈ [700, margin)） | **WARN 后 listening**：`[serve] WARN: only 5348 MiB free after load (< margin 6200 MiB, >= hard floor 700 MiB); starting anyway...` |
+| 9B 同条件 `--strict-vram` | **拒绝（rc=1）**：`[serve] ERROR: VRAM over-subscribed after load ... (or pass --strict-vram to keep refusing)` |
 
 **代价与标定**：35B 默认 GPU 专家层数从 13 降到 9–10（decode 会慢一些），换来默认启动在桌面
 WDDM 抖动下稳定；需要绝对速度时可用显式 `--gpu-layers`（本轮显式 13 也能启动）或
 `--strict-vram` 环境干净时追求 margin。`docs/reports/PLACEMENT-VRAM-MARGIN.md` §2.4 已更新
 “ledger gap 不是常数”的标定结论。
 
-### 2.15 35B 30 轮会话 ⏳ v0.1.6
+### 2.15 35B 30 轮长会话（实测完成，2026-11-27）
 
-35B 在 CPU 专家模式下每轮 decode 受 CPU 专家带宽限制（perf 31.13 tok/s），30 轮会话预计
-~3 min/30 轮 + 1 次装载；本轮不做，留 v0.1.6。
+**测量条件**：HEAD `e63d7f0`（origin/main）clean worktree 构建，engine sha1 `0daa1ae1…`；
+`engine serve` **默认 auto 放置**（含 v0.1.10 serve reserve），ctx 8192 / f32，chat completions
+`max_tokens=16, temperature=0`；每轮追加 ~50–120 token 的中文材料（约第 30 轮 prompt 3079 tokens）。
+起测前 `nvidia-smi`：used ≈ 551 MiB（桌面 baseline）、free 11737 MiB；装载后 **GPU 专家层
+13/40**（其余 CPU 专家）、post-load free ≈ 3.8 GiB；load 54.5 s。
+
+| turn | wall s | prompt tok | comp tok | prefill ms | decode ms | decode tok/s | cache hit tok | RSS MiB | GPU free MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 6.00 | 62 | 80 | 2821 | 3175 | 25.2 | 0 | 15219 | 3830 |
+| 5 | 8.21 | 562 | 80 | 5052 | 3151 | 25.4 | 512 | 15230 | 3746 |
+| 10 | 7.75 | 1189 | 80 | 4663 | 3077 | 26.0 | 1152 | 15231 | 3746 |
+| 15 | 7.32 | 1820 | 80 | 4229 | 3081 | 26.0 | 1792 | 15231 | 3746 |
+| 20 | 7.27 | 2361 | 50 | 5310 | 1934 | 25.9 | 2304 | 15231 | 3746 |
+| 25 | 6.48 | 2752 | 20 | 5666 | 796 | 25.1 | 2688 | 15232 | 3746 |
+| 30 | 3.09 | 3079 | 4 | 2844 | 223 | 18.0 | 2944 | **15237** | 3746 |
+
+**结论**：
+- **无泄漏**：30 轮 RSS 15219 → **15237 MiB（+18 MiB，0.12%）**，GPU free 在 3746–3830 MiB
+  间稳定（无单调下降）；30 轮总 wall **211.9 s**（平均 7.06 s/轮，含每轮 20–80 token 生成）。
+- **round-to-round 稳定**：wall 3.03–9.78 s，无 10× 抖动；最慢出现在第 3 轮（9.78 s，首轮
+  缓存建立 + think 生成 80 token），第 28/30 轮 3.0 s（think 提前闭合只生成 4 token）。
+- **前缀缓存/slot 健康**：`prefix_cache` 统计 hits 55 / misses **1**（仅第 2 轮一次 miss），
+  reused 93056 tokens / prefilled 6302 tokens（**累计命中率 93.7%**）；`cached_tokens` 0→3072、
+  `have_snapshot=true` 从第 2 轮起保持、`alloc_failed=false`（slot 计数/快照无丢）。
+- **复读/异常**：`repeat_guard_hit=0`（30 轮均未触发）；15-gram 最大重复次数 2、
+  无 ≥20 字符的相邻重复、loop_suspect 全 False；`think_budget_hit=28/30`（模型自行提前闭合
+  2 轮）属预期；输出为正常中文技术回答（无复读/符号 soup）。
+- decode 25–26 tok/s（CPU 专家 27/40 层）、prefill 4–6 s/轮（每轮新 token ~30–130 + 前缀快照
+  恢复）；绝对 tok/s 与历史不可比（受 CPU/桌面环境影响），**本表用于泄漏与稳定性判定**。
 
 ---
 
@@ -537,7 +567,11 @@ Gemma4「extended path」WIP（`[arch] extended path enabled ... qk_norm=1 gelu=
 3. **长 prompt 的 O(ctx²) prefill**（§2.2）：0.5B 8k 上下文 592 tok/s。改进项见该节。
 4. **ctx=1 无法生成**是接口语义（总预算=1），目前用 400 明确报错；若产品希望“1 token 生成”
    需要另立语义（例如 prompt 不计入预算），不建议。
-5. 9B/35B 的 ctx 矩阵与性能不回退、35B 30 轮、launcher 截图 = `⏳` 大窗口/干净二进制后进行。
+5. **launcher 完整 19 步 GUI 验收** = 唯一剩余 `⏳`（本 VM 上旧 harness 会因 modal MessageBox 挂起；
+   已交付 UI 截图 + ctx 用例代码，属测试工具兼容问题，非产品缺陷）。
+6. **预载预算在低显存下偏保守**（v0.1.11 candidate，§2.13 数据）：35B ctx16384 在 clean 桌面下
+   先夹到 13107、serve-guard 缺口后再夹到 4802；建议细化 measured-clamp suggestion 的 safety
+   （256 MiB 对 40 KiB/token 粒度太粗）并把 check→serve 缺口精确建模。
 
 ---
 
