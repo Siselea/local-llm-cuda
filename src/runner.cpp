@@ -1,4 +1,6 @@
 #include "engine/runner.h"
+
+#include "engine/rope_freqs.h"
 #include "engine/runner_internal.h"
 
 #include <algorithm>
@@ -229,6 +231,13 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
     if (sc == "off") ext_logit_softcap_ = 0.0;
     const std::string nm = cfg.get_string("arch_norm_mode");
     ext_norm_plus1_ = nm == "plus1" ? 1 : (nm == "direct" ? 0 : -1);
+    ext_rope_freq_mode_ = cfg.get_string("arch_rope_freqs");
+    if (ext_rope_freq_mode_ != "auto" && ext_rope_freq_mode_ != "on" &&
+        ext_rope_freq_mode_ != "off") {
+      std::fprintf(stderr, "[arch] unknown arch_rope_freqs '%s' (auto|on|off); using auto\n",
+                   ext_rope_freq_mode_.c_str());
+      ext_rope_freq_mode_ = "auto";
+    }
     if (ext_enabled_) {
       use_graph_ = false;          // per-layer geometry: keep the plain launch path
       prefill_graph_ = false;
@@ -252,6 +261,9 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
                        if (!ir_.layers[i].attn.has_v) ++n;
                      return n;
                    }());
+      std::fprintf(stderr,
+                   "[arch] proportional rope: freq_factors=%d (mode=%s, full-attn layers only)\n",
+                   (int)ir_.caps.rope_freq_factors, ext_rope_freq_mode_.c_str());
     }
   }
   // ---- KV quantization + adaptive context length ---------------------------
@@ -386,7 +398,7 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
                     kernels::kAdd + kernels::kAddThree + kernels::kAddBias + kernels::kDequantQ4K +
                     kernels::kDequantQ5K + kernels::kDequantQ6K + kernels::kDequantQ8_0 +
                     kernels::kDequantQ5_0 + kernels::kGatherRows + kernels::kScatterAddW + kernels::kDequantQ5_1 +
-                    kernels::kRopeStrided + kernels::kSplit2 + kernels::kMlaBuildK +
+                    kernels::kRopeStrided + kernels::kRopeStridedFF + kernels::kSplit2 + kernels::kMlaBuildK +
                     kernels::kMlaKvWrite + kernels::kMlaAttnCached +
                     kernels::kGdConv1d + kernels::kGdConvState + kernels::kGdNormQk +
                     kernels::kGdDelta + kernels::kGdDelta128 + kernels::kGdDelta128F +
@@ -424,6 +436,7 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   k_gather_ = mod_->kernel("gather_rows");
   k_scatter_ = mod_->kernel("scatter_add_weighted");
   k_ropestrided_ = mod_->kernel("rope_strided");
+  k_ropestridedff_ = mod_->kernel("rope_strided_ff");
   k_split2_ = mod_->kernel("split2");
   k_buildk_ = mod_->kernel("mla_build_k");
   k_mlakv_ = mod_->kernel("mla_kv_write");
@@ -1507,6 +1520,62 @@ std::vector<float> DenseRunner::tensor_f32(const std::string& name) const {
 // and per-layer geometry comes from ir::LayerAttn (head counts / head dims /
 // rope dim+base / sliding window), which the IR derives from metadata arrays.
 
+void DenseRunner::load_ext_rope_freq_factors() {
+  ext_rope_ff_ok_ = false;
+  if (!ext_enabled_ || container_ != Container::Gguf) return;
+  if (ext_rope_freq_mode_ == "off") {
+    if (ir_.caps.rope_freq_factors)
+      std::fprintf(stderr,
+                   "[rope] proportional freq factors disabled by arch_rope_freqs=off\\n");
+    return;
+  }
+  if (!ir_.caps.rope_freq_factors) {
+    if (ext_rope_freq_mode_ == "on")
+      std::fprintf(stderr,
+                   "[rope] arch_rope_freqs=on but no usable rope_freqs.weight table was "
+                   "derived from the metadata; full rotary stays in effect\\n");
+    return;
+  }
+  int full_rot = 0;
+  for (int i = 0; i < ir_.n_layer; ++i) {
+    const auto& la = ir_.layers[i].attn;
+    if (la.window != 0) continue;   // the table binds to full-attention layers only
+    full_rot = std::max(full_rot, la.rope_dim > 0 ? la.rope_dim : la.key_dim);
+  }
+  const size_t want = engine::rope_ff::expected_len(full_rot);
+  if (want == 0) return;
+  std::vector<float> ff;
+  try {
+    ff = tensor_f32("rope_freqs.weight");
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[rope] cannot read rope_freqs.weight (%s); full rotary stays\\n",
+                 e.what());
+    return;
+  }
+  if (ff.size() != want) {
+    std::fprintf(stderr,
+                 "[rope] rope_freqs.weight has %zu entries but full-layer rope_dim/2 = %zu; "
+                 "ignoring proportional factors\\n",
+                 ff.size(), want);
+    return;
+  }
+  if (!engine::rope_ff::sanitize(ff)) {
+    std::fprintf(stderr,
+                 "[rope] rope_freqs.weight contained non-finite/non-positive factors; they "
+                 "were mapped to the no-rotation sentinel\\n");
+  }
+  const size_t rotating = engine::rope_ff::rotating_pairs(ff);
+  ext_rope_ff_ = cuda::Buffer(ff.size() * 4);
+  ext_rope_ff_.upload(ff.data(), ff.size() * 4);
+  ext_rope_ff_len_ = static_cast<int>(ff.size());
+  ext_rope_ff_ok_ = true;
+  std::fprintf(stderr,
+               "[rope] proportional freq factors: %d pairs (%d rotating = %d dims) on "
+               "full-attention layers\\n",
+               static_cast<int>(ff.size()), static_cast<int>(rotating),
+               static_cast<int>(rotating * 2));
+}
+
 void DenseRunner::load_ext_layer(int i, LayerW& w) {
   auto gg = std::static_pointer_cast<gguf::Model>(gguf_);
   auto find_t = [&](const std::string& name) -> const gguf::TensorInfo* {
@@ -1622,15 +1691,23 @@ void DenseRunner::ext_attention(LayerW& L, int n_tokens, int start_pos) {
     cuda::launch(k_rms_, rows, 1, 1, 256, 1, 1, sh, args);
   };
   auto rope_dev = [&](cuda::Buffer& buf, int heads, int stride, int rope_dim,
-                      cuda::Buffer& freqs) {
+                      cuda::Buffer& freqs, bool use_ff) {
     int nhh = heads, hs = stride, rd = rope_dim, off = 0;
     float ms = 1.0f;
     void* px = buf.data();
     void* pp = pos_dev_.data();
     void* pf = freqs.data();
-    void* args[] = {&px, &pp, &nhh, &hs, &rd, &off, &pf, &ms};
     const int threads = 128;
-    cuda::launch(k_ropestrided_, n_tokens, heads, 1, threads, 1, 1, 0, args);
+    // The divider table is only valid when its length matches this layer's
+    // n_rot/2 exactly; otherwise fall back to plain rope instead of reading OOB.
+    if (use_ff && k_ropestridedff_ && ext_rope_ff_ok_ && ext_rope_ff_len_ == rd / 2) {
+      void* pff = ext_rope_ff_.data();
+      void* args[] = {&px, &pp, &nhh, &hs, &rd, &off, &pf, &pff, &ms};
+      cuda::launch(k_ropestridedff_, n_tokens, heads, 1, threads, 1, 1, 0, args);
+    } else {
+      void* args[] = {&px, &pp, &nhh, &hs, &rd, &off, &pf, &ms};
+      cuda::launch(k_ropestrided_, n_tokens, heads, 1, threads, 1, 1, 0, args);
+    }
   };
 
   // q / k / v projections (k raw is also the source of V for k_eq_v layers)
@@ -1647,8 +1724,14 @@ void DenseRunner::ext_attention(LayerW& L, int n_tokens, int start_pos) {
     rms_rows(k_, L.k_norm_w, k_, n_tokens * nkv, d);
     rms_rows(q_, L.q_norm_w, q_, n_tokens * nh, d);
   }
-  rope_dev(q_, nh, d, la.rope_dim > 0 ? la.rope_dim : d, L.rope_freqs);
-  rope_dev(k_, nkv, d, la.rope_dim > 0 ? la.rope_dim : d, L.rope_freqs);
+  {
+    const int rd = la.rope_dim > 0 ? la.rope_dim : d;
+    // gemma4 proportional rope: llama.cpp creates rope_freqs only for the
+    // non-sliding (full-attention) layers, so SWA layers keep full rotary.
+    const bool ff_ok = la.window == 0 && ext_rope_freq_mode_ != "off" && ext_rope_ff_ok_;
+    rope_dev(q_, nh, d, rd, L.rope_freqs, ff_ok);
+    rope_dev(k_, nkv, d, rd, L.rope_freqs, ff_ok);
+  }
 
   // KV cache write (f32 path; extended models keep f32 KV)
   {
@@ -1773,6 +1856,8 @@ void DenseRunner::load_weights() {
     auto shards = std::static_pointer_cast<st::Shards>(shards_);
     return shards->tensors.count(n) > 0;
   };
+
+  if (ext_enabled_ && gguf) load_ext_rope_freq_factors();
 
   {
     const std::string emb_name = gguf ? "token_embd.weight" : "model.embed_tokens.weight";

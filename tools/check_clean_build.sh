@@ -158,6 +158,12 @@ else
   else
     echo "[gate]   config validation GREEN"
   fi
+  if [ -x build/test_rope_freqs.exe ] && ! ./build/test_rope_freqs.exe > rope_freqs_gate.log 2>&1; then
+    fail "test_rope_freqs (gemma4 proportional-rope frequency factors)"
+    tail -8 rope_freqs_gate.log >&2
+  else
+    echo "[gate]   proportional rope freq factors GREEN"
+  fi
 fi
 
 echo

@@ -93,6 +93,9 @@ struct ArchCaps {
   double embed_scale = 1.0;   // multiplier applied to the token embeddings
   double logit_softcap = 0.0; // final logit softcapping (0 = off)
   double attn_logit_softcap = 0.0;
+  // A global `rope_freqs.weight` table (gemma4 proportional rope) exists and has
+  // the expected n_rot/2 length.  It applies only to full-attention layers.
+  bool rope_freq_factors = false;
 };
 
 // Gated DeltaNet parameters (qwen35 linear attention layers).

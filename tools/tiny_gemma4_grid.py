@@ -36,11 +36,19 @@ def rmsnorm_ops(x, w, eps, plus1_w):
     return y
 
 
-def rope_style(x, pos, n_rot, theta, neox=True):
-    """x [T,H,D]; neox=rotate_half pairs, else GPTJ interleaved pairs."""
+def rope_style(x, pos, n_rot, theta, neox=True, ff=None):
+    """x [T,H,D]; neox=rotate_half pairs, else GPTJ interleaved pairs.
+
+    ff is the proportional-rope frequency divisor table (GGUF rope_freqs.weight):
+    llama.cpp computes theta_i = pos * base^(-2i/n_rot) / ff[i] (the gemma4 full
+    layers use it; sliding layers do not).  ff=None is plain full rotary.
+    """
     d = x.shape[-1]
     n_rot = min(n_rot, d)
     inv = 1.0 / (theta ** (torch.arange(0, n_rot, 2, dtype=torch.float32) / n_rot))
+    if ff is not None:
+        n = min(int(ff.numel()), int(inv.numel()))
+        inv[:n] = inv[:n] / ff[:n].float()
     ang = pos.float()[:, None] * inv[None, :]
     if neox:
         cos = torch.cat([ang.cos(), ang.cos()], dim=-1)[:, None, :]
@@ -84,14 +92,21 @@ def forward(ts, cfg, ids, v) -> tuple[torch.Tensor, torch.Tensor]:
         q = (xn @ Wq.T).view(T, nh, d)
         if ts.has(pre + "attn_q_norm.weight"):
             q = rmsnorm_ops(q, Ts(pre + "attn_q_norm.weight"), cfg.eps, v["qk_plus1"])
-        q = rope_style(q, pos, lp["n_rot"], lp["theta"], v["rope_neox"])
+        ff_tab = None
+        if ts.has("rope_freqs.weight") and v.get("rope_ff", "auto") != "ignore":
+            cand = ts.get_t("rope_freqs.weight")
+            # llama.cpp binds rope_freqs only to full-attention layers and only
+            # when the table length matches that layer's n_rot/2.
+            if lp["window"] == 0 and cand.numel() * 2 == lp["n_rot"]:
+                ff_tab = cand
+        q = rope_style(q, pos, lp["n_rot"], lp["theta"], v["rope_neox"], ff_tab)
         has_v = ts.has(pre + "attn_v.weight")
         Wv = Ts(pre + "attn_v.weight") if has_v else None
         if has_v:
             k = (xn @ Wk.T).view(T, nkv, d)
             if ts.has(pre + "attn_k_norm.weight"):
                 k = rmsnorm_ops(k, Ts(pre + "attn_k_norm.weight"), cfg.eps, v["qk_plus1"])
-            k = rope_style(k, pos, lp["n_rot"], lp["theta"], v["rope_neox"])
+            k = rope_style(k, pos, lp["n_rot"], lp["theta"], v["rope_neox"], ff_tab)
             vv = (xn @ Wv.T).view(T, nkv, d)
             if v["vnorm"] == "on":
                 vv = rmsnorm_ops(vv, None, cfg.eps, False)
@@ -104,10 +119,10 @@ def forward(ts, cfg, ids, v) -> tuple[torch.Tensor, torch.Tensor]:
             else:
                 kk = rmsnorm_ops(k_raw, Ts(pre + "attn_k_norm.weight"), cfg.eps,
                                  v["qk_plus1"])
-                kk = rope_style(kk, pos, lp["n_rot"], lp["theta"], v["rope_neox"])
+                kk = rope_style(kk, pos, lp["n_rot"], lp["theta"], v["rope_neox"], ff_tab)
                 vv = kk
             k = rmsnorm_ops(k_raw, Ts(pre + "attn_k_norm.weight"), cfg.eps, v["qk_plus1"])
-            k = rope_style(k, pos, lp["n_rot"], lp["theta"], v["rope_neox"])
+            k = rope_style(k, pos, lp["n_rot"], lp["theta"], v["rope_neox"], ff_tab)
         if v["vmap"] == "repeat":
             idx = torch.arange(nh) // rep
         else:
@@ -151,12 +166,15 @@ def forward(ts, cfg, ids, v) -> tuple[torch.Tensor, torch.Tensor]:
 def base_variant() -> dict:
     return dict(norm_plus1=False, qk_plus1=False, rope_neox=True, embed="sqrt",
                 vnorm="on", vkind="rms_raw", vmap="repeat", scale="one", win_mode="lt",
-                act="gelu", sandwich=True, scalar="final", softcap=True)
+                act="gelu", sandwich=True, scalar="final", softcap=True,
+                rope_ff="auto")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ids", default="5,7,9")
+    ap.add_argument("--model", default=str(MODEL))
+    ap.add_argument("--oracle", default=str(ORACLE))
     ap.add_argument("--all-single", action="store_true")
     opts = ap.parse_args()
     ids = [int(x) for x in opts.ids.split(",")]

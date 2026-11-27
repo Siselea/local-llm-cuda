@@ -504,6 +504,11 @@ const OptionDef kDefs[] = {
     {"arch_softcap", "ENGINE_ARCH_SOFTCAP", "arch-softcap", true, false, Type::String,
      "auto",
      0, 0, "final logit softcapping: auto (metadata) | on | off"},
+    {"arch_rope_freqs", "ENGINE_ARCH_ROPE_FREQS", "arch-rope-freqs", true, false,
+     Type::String, "auto",
+     0, 0,
+     "proportional-rope frequency factors (GGUF rope_freqs.weight, full-attention "
+     "layers only): auto (metadata) | on | off"},
 };
 
 constexpr size_t kNumDefs = sizeof(kDefs) / sizeof(kDefs[0]);
