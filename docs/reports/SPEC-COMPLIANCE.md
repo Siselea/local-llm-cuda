@@ -1557,3 +1557,69 @@ gated-delta 改动，30 个线性注意力层）。
 `docs/CONFIG.md` 3.2/3.3/3.5 已同步）。三套验证：`tools/verify.sh` **ALL GREEN**；
 `tools/smoke_models.sh` 四模型 top-1 40716 / 185 / 2614 / 69014 全对；
 `tools/verify_generality.sh` **GENERALITY GREEN（26/26）**。
+
+---
+
+## 33. 阶段十五（2026-11-27）：手写 x64 汇编 vs intrinsics（结论：不划算）+ F16C 块头落地
+
+问题（用户提出）：**用 x64（汇编）会不会比现在的 C++17 + AVX2 intrinsics 更快？**
+完整证据见 [`X64-ASM-VS-INTRINSICS.md`](X64-ASM-VS-INTRINSICS.md)；本节是结论与落地记录。
+
+### 33.1 实验方法
+
+负载 = 真实 35B CPU MoE 单层几何（8 专家 × gate/up Q4_K 512×2048 + down Q6_K 2048×512 = 16.3 MB/层），
+12 线程（生产默认）。探针 `build/x64asm/probe.cpp` **单进程内逐轮交错所有变体**、每轮换新副本
+（`copies=1` 分离 L3 计算上限，`copies=24` 测 216 MB DRAM），每配置 5 个独立进程 × 20 轮取 min/median。
+探针直接 `#include ../../src/cpu_matvec.cpp`，所以 "prod" 是出货内核本身；实验阶段未改动 `src/`。
+
+### 33.2 结果（Q4_K fp32 行内核，256 值块）
+
+| 变体 | 块内指令数（.s 静态） | L3 GB/s | DRAM GB/s |
+|---|---|---|---|
+| A：出货 intrinsics（4 累加器 + 预取） | **282**（35.2/32 值） | 20.5–21.3 | 19.4–20.3 |
+| B1：+ F16C 块头（`vcvtph2ps`） | 215（26.9） | **23.4–23.8（+11–14%）** | **22.4–22.7（+11–15%）** |
+| B2：+ 显式 SIMD scale 解码 | 211（26.4） | 23.4–23.6 | 21.2–22.2 |
+| B3：循环全展开（LLVM 调度） | 260 + **62 条栈访问** | 18.9–19.4（−8%，溢出） | — |
+| B4：2 行共享激活 | 521/2 块 + 溢出 | 18.4–19.4（−10%，且非逐位） | — |
+| **C：手写 x64 汇编**（整行 225 条，F16C+全展开+手工寄存器，无 spill） | **195（24.4）** | 22.4–23.3 | 21.3–21.8 |
+| 诊断：无块头 → 理论天花板 | 162（20.2） | 26.8–27.1 | 24.3–25.1 |
+
+phase B（down Q6_K 两级 int8）加 F16C 块头：**+10–12%**（逐位相同）。
+整层（A+B+merge）：出货 18.99 → F16C 版 20.02 GB/s（**+5.4%** 直测 / −9.5% phase 加权）。
+
+### 33.3 结论：汇编不值得
+
+- 手写汇编把块内指令数从 211 压到 195，**实测没有超出最佳 C++ 的收益**（噪声内，中位略低）。
+- 端口模型：32×`vcvtdq2ps`（Comet Lake 仅 p1）+ 32 FMA ⇒ **p1 每块 64 cycle 地板**；
+  瓶颈是 p1 + SMT/访存，不是指令条数/前端 ⇒ 汇编补不了什么（0–5% 上界，实测 0%）。
+- 真实可拿的是**编译目标缺 F16C** 导致的块头成本（Q4_K 块头 106 条里约 56 条是两次分支式
+  `half_to_float`）：`vcvtph2ps` 后块头 106→39 条，逐位相同。
+- 汇编的维护成本（本轮实测）：`vpermilps` 128-bit 清零 ymm 高半导致广播错位、`vmovaps`
+  32 B 对齐直接崩溃、需 `n_in` 特化与手工 clobber 列表。
+
+### 33.4 落地：F16C 块头（`src/cpu_matvec.cpp`）
+
+- `avx2_dot_q4k_f16c` / `avx2_dot_q6k_f16c` / `avx2_dot_q6k_i8_f16c`：循环/累加顺序与出货内核
+  逐行一致，只换块头（Q4_K 一次 `vcvtph2ps` 得 d/dmin，Q6_K 一次得 d）；函数级
+  `__attribute__((target("f16c")))`，**不改 build.sh**。
+- 运行时选择：`cpu_has_f16c()` 只算一次，`row_dot`/`row_dot_i8` 分派，无 F16C 回退原实现。
+  检测 = `__builtin_cpu_supports("f16c")` → 编译器 `<cpuid.h>` 的 `__get_cpuid(1,…) & bit_F16C`。
+  **回退是必须的**：zig/clang Windows 的 compiler-rt CPU model 未初始化，builtin 对本机所有
+  feature 返回 0（实测），只用 builtin 会永远走旧路径。
+- `ENGINE_NO_F16C=1`：调试/逐位对照开关（强制旧实现）。
+
+**逐位验证**（`build/x64asm/verify_f16c.cpp`，探针 TU 直接 include 生产源码）：
+
+| 检查 | 结果 |
+|---|---|
+| 全 65536 个 fp16 bit pattern：F16C 头 vs 旧 `half_to_float` | **0 处 bit 不一致**（2046 对 NaN/NaN 允许 payload 不同） |
+| Q4_K fp32 4096 行 / Q6_K fp32 16384 行 / Q6_K int8 16384 行 | **0 bit mismatch** |
+| `tests/test_cpu_moe.exe`（默认 + `ENGINE_NO_F16C=1`） | 均 PASS |
+| 35B 端到端：默认 vs `ENGINE_NO_F16C=1` 生成 token 序列 | 完全一致 |
+
+**同进程收益**（生产 `moe_forward_mt` 路径，12 线程，DRAM，5×20 轮 med-of-min）：phase A
+20.29→22.70 GB/s（+11.9%），phase B 21.06→23.22（+10.3%），整层 18.99→20.02（+5.4%）。
+按 35B 宿主 GEMV 账本（14.81 ms/token）= **13.4–14.0 ms/token（−0.8～−1.4 ms/token）**。
+
+**验证**：`tools/verify.sh` **ALL GREEN**（e9a04c1 + F16C，独立 worktree）；smoke/gen_regression/
+verify_generality/verify_serve 与端到端二进制 A/B 待 GPU 窗口（v0.1.8 发布门禁占用中）。

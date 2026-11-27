@@ -9,6 +9,14 @@
 #include <stdexcept>
 #include <vector>
 #include <atomic>
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#if defined(__has_include)
+#if __has_include(<cpuid.h>)
+#include <cpuid.h>
+#define ENGINE_HAVE_CPUID_H 1
+#endif
+#endif
+#endif
 #include <condition_variable>
 #include <utility>
 #include <functional>
@@ -195,6 +203,31 @@ std::vector<std::pair<int, int>> smt_cpu_pairs() {
   return pairs;
 }
 
+// F16C detection for the K-quant block headers (see the f16c kernels below).
+// Two compiler-provided checks, no hand-written inline assembly:
+//  1. __builtin_cpu_supports() - the portable builtin;
+//  2. the compiler's <cpuid.h> helper (__get_cpuid), used when the toolchain does
+//     not initialise compiler-rt's CPU model: the zig/clang Windows toolchain
+//     returns 0 from the builtin for every feature, which would otherwise disable
+//     the f16c kernels on a CPU that has F16C.
+// The check runs once; the row kernels consult the cached result.
+inline bool cpu_has_f16c() {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+  static const bool available = []() -> bool {
+    if (std::getenv("ENGINE_NO_F16C")) return false;  // A/B + bit-identity check switch
+    if (__builtin_cpu_supports("f16c")) return true;
+#if defined(ENGINE_HAVE_CPUID_H)
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (__get_cpuid(1, &a, &b, &c, &d)) return (c & bit_F16C) != 0;
+#endif
+    return false;
+  }();
+  return available;
+#else
+  return false;
+#endif
+}
+
 void scale_min(int sub, const unsigned char* s, int* sc, int* mn) {
   // must match q4k_scale_min() in kernels.h (validated bit-exact vs gguf.quants)
   if (sub < 4) {
@@ -315,6 +348,28 @@ namespace {
 #if defined(__AVX2__) && defined(__FMA__)
 #define ENGINE_HAVE_AVX2 1
 #include <immintrin.h>
+
+// ---- F16C block-header decoding ---------------------------------------------
+// Every K-quant super-block starts with one or two fp16 block scales.  The history
+// here is the branchy bit-manipulation half_to_float (~28 instructions and 3-4
+// unpredictable branches per call; a Q4_K block needs two calls, i.e. ~56 of the
+// kernel's ~106 header instructions).  F16C converts both halves of a Q4_K header
+// with one 32-bit load + one vcvtph2ps.  vcvtph2ps is exact for every fp16 value
+// (normal, subnormal, Inf, NaN -> NaN), so the f16c kernels are bit-identical to
+// the portable ones; measured on the 35B CPU-expert path: +11-15% bandwidth on
+// Q4_K and +10-12% on the Q6_K int8 kernel (docs/reports/X64-ASM-VS-INTRINSICS.md).
+// The f16c kernels are runtime-guarded by cpu_has_f16c(), so a build made on a
+// newer CPU still runs on a machine without F16C.
+__attribute__((target("f16c"))) static inline __m128 f16c_hdr2(const unsigned char* p) {
+  std::uint32_t h = 0;
+  std::memcpy(&h, p, 4);  // two fp16 values: (d, dmin)
+  return _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(h)));
+}
+__attribute__((target("f16c"))) static inline float f16c_hdr1(const unsigned char* p) {
+  const std::uint32_t h = static_cast<std::uint32_t>(p[0]) |
+                          (static_cast<std::uint32_t>(p[1]) << 8);
+  return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(h))));
+}
 
 static inline __m256 q4k_fma8(__m256 acc, const unsigned char* q8, __m256 scale, __m256 bias,
                               const float* x) {
@@ -519,6 +574,63 @@ static inline void avx2_dot_q4k(const unsigned char* row, const float* x, int n_
   a2 = _mm256_add_ps(a2, a3);
   *out = hsum256(_mm256_add_ps(a0, a2));
 }
+// F16C block header + identical loop/accumulation order (bit-identical to the
+// portable kernel above; helpers live at the top of the AVX2 section).
+__attribute__((target("f16c"))) static inline void avx2_dot_q4k_f16c(const unsigned char* row, const float* x, int n_in, float* out) {
+  const int nb = n_in / 256;
+  const int row_bytes = nb * 144;
+  for (int i = 0; i < row_bytes; i += 64)
+    _mm_prefetch(reinterpret_cast<const char*>(row + i), _MM_HINT_T0);
+  for (int i = 0; i < row_bytes; i += 64)
+    _mm_prefetch(reinterpret_cast<const char*>(row + row_bytes + i), _MM_HINT_T1);
+  __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+  __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+  const __m256i c15 = _mm256_set1_epi32(0xF);
+  for (int b = 0; b < nb; ++b) {
+    const unsigned char* p = row + static_cast<std::size_t>(b) * 144;
+    const __m128 hdr = f16c_hdr2(p);
+    const float d = _mm_cvtss_f32(hdr);
+    const float dmin = _mm_cvtss_f32(_mm_shuffle_ps(hdr, hdr, 1));
+    const unsigned char* scales = p + 4;
+    const unsigned char* qs = p + 16;
+    float scf[8], mnf[8];
+    for (int sub = 0; sub < 8; ++sub) {
+      int sc = 0, mn = 0;
+      scale_min(sub, scales, &sc, &mn);
+      scf[sub] = d * static_cast<float>(sc);
+      mnf[sub] = dmin * static_cast<float>(mn);
+    }
+    const float* xb = x + static_cast<std::size_t>(b) * 256;
+    for (int g = 0; g < 4; ++g) {
+      const unsigned char* q = qs + g * 32;
+      const __m256 s0 = _mm256_set1_ps(scf[2 * g]);
+      const __m256 m0 = _mm256_set1_ps(mnf[2 * g]);
+      const __m256 s1 = _mm256_set1_ps(scf[2 * g + 1]);
+      const __m256 m1 = _mm256_set1_ps(mnf[2 * g + 1]);
+      const float* x0 = xb + g * 64;
+      for (int l = 0; l < 32; l += 16) {
+        const __m128i raw0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q + l));
+        const __m128i raw1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q + l + 8));
+        const __m256i lo0 = _mm256_and_si256(_mm256_cvtepu8_epi32(raw0), c15);
+        const __m256i hi0 = _mm256_srli_epi32(_mm256_cvtepu8_epi32(raw0), 4);
+        const __m256i lo1 = _mm256_and_si256(_mm256_cvtepu8_epi32(raw1), c15);
+        const __m256i hi1 = _mm256_srli_epi32(_mm256_cvtepu8_epi32(raw1), 4);
+        const __m256 f00 = _mm256_fmsub_ps(s0, _mm256_cvtepi32_ps(lo0), m0);
+        const __m256 f01 = _mm256_fmsub_ps(s1, _mm256_cvtepi32_ps(hi0), m1);
+        const __m256 f10 = _mm256_fmsub_ps(s0, _mm256_cvtepi32_ps(lo1), m0);
+        const __m256 f11 = _mm256_fmsub_ps(s1, _mm256_cvtepi32_ps(hi1), m1);
+        a0 = _mm256_fmadd_ps(f00, _mm256_loadu_ps(x0 + l), a0);
+        a1 = _mm256_fmadd_ps(f01, _mm256_loadu_ps(x0 + 32 + l), a1);
+        a2 = _mm256_fmadd_ps(f10, _mm256_loadu_ps(x0 + l + 8), a2);
+        a3 = _mm256_fmadd_ps(f11, _mm256_loadu_ps(x0 + 32 + l + 8), a3);
+      }
+    }
+  }
+  a0 = _mm256_add_ps(a0, a1);
+  a2 = _mm256_add_ps(a2, a3);
+  *out = hsum256(_mm256_add_ps(a0, a2));
+}
+
 
 static inline void avx2_dot_q6k(const unsigned char* row, const float* x, int n_in, float* out) {
   const int nb = n_in / 256;
@@ -587,6 +699,76 @@ static inline void avx2_dot_q6k(const unsigned char* row, const float* x, int n_
   a2 = _mm256_add_ps(a2, a3);
   *out = hsum256(_mm256_add_ps(a0, a2));
 }
+// F16C block header + identical loop/accumulation order (bit-identical to the
+// portable kernel above; helpers live at the top of the AVX2 section).
+__attribute__((target("f16c"))) static inline void avx2_dot_q6k_f16c(const unsigned char* row, const float* x, int n_in, float* out) {
+  const int nb = n_in / 256;
+  const int row_bytes = nb * 210;
+  for (int i = 0; i < row_bytes; i += 64)
+    _mm_prefetch(reinterpret_cast<const char*>(row + i), _MM_HINT_T0);
+  for (int i = 0; i < row_bytes; i += 64)
+    _mm_prefetch(reinterpret_cast<const char*>(row + row_bytes + i), _MM_HINT_T1);
+  __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+  __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+  const __m256i c15 = _mm256_set1_epi32(0xF);
+  const __m256i c3 = _mm256_set1_epi32(3);
+  const __m256i c32 = _mm256_set1_epi32(32);
+  for (int b = 0; b < nb; ++b) {
+    const unsigned char* p = row + static_cast<std::size_t>(b) * 210;
+    const float d = f16c_hdr1(p + 208);
+    const signed char* sc = reinterpret_cast<const signed char*>(p + 192);
+    const float* xb = x + static_cast<std::size_t>(b) * 256;
+    // the per-16-element scales are loop invariant per half-block: hoist them out
+    float sfl[16];
+    for (int i = 0; i < 16; ++i) sfl[i] = d * static_cast<float>(sc[i]);
+    for (int n2 = 0; n2 < 2; ++n2) {
+      const unsigned char* ql = p + n2 * 64;
+      const unsigned char* qh = p + 128 + n2 * 32;
+      const float* x0 = xb + n2 * 128;
+      for (int l = 0; l < 32; l += 8) {
+        // scale byte index: n2*8 + (l>>4), then every second byte for q1..q4
+        const float* sf = sfl + n2 * 8 + (l >> 4);
+        const __m128i l1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql + l));
+        const __m128i l2 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql + l + 32));
+        const __m128i h8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qh + l));
+        const __m256i h = _mm256_cvtepu8_epi32(h8);
+        const __m256i lo1 = _mm256_cvtepu8_epi32(l1);
+        const __m256i lo2 = _mm256_cvtepu8_epi32(l2);
+        const __m256i q1 = _mm256_sub_epi32(
+            _mm256_or_si256(_mm256_and_si256(lo1, c15),
+                            _mm256_slli_epi32(_mm256_and_si256(h, c3), 4)), c32);
+        const __m256i q2 = _mm256_sub_epi32(
+            _mm256_or_si256(_mm256_and_si256(lo2, c15),
+                            _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(h, 2), c3), 4)),
+            c32);
+        const __m256i q3 = _mm256_sub_epi32(
+            _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi32(lo1, 4), c15),
+                            _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(h, 4), c3), 4)),
+            c32);
+        const __m256i q4 = _mm256_sub_epi32(
+            _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi32(lo2, 4), c15),
+                            _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(h, 6), c3), 4)),
+            c32);
+        a0 = _mm256_fmadd_ps(
+            _mm256_mul_ps(_mm256_set1_ps(sf[0]), _mm256_cvtepi32_ps(q1)),
+            _mm256_loadu_ps(x0 + l), a0);
+        a1 = _mm256_fmadd_ps(
+            _mm256_mul_ps(_mm256_set1_ps(sf[2]), _mm256_cvtepi32_ps(q2)),
+            _mm256_loadu_ps(x0 + l + 32), a1);
+        a2 = _mm256_fmadd_ps(
+            _mm256_mul_ps(_mm256_set1_ps(sf[4]), _mm256_cvtepi32_ps(q3)),
+            _mm256_loadu_ps(x0 + l + 64), a2);
+        a3 = _mm256_fmadd_ps(
+            _mm256_mul_ps(_mm256_set1_ps(sf[6]), _mm256_cvtepi32_ps(q4)),
+            _mm256_loadu_ps(x0 + l + 96), a3);
+      }
+    }
+  }
+  a0 = _mm256_add_ps(a0, a1);
+  a2 = _mm256_add_ps(a2, a3);
+  *out = hsum256(_mm256_add_ps(a0, a2));
+}
+
 
 // ---- int8 row kernels (Q4_K / Q6_K) ------------------------------------------
 // Both quant types are unpacked straight into int8 vectors with one load + one mask
@@ -749,6 +931,67 @@ static inline void avx2_dot_q6k_i8(const unsigned char* row, const XQ8& x, int n
   acc2 = _mm256_add_ps(acc2, acc3);
   *out = hsum256(_mm256_add_ps(acc0, acc2)) + bias;
 }
+// F16C block header + identical loop/accumulation order (bit-identical to the
+// portable kernel above; helpers live at the top of the AVX2 section).
+__attribute__((target("f16c"))) static inline void avx2_dot_q6k_i8_f16c(const unsigned char* row, const XQ8& x, int n_in, float* out) {
+  const int nb = n_in / 256;
+  const int row_bytes = nb * 210;
+  for (int i = 0; i < row_bytes; i += 64)
+    _mm_prefetch(reinterpret_cast<const char*>(row + i), _MM_HINT_T0);
+  for (int i = 0; i < row_bytes; i += 64)
+    _mm_prefetch(reinterpret_cast<const char*>(row + row_bytes + i), _MM_HINT_T1);
+  const __m256i m0f = _mm256_set1_epi8(0x0F);
+  const __m256i m03 = _mm256_set1_epi8(0x03);
+  const __m256i m30 = _mm256_set1_epi8(0x30);
+  const __m256i mc0 = _mm256_set1_epi8(static_cast<char>(0xC0));
+  const signed char* q1 = x.q1.data();
+  const signed char* q2 = x.q2.data();
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+  float bias = 0.f;
+  for (int b = 0; b < nb; ++b) {
+    const unsigned char* p = row + static_cast<std::size_t>(b) * 210;
+    const float d = f16c_hdr1(p + 208);
+    const signed char* sc = reinterpret_cast<const signed char*>(p + 192);
+    for (int n2 = 0; n2 < 2; ++n2) {
+      const __m256i ql0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + n2 * 64));
+      const __m256i ql1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + n2 * 64 + 32));
+      const __m256i qh = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 128 + n2 * 32));
+      const __m256i w0 = _mm256_or_si256(_mm256_and_si256(ql0, m0f),
+                                         _mm256_slli_epi16(_mm256_and_si256(qh, m03), 4));
+      const __m256i w1 = _mm256_or_si256(
+          _mm256_and_si256(ql1, m0f),
+          _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2), m03), 4));
+      const __m256i w2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql0, 4), m0f),
+                                         _mm256_and_si256(qh, m30));
+      const __m256i w3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql1, 4), m0f),
+                                         _mm256_srli_epi16(_mm256_and_si256(qh, mc0), 2));
+      const int bio = b * 8 + n2 * 4;
+      const signed char* scb = sc + n2 * 8;
+      const std::size_t o0 = static_cast<std::size_t>(bio) * 32;
+      const float dd1 = x.d1[bio], dd2 = x.d2[bio];
+      acc0 = _mm256_add_ps(acc0, q6k_i8_contrib(w0, q1, q2, o0, dd1, dd2, d * scb[0], d * scb[1], &bias));
+      acc1 = _mm256_add_ps(acc1, q6k_i8_contrib(w1, q1, q2, o0 + 32, x.d1[bio + 1], x.d2[bio + 1],
+                                                d * scb[2], d * scb[3], &bias));
+      acc2 = _mm256_add_ps(acc2, q6k_i8_contrib(w2, q1, q2, o0 + 64, x.d1[bio + 2], x.d2[bio + 2],
+                                                d * scb[4], d * scb[5], &bias));
+      acc3 = _mm256_add_ps(acc3, q6k_i8_contrib(w3, q1, q2, o0 + 96, x.d1[bio + 3], x.d2[bio + 3],
+                                                d * scb[6], d * scb[7], &bias));
+      bias -= 32.f * (d * scb[0] * x.sx16[static_cast<std::size_t>(bio) * 2] +
+                      d * scb[1] * x.sx16[static_cast<std::size_t>(bio) * 2 + 1] +
+                      d * scb[2] * x.sx16[static_cast<std::size_t>(bio + 1) * 2] +
+                      d * scb[3] * x.sx16[static_cast<std::size_t>(bio + 1) * 2 + 1] +
+                      d * scb[4] * x.sx16[static_cast<std::size_t>(bio + 2) * 2] +
+                      d * scb[5] * x.sx16[static_cast<std::size_t>(bio + 2) * 2 + 1] +
+                      d * scb[6] * x.sx16[static_cast<std::size_t>(bio + 3) * 2] +
+                      d * scb[7] * x.sx16[static_cast<std::size_t>(bio + 3) * 2 + 1]);
+    }
+  }
+  acc0 = _mm256_add_ps(acc0, acc1);
+  acc2 = _mm256_add_ps(acc2, acc3);
+  *out = hsum256(_mm256_add_ps(acc0, acc2)) + bias;
+}
+
 
 static bool avx2_dot_row(const std::string& type, const unsigned char* row, const float* x,
                          int n_in, float* out) {
@@ -1310,11 +1553,13 @@ inline void row_dot(const RowDot& rd, const unsigned char* row, const float* x, 
   static const bool no_avx2 = engine::config::get_bool("no_avx2");
   if (!no_avx2) {
     switch (rd.kind) {
-      case RowKind::Q4K:
-        avx2_dot_q4k(row, x, rd.n_in, out);  // kernel prefetches internally
+      case RowKind::Q4K:  // kernels prefetch internally
+        if (cpu_has_f16c()) avx2_dot_q4k_f16c(row, x, rd.n_in, out);
+        else avx2_dot_q4k(row, x, rd.n_in, out);
         return;
       case RowKind::Q6K:
-        avx2_dot_q6k(row, x, rd.n_in, out);
+        if (cpu_has_f16c()) avx2_dot_q6k_f16c(row, x, rd.n_in, out);
+        else avx2_dot_q6k(row, x, rd.n_in, out);
         return;
       case RowKind::Q5K:
       case RowKind::Q5_1:
@@ -1355,7 +1600,8 @@ inline void row_dot_i8(const RowDot& rd, const unsigned char* row, const XQ8& x,
       avx2_dot_q4k_i8(row, x, rd.n_in, out);
       return;
     case RowKind::Q6K:
-      avx2_dot_q6k_i8(row, x, rd.n_in, out);
+      if (cpu_has_f16c()) avx2_dot_q6k_i8_f16c(row, x, rd.n_in, out);
+      else avx2_dot_q6k_i8(row, x, rd.n_in, out);
       return;
     default:
       row_dot(rd, row, nullptr, out);  // unreachable: guarded by int8_row_supported
