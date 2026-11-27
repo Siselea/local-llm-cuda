@@ -55,7 +55,7 @@ Two things are deliberately separated:
 | DeepSeek-Coder-V2-Lite Q5_K_M | deepseek_v2 (MLA + MoE) | yes | yes | yes in smoke (top-1 185) *** |
 | Qwen3.5-9B Q5_K_M | qwen35 (hybrid SSM) | yes | yes | yes (smoke top-1 2614) |
 | Qwen3.6-35B-A3B Q4_K_M | qwen35moe (hybrid SSM + MoE) | yes | yes | yes (smoke top-1 2614) |
-| **gemma-4-12b-it Q4_K_M** | gemma4 dense, mixed layer types | **yes** | **yes** | **NO** — 8-token greedy diverges at token 3; max Δlogp over llama top-5 = 0.46 (top-2 near-tie flip). Requires `--arch-ext auto` (default off until parity is proven). |
+| **gemma-4-12b-it Q4_K_M** | gemma4 dense, mixed layer types | **yes** | **yes** | **semantics yes, Q4 near-ties differ** — the generic path runs the real checkpoint with verified semantics: 16/16 greedy tokens identical on a decisive-margin prompt; near-tie prompts can flip because llama.cpp's own q8 activation quantisation noise on Q4_K weights is larger than the margin (proven with F16-vs-Q4 truncated probes, §7). Requires `--arch-ext auto` (see below). |
 | Gemma4-26B-A4B QAT Q4_K_M | gemma4 MoE (fused `ffn_gate_up_exps`) | no | no | not implemented; clear diagnostic (needs fused-expert gate/up slab) |
 | gpt-oss-20b MXFP4 | gpt-oss | no | no | parse error: unsupported GGUF tensor type id 39 (MXFP4) — tracked as Phase 3 |
 | Qwen3.8-27B / R1-Distill-14B | qwen2 family | (Phase 2 pending) | — | — |
@@ -79,7 +79,9 @@ Verified after the fix: smoke 4/4, gen_regression 10/10.
 ### gemma4-12b parity detail
 
 The real checkpoint now loads through the generic path and produces plausible
-tokens, but is **not numerically aligned** with llama.cpp yet:
+tokens, and its **semantics are aligned** with llama.cpp (F16 truncated probe:
+    relL2 1.1e-4, §7); the remaining Q4 near-tie greedy differences are
+    llama.cpp's runtime activation-quantisation noise, not a missing rule:
 
 - Greedy prompt ids `[9259]` ("Hello"): llama.cpp → `236770 236770 ...` (8x);
   engine → `236761 236761 236761 236770 236770 236770 236770 236761`.
@@ -254,9 +256,19 @@ Verification:
      "exact greedy parity on a Q4_K checkpoint at near ties" is multi-valued;
      on decisive-margin prompts the engine is 16/16 identical.
 
-Consequence: the full-layer rotary geometry is now correct (a genuine
-bug fix for multi-token behaviour), and the residual 12B greedy differences are
-quantisation-backend noise rather than missing architecture rules.  `arch_ext`
-stays off by default; a future F16/BF16 checkpoint or a backend-matched
-activation-quantisation path can be used to tighten parity further.
+Consequence: the full-layer rotary geometry is now correct (a genuine bug fix
+for multi-token behaviour), and the residual 12B greedy differences are
+quantisation-backend noise rather than missing architecture rules.  Wording for
+users: `--arch-ext auto` **runs gemma4-12b correctly** (loads, generates, matches
+llama.cpp on decisive-margin prompts); it is not "unsupported".  `arch_ext` stays
+off by default as a release policy (the extended path is young and other
+architectures are not covered), not because the gemma4 maths is wrong.
+
+在 Q4_K 上做 greedy parity 的公平替代目标（后续建议，本轮未做）：
+1. 与 llama.cpp 的 **F16/BF16 权重** checkpoint 对比（其 q8 activation 量化噪声
+   消失；本报告的截断 F16 实验已经显示 relL2 1.1e-4 的量级）；
+2. 与 HF transformers 的 F16/BF16 参考实现对比（语义基准，不依赖 llama.cpp 的
+   量化后端）；
+3. 或者为 extended 路径增加"后端匹配的 activation 量化"（复刻 llama.cpp 的 q8
+   块量化）——只有需要逐 token 与某个 llama.cpp 构建完全一致时才值得做。
 
