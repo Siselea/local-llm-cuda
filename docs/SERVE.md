@@ -467,3 +467,24 @@ Qwen3.6-35B-A3B 实测前 147 token 一致、第 148 个分叉（`docs/MTP-NUMER
 `docs/reports/MTP-IMPL-REPORT.md`）。**需要逐位一致的用户不要用 `--mtp`**；服务启动时
 hybrid 模型会打印明确 WARN。另：MTP 回滚快照用 SSM slot 0..k-1、prefix cache 用 slot 0，
 两者同时启用时 serve 会 WARN 并禁用投机（独立 slot 留 v0.2）。
+
+### 5.11 输入预算与 DoS 防御（2026-11-27，v0.1.8）
+
+默认 `--host 127.0.0.1` 只本机可达；**绑定 `--host 0.0.0.0` 会让局域网任意设备使用
+API（无鉴权）**，只应在可信网络使用，不要暴露公网。所有用户输入都有有界工作量：
+
+| 输入 | 预算 | 超限 |
+|---|---|---|
+| `/tokenize` content | **200k 字符**（全局，不占 KV，因此不受 `--ctx` 限制） | 400 `prompt too long to tokenize: N characters (limit M)` |
+| chat/completions、/completion prompt | `min(200k, ctx*8)` 字符（+ 渲染后 prompt 的 ctx 校验） | 400 |
+| 单次 encode | 1500 ms 墙钟兜底 | 400 `tokenization failed: ...` |
+| `stop` 数组 | 总长 4096 字节 | 400 |
+| `/detokenize` ids | 200k 个 | 400 |
+| HTTP body / headers | 32 MiB / 64 KiB（严格 Content-Length；重复 CL→400；chunked 请求体→501） | 413/431/400/501 |
+| 数值参数 | finite + 区间（temperature [0,100]、top_p/min_p [0,1]、top_k [-1,1M]、max_tokens [-1,1M]、seed [-1,INT_MAX]、repetition_penalty [0,100]） | 400 |
+| 文本编码 | 必须合法 UTF-8（拒绝 overlong/代理项/>U+10FFFF） | 400 `... is not valid UTF-8` |
+
+tokenizer 的 BPE merge 已从"每轮全量重扫"改为**符号链表 + (rank,left) 最小堆**
+（O(n log n)，输出 id 不变）：20k CJK 字符编码从 92 s 降到 ~23 ms，1 MB 无空格文本在
+编码前即被字符预算拒绝（~20 ms）。回归测试：`tests/test_tokenizer_budget.cpp`、
+`tests/test_text_util.cpp`，HTTP 用例见 `tools/serve_edge_cases.py`（L1–L5）。
