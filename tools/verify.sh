@@ -42,6 +42,7 @@ N_LAYER=4 "$PY" tests/make_tiny_model.py build/fixtures/tiny_model4 >/dev/null |
 "$PY" tests/make_tiny_moe.py >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_moe.py >/dev/null || fail=1
 N_EXPERT=300 "$PY" tests/make_tiny_gguf_moe.py build/fixtures/tiny_gguf_moe300 >/dev/null || fail=1
+N_EXPERT=384 "$PY" tests/make_tiny_gguf_moe.py build/fixtures/tiny_gguf_moe384 >/dev/null || fail=1
 EXPERT_TYPE=F16 "$PY" tests/make_tiny_gguf_moe.py build/fixtures/tiny_gguf_moe_f16 >/dev/null || fail=1
 EXPERT_TYPE=F32 "$PY" tests/make_tiny_gguf_moe.py build/fixtures/tiny_gguf_moe_f32 >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_mla.py >/dev/null || fail=1
@@ -96,6 +97,29 @@ if [ -x ./build/test_model.exe ]; then
   ./build/test_model.exe build/fixtures/tiny_gguf_ds2 || fail=1
 else echo "missing build/test_model.exe"; fail=1; fi
 if [ -x ./build/test_mla_kv.exe ]; then ./build/test_mla_kv.exe || fail=1; else echo "missing build/test_mla_kv.exe"; fail=1; fi
+
+echo
+echo "== >256-expert MoE (host-route fallback): load + 30-token generation =="
+mkdir -p build/logs
+for ne in 300 384; do
+  d="build/fixtures/tiny_gguf_moe${ne}"
+  [ -e "$d/model.gguf" ] || { echo "skip (missing $d)"; continue; }
+  ./build/test_model.exe "$d" || fail=1
+  ENGINE_GPU_EXPERTS=0 ./build/test_model.exe "$d" || fail=1
+  ENGINE_GPU_EXPERTS="$ne" ENGINE_DEV_ROUTE=1 ./build/test_model.exe "$d" || fail=1
+  ENGINE_TOPK=1 ./build/test_gen.exe "$d/model.gguf" "1,2,3,4" 30 \
+    >"build/logs/large_${ne}_default.log" 2>&1 || fail=1
+  ENGINE_TOPK=1 ENGINE_DEV_ROUTE=0 ./build/test_gen.exe "$d/model.gguf" "1,2,3,4" 30 \
+    >"build/logs/large_${ne}_host.log" 2>&1 || fail=1
+  grep -h '^gen:' "build/logs/large_${ne}_default.log" >"build/logs/large_${ne}_g1.txt" || fail=1
+  grep -h '^gen:' "build/logs/large_${ne}_host.log" >"build/logs/large_${ne}_g2.txt" || fail=1
+  if cmp -s "build/logs/large_${ne}_g1.txt" "build/logs/large_${ne}_g2.txt"; then
+    echo "  ne=$ne 30-token greedy stream identical across routing flags: PASS"
+  else
+    echo "  ne=$ne greedy stream differs across routing flags: FAIL"
+    fail=1
+  fi
+done
 if [ -x ./build/test_decode.exe ]; then
   ./build/test_decode.exe || fail=1
   ./build/test_decode.exe build/fixtures/tiny_gguf_mla || fail=1
@@ -115,6 +139,12 @@ if [ -x ./build/test_loader_bounds.exe ]; then ./build/test_loader_bounds.exe ||
 if [ -x ./build/test_gguf_moe_offload.exe ]; then
   ./build/test_gguf_moe_offload.exe build/fixtures/tiny_gguf_moe_f16/model.gguf build/fixtures/tiny_gguf_moe_f16 || fail=1
   ./build/test_gguf_moe_offload.exe build/fixtures/tiny_gguf_moe_f32/model.gguf build/fixtures/tiny_gguf_moe_f32 || fail=1
+  # >256 experts: accepted via the host router (device router is capped at 256)
+  for ne in 300 384; do
+    d="build/fixtures/tiny_gguf_moe${ne}"
+    [ -e "$d/model.gguf" ] || continue
+    ./build/test_gguf_moe_offload.exe "$d/model.gguf" "$d" "$ne" || fail=1
+  done
 else echo "missing build/test_gguf_moe_offload.exe"; fail=1; fi
 
 echo

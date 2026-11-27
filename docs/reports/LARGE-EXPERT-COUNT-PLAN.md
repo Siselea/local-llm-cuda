@@ -95,3 +95,40 @@
 | 合计 | | **约 1–1.5 人日** |
 
 建议排期为下个发布窗口的独立任务；改动不动 MoE GEMV/attention 内核，风险集中在路由/放置层。
+
+
+---
+
+## 6. 实施状态
+
+### 已完成（v0.1.10，步骤 1：host-route fallback）
+- **IR 校验放宽**（`src/ir.cpp`）：`expert_count > 256` 不再报错；**≤ 4096 的模型加载期给出 warning**
+  （"device-side router is disabled ... host-side routing is used"），>4096 仍拒绝。
+- **路由选择**：`runner::kMaxDeviceRouteExperts` 保持 256，`device_route_supported(ne)` 对 >256
+  返回 false ⇒ 自动走 host 路由；host 路由本身对专家数无上限（只按 topk 扫描 ne 个 logits）。
+- **测试**（`tools/verify.sh`）：
+  - 生成 `build/fixtures/tiny_gguf_moe300` / `tiny_gguf_moe384`（`N_EXPERT` 环境变量）；
+  - `test_gguf_moe_offload` 新增可选专家数参数，对 300/384 跑 all-GPU / all-CPU / mixed 放置矩阵，
+    全部与 numpy 参考 logits 对拍；
+  - `test_model.exe` 三种放置（默认 / 全 CPU / 全 GPU）加载 + 参考 logits；
+  - `test_gen.exe` 30-token greedy 生成，在 `ENGINE_DEV_ROUTE=1` 与 `=0` 下逐位一致。
+- **现有模型零回退**：ne=256（35B）仍走 device router（≤256），ne=64（Coder）同理；见五套 gate。
+
+### 待做（步骤 2：device router 扩到 >256，性能优化）
+按 §2.1 把 `moe_route` 的 `float pr[256]` 改为动态共享内存（`ne*4` 字节 ≤48 KiB，384 专家仅 1.5 KiB），
+删除 256 硬返回，`kMaxDeviceRouteExperts` 随之提升；然后比较 ne=384 时 device vs host 路由的
+decode 速度与 token 一致性，若 device 无优势则默认保持 host 并文档化。
+
+### 步骤 1 实测结果（2026-11-27，worktree `feat/large-experts`）
+- 合成 **300 / 384 专家** tiny MoE（Q8_0 experts，2 层 topk=2）：
+  - `test_model` 三种放置（默认 auto / `ENGINE_GPU_EXPERTS=0` / `ENGINE_GPU_EXPERTS=ne ENGINE_DEV_ROUTE=1`）
+    **全部 PASS**（rel_l2 ≤ 4.4e-05，argmax 一致；后两者 rel_l2 ≈2.4e-07）；
+  - `test_gguf_moe_offload` 放置矩阵（all-GPU / all-CPU / mixed 1-GPU）**PASS**（host=300/384 计数正确）；
+  - `test_gen` **30-token greedy** 在 `ENGINE_DEV_ROUTE=1` 与 `=0` 下**逐 token 相同**。
+- 零回退：`smoke_models` 四模型官方 token 全对；`gen_regression` **10/10 GREEN**（9B×5、35B×3、Coder、0.5B）。
+- `tools/verify.sh`（含新用例与全部 test_*、IR/M2 parity）**ALL GREEN**。
+- `test_kernel_bounds` 单跑 GREEN 且无残留进程（新增 `KERNEL_BOUNDS_CHILD` 递归守卫；见 D11 fork-bomb 教训）。
+
+### 下一步（步骤 2）
+`moe_route` 动态共享内存 + 提高 device 上限，按 §2.1 实施；若 ne=384 时 device 路由无速度优势，
+保持默认 host 路由并在此文档记录 A/B 数据。

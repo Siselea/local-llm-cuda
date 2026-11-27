@@ -14,6 +14,7 @@
 // Usage: test_gguf_moe_offload <model.gguf> <fixture_dir>
 // Skips (exit 0) with a message when no CUDA device is available, like the other GPU tests.
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -114,6 +115,12 @@ int main(int argc, char** argv) {
     return 1;
   }
   const std::string model = argv[1], dir = argv[2];
+  // Optional expected expert count (default 4).  Used by the >256-expert cases.
+  const int ne = (argc > 3) ? std::atoi(argv[3]) : 4;
+  if (ne <= 0) {
+    std::fprintf(stderr, "invalid expert count %d\n", ne);
+    return 1;
+  }
   try {
     cuda::init();
   } catch (const std::exception& e) {
@@ -127,9 +134,9 @@ int main(int argc, char** argv) {
     // A) all experts on the GPU (baseline path, must keep matching the reference)
     ok &= run_case("all-GPU experts", model, tokens, ref, "gpu_layers", "0x7fffffff");
     // all-GPU: every expert uploaded, no host copies needed.
-    if (!(g_placement.gpu_experts == 4 && g_placement.host_experts == 0)) {
-      std::fprintf(stderr, "FAIL: all-GPU placement is gpu=%d host=%d (want 4/0)\n",
-                   g_placement.gpu_experts, g_placement.host_experts);
+    if (!(g_placement.gpu_experts == ne && g_placement.host_experts == 0)) {
+      std::fprintf(stderr, "FAIL: all-GPU placement is gpu=%d host=%d (want %d/0)\n",
+                   g_placement.gpu_experts, g_placement.host_experts, ne);
       ok = false;
     }
     // B) every expert on the CPU.  The device footprint must shrink: before the fix the
@@ -137,11 +144,12 @@ int main(int argc, char** argv) {
     // buffers empty, so the CPU path had no weights).
     ok &= run_case("all-CPU experts", model, tokens, ref, "gpu_layers", "0", true);
     // all-CPU: nothing uploaded, all four experts kept on the host, cpu_begin == 0.
-    if (!(g_placement.gpu_experts == 0 && g_placement.host_experts == 4 &&
+    if (!(g_placement.gpu_experts == 0 && g_placement.host_experts == ne &&
           g_placement.cpu_begin == 0)) {
       std::fprintf(stderr,
-                   "FAIL: all-CPU placement is gpu=%d host=%d cpu_begin=%d (want 0/4/0)\n",
-                   g_placement.gpu_experts, g_placement.host_experts, g_placement.cpu_begin);
+                   "FAIL: all-CPU placement is gpu=%d host=%d cpu_begin=%d (want 0/%d/0)\n",
+                   g_placement.gpu_experts, g_placement.host_experts, g_placement.cpu_begin,
+                   ne);
       ok = false;
     }
     // C) mixed placement: one expert per layer on the GPU, the rest on the CPU.
@@ -149,11 +157,12 @@ int main(int argc, char** argv) {
     ok &= run_case("mixed experts (1 GPU)", model, tokens, ref, "gpu_experts", "1", true);
     // mixed: one expert uploaded, host copies for all (the CPU path indexes by expert
     // id), cpu_begin == 1.
-    if (!(g_placement.gpu_experts == 1 && g_placement.host_experts == 4 &&
+    if (!(g_placement.gpu_experts == 1 && g_placement.host_experts == ne &&
           g_placement.cpu_begin == 1)) {
       std::fprintf(stderr,
-                   "FAIL: mixed placement is gpu=%d host=%d cpu_begin=%d (want 1/4/1)\n",
-                   g_placement.gpu_experts, g_placement.host_experts, g_placement.cpu_begin);
+                   "FAIL: mixed placement is gpu=%d host=%d cpu_begin=%d (want 1/%d/1)\n",
+                   g_placement.gpu_experts, g_placement.host_experts, g_placement.cpu_begin,
+                   ne);
       ok = false;
     }
     if (!ok) {

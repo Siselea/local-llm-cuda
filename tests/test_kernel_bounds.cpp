@@ -46,10 +46,15 @@ std::string exe_path() {
 }
 
 // Spawn this executable with one environment variable set (env_name may be null).
+// KERNEL_BOUNDS_CHILD makes the child refuse to run the parent suite, so a typo in a
+// child mode can never turn into an exponential fork bomb (the D11 incident: a child
+// that fell through the dispatcher re-spawned itself).
 int spawn_self(const char* env_name, const char* env_val, const std::string& args) {
   if (env_name) _putenv_s(env_name, env_val ? env_val : "");
+  _putenv_s("KERNEL_BOUNDS_CHILD", "1");
   const std::string cmd = "\"" + exe_path() + "\" " + args + " >NUL 2>&1";
   const int rc = std::system(cmd.c_str());
+  _putenv_s("KERNEL_BOUNDS_CHILD", "");
   if (env_name) _putenv_s(env_name, "");
   return rc;
 }
@@ -58,7 +63,9 @@ int spawn_tool(const char* env1, const char* val1, const char* env2, const char*
                const std::string& cmd) {
   if (env1) _putenv_s(env1, val1 ? val1 : "");
   if (env2) _putenv_s(env2, val2 ? val2 : "");
+  _putenv_s("KERNEL_BOUNDS_CHILD", "1");
   const int rc = std::system(cmd.c_str());
+  _putenv_s("KERNEL_BOUNDS_CHILD", "");
   if (env1) _putenv_s(env1, "");
   if (env2) _putenv_s(env2, "");
   return rc;
@@ -217,30 +224,35 @@ void test_device_route_guard() {
 
 // -------------------------------------- 300-expert synthetic model smoke (#2) ----
 void test_expert_overflow_fixture() {
-  std::printf("== 300-expert synthetic model (host-router fallback) ==\n");
-  const std::string fixture = "build/fixtures/tiny_gguf_moe300/model.gguf";
-  if (!file_exists(fixture) || !file_exists("build/test_model.exe")) {
-    std::printf("  (fixture/build/test_model.exe missing: skipped; tools/verify.sh builds it)\n");
+  std::printf("== >256-expert synthetic model (host-router fallback) ==\n");
+  if (!file_exists("build/test_model.exe")) {
+    std::printf("  (build/test_model.exe missing: skipped; tools/verify.sh builds it)\n");
     return;
   }
-  // v0.1.7/v0.1.8 contract: expert_count > 256 is rejected at IR validation time
-  // (src/ir.cpp), so the moe_route no-op can never be reached with a real model today.
-  // This test pins that clear rejection; the device_route_supported() checks above pin
-  // the host-router fallback that would take over if the limit is ever relaxed.
-  const std::string log = "build\\fixtures\\tiny_gguf_moe300\\load.log";
-  for (const char* env : {"0", "300"}) {
-    // cmd.exe only accepts backslashes for the executable and the redirect target.
-    const int rc = spawn_tool("ENGINE_GPU_EXPERTS", env, nullptr, nullptr,
-                              "build\\test_model.exe build/fixtures/tiny_gguf_moe300 > \"" + log +
-                                  "\" 2>&1");
-    const std::string text = read_text(log);
-    const bool mentions = text.find("expert_count 300 > 256") != std::string::npos &&
-                          text.find("not supported") != std::string::npos;
-    check(rc != 0, std::string("300-expert model rejected at load (GPU_EXPERTS=") + env + ")");
-    check(mentions, "rejection message names the 256-expert device-router limit");
+  // v0.1.10 contract: expert_count > 256 now loads (IR warning, no error) and the
+  // device router is disabled, so the generic host router serves the model.  Both the
+  // all-CPU placement and an all-GPU placement (host route + GPU expert GEMV) must
+  // decode and match the generator's reference logits.
+  for (const int ne : {300, 384}) {
+    const std::string fixture = "build/fixtures/tiny_gguf_moe" + std::to_string(ne);
+    if (!file_exists(fixture + "/model.gguf")) {
+      std::printf("  (fixture %s missing: skipped)\n", fixture.c_str());
+      continue;
+    }
+    const std::string log = fixture + "\\load.log";
+    const char* envs[] = {"0", nullptr};
+    for (const char* env : envs) {
+      const std::string cmd = "build\\test_model.exe " + fixture + " > \"" + log + "\" 2>&1";
+      const int rc = spawn_tool(env ? "ENGINE_GPU_EXPERTS" : nullptr, env, nullptr, nullptr, cmd);
+      const std::string text = read_text(log);
+      const bool rejected = text.find("is not supported") != std::string::npos;
+      check(rc == 0 && !rejected,
+            "ne=" + std::to_string(ne) + " loads and matches reference logits (GPU_EXPERTS=" +
+                (env ? env : "auto") + ")");
+    }
   }
   check(!runner::device_route_supported(300),
-        "if the IR limit is relaxed, n_expert=300 takes the host router");
+        "n_expert=300 still takes the host router (device router capped at 256)");
 }
 
 // D4: the device top-k partial kernel keeps a 512-word (16384-index) selection bitmap
@@ -351,6 +363,10 @@ int main(int argc, char** argv) {
   // argument (argc==2).  With the old `argc >= 3` guard those children fell
   // through to the full suite and re-spawned themselves, which is an exponential
   // fork bomb (observed: 170+ concurrent processes, GPU VRAM 2GB -> 12GB).
+  //
+  // Defence in depth: a spawned child sets KERNEL_BOUNDS_CHILD, and an unrecognised
+  // mode in that state fails instead of running the parent suite.
+  const bool is_child = std::getenv("KERNEL_BOUNDS_CHILD") != nullptr;
   if (argc >= 2) {
     const std::string mode = argv[1];
     const int value = (argc >= 3) ? std::atoi(argv[2]) : 0;
@@ -358,6 +374,13 @@ int main(int argc, char** argv) {
     if (mode == "--child-kvsplit-eq") return child_kvsplit_eq(value);
     if (mode == "--child-capture-strict") return child_capture_probe(true);
     if (mode == "--child-capture-lenient") return child_capture_probe(false);
+    if (is_child) {
+      std::printf("test_kernel_bounds: unknown child mode '%s'\n", mode.c_str());
+      return 1;
+    }
+  } else if (is_child) {
+    std::printf("test_kernel_bounds: child mode needs an argument\n");
+    return 1;
   }
 
   std::printf("== kv_split config bounds (#1) ==\n");
