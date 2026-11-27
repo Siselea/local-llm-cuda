@@ -1617,9 +1617,16 @@ phase B（down Q6_K 两级 int8）加 F16C 块头：**+10–12%**（逐位相同
 | `tests/test_cpu_moe.exe`（默认 + `ENGINE_NO_F16C=1`） | 均 PASS |
 | 35B 端到端：默认 vs `ENGINE_NO_F16C=1` 生成 token 序列 | 完全一致 |
 
-**同进程收益**（生产 `moe_forward_mt` 路径，12 线程，DRAM，5×20 轮 med-of-min）：phase A
-20.29→22.70 GB/s（+11.9%），phase B 21.06→23.22（+10.3%），整层 18.99→20.02（+5.4%）。
-按 35B 宿主 GEMV 账本（14.81 ms/token）= **13.4–14.0 ms/token（−0.8～−1.4 ms/token）**。
+**收益（同进程 A/B，生产 `moe_forward_mt` 路径，12 线程，DRAM，5×20 轮 med-of-min）**：
+phase A 20.29→22.70 GB/s（**+11.9%**），phase B 21.06→23.22（**+10.3%**），整层 18.99→20.02
+（**+5.4%**，phase 加权上限 −9.5%）。
 
-**验证**：`tools/verify.sh` **ALL GREEN**（e9a04c1 + F16C，独立 worktree）；smoke/gen_regression/
-verify_generality/verify_serve 与端到端二进制 A/B 待 GPU 窗口（v0.1.8 发布门禁占用中）。
+**端到端 A/B（`70c8f0c`，GPU 独占，同二进制 `pre=ENGINE_NO_F16C` / `new=默认`）**：
+35B 6 对（placement 14/14）：GEMV 0.6395→0.5945 ms/layer（配对 ratio 中位 **0.928，−7.2%**；
+剔除 1 个外部负载离群对后 0.908，**−9.2%**），decode 34.14→32.89 ms/token（ratio 中位
+**0.953，−4.7%**；剔除离群 −5.0%）⇒ **−1.25～−1.5 ms/token**；9B 4 对 decode 21.375→21.305
+（**−0.2%，无回退**）；10 对配对 `gen:` token id 序列**全部逐字相同**。
+
+**验证**：发布门禁 @ `70c8f0c` **GREEN**（`tools/verify.sh` ALL GREEN、smoke OK、
+`gen_regression` 10/10、`test_fp16` 131090 checks）；本轮补测 `verify_generality` **21/21**、
+`verify_serve` **22/22**。原计划的 A/B 与四套验证已补齐，随 **v0.1.9** 发布（v0.1.8 不含）。
