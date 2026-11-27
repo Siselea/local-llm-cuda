@@ -14,12 +14,12 @@
 
 namespace runner {
 
-// moe_route (device-side router) formats its routing probabilities in a 256-entry
-// array and returns early when n_expert > 256.  Wider expert tables (Kimi-K2 384 etc.)
-// are accepted by the IR validator and use the generic host router instead (see
-// device_route_supported).  A future dynamic-shared-memory router can raise the device
-// limit; the host path already handles any table size up to the IR cap (4096).
-constexpr int kMaxDeviceRouteExperts = 256;
+// moe_route (device-side router) keeps the routing probabilities in dynamic shared
+// memory: ne floats = 4*ne bytes (4096 experts -> 16 KiB, inside the 48 KiB default
+// limit).  This matches the IR cap on expert_count, so every loadable expert table can
+// use the device router when all experts are GPU-resident; the host router remains the
+// fallback for non-GPU placement / unverified quant layouts.
+constexpr int kMaxDeviceRouteExperts = 4096;
 inline bool device_route_supported(int n_expert) {
   return n_expert > 0 && n_expert <= kMaxDeviceRouteExperts;
 }

@@ -132,3 +132,45 @@ decode 速度与 token 一致性，若 device 无优势则默认保持 host 并�
 ### 下一步（步骤 2）
 `moe_route` 动态共享内存 + 提高 device 上限，按 §2.1 实施；若 ne=384 时 device 路由无速度优势，
 保持默认 host 路由并在此文档记录 A/B 数据。
+
+---
+
+## 7. 实施状态（步骤 2：device router 扩到 >256，v0.1.10）
+
+### 改动
+- `kernels.h` `moe_route`：`float pr[256]`（栈）→ `extern __shared__ float pr[]`（动态共享内存），
+  删除 `if (ne > 256) return;`。host 按 `ne*sizeof(float)` 传 smem。
+- `runner.h`：`kMaxDeviceRouteExperts` 256 → **4096**（= IR 专家数上限）；`device_route_supported(ne)`
+  对 257..4096 返回 true。
+- `src/runner.cpp`：`moe_route` launch 传入 `ne*4` 字节动态共享内存。
+- `src/ir.cpp`：>256 的 warning 改为"device router 用动态共享内存；专家不全在 GPU 时仍走 host 路由"。
+- `tools/verify.sh`：>256 用例增加 `ENGINE_NO_DEV_ROUTE=1`（host 路由）与 `ENGINE_DEV_ROUTE=1`
+  （device 路由）两条 logits 对比；30-token 生成 parity 现在真正比较 device vs host 路由。
+
+### 内存账（ne 个专家）
+| 项 | 公式 | ne=384 | ne=4096（IR 上限） |
+|---|---|---|---|
+| `moe_route` 动态共享内存/block | `4*ne` B | 1.5 KiB | 16 KiB（默认 48 KiB 限制内，无需 opt-in） |
+| `router_logits_` | `rows*ne*4` B | rows=4096 → 6 MiB | rows=4096 → 64 MiB |
+| 路由槽位 `slot_exp_/slot_tok_/slot_w_` | `n_tokens*topk*4` B ×3 | 与 ne 无关 | 与 ne 无关 |
+| host 路由回退 | 无额外 device 内存（D2H logits + host 向量） | — | — |
+
+### 验收实测（合成 300/384 专家 tiny MoE，Q8_0 experts，2 层 topk=2）
+- **输出一致性**：`ENGINE_DEV_ROUTE=1`（device）vs `ENGINE_NO_DEV_ROUTE=1`（host）
+  **30-token greedy 逐 token 相同**（300/384 均 PASS）；两种路由单独 vs numpy 参考 logits 均 PASS
+  （device rel_l2≈2.4e-07/2.6e-07，host rel_l2≈4.4e-05/2.6e-07）。
+- **速度（decode ms/token，6 次交替取中位数；tiny 模型噪声大）**：
+  | ne | device 中位数 | host 中位数 | device 优势 |
+  |---|---|---|---|
+  | 300 | 0.61 ms | 0.73 ms | ~16% |
+  | 384 | 0.86 ms | 1.05 ms | ~18% |
+  结构性收益 = 每 MoE 层省一次 host round-trip；tiny 模型绝对量小、噪声 ±30%，
+  真实宽专家模型（若到手）应更明显。默认策略保持"全部专家 GPU 且量化布局已验证时用 device 路由"，
+  否则 host 路由。
+- `test_gguf_moe_offload` 300/384 放置矩阵 PASS（host 计数正确）。
+- `test_kernel_bounds` GREEN（`device_route_supported` 新边界：257/300/384/4096 true、4097 false）。
+
+### 剩余
+- 真实 Kimi-K2 类模型（若到手）验证：加载 + 生成 + device/host 路由 A/B + 显存账。
+- 若要在 IR 上限之上继续扩（>4096 专家），只需提高 `kMaxDeviceRouteExperts` 并选择 smem opt-in
+  （>48 KiB 需 `max_dynamic_shared_mem`），host 路由已无上限。
