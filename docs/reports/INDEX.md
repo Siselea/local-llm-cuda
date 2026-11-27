@@ -8,6 +8,7 @@
 
 | 文件 | 标题 | 一句话说明 |
 | --- | --- | --- |
+| [DEFECT-SUMMARY-v0.1.7.md](DEFECT-SUMMARY-v0.1.7.md) | v0.1.7 缺陷总结（外部审查 + 复核） | 三档归档：已确认缺陷（JSON 嵌套深度可打崩服务、源码归档不可构建、混入 50 个备份文件）、已复现失败、需运行时验证；含已核对为正常的安全面。 |
 | [CTX-AND-EXTREMES.md](CTX-AND-EXTREMES.md) | 任意上下文长度 + 极端情况矩阵（CTX-AND-EXTREMES） | `--ctx` 任意正整数、只在物理放不下时夹紧、requested/actual 可观测；极小/极大 ctx、极短/极长 prompt、显存紧张、30 轮长会话、空输入的实测矩阵与问题清单。 |
 | [CPU-GEMV-BW-REPORT.md](CPU-GEMV-BW-REPORT.md) | CPU 量化 GEMV 带宽优化 — 交付报告 | CPU 量化 GEMV 的带宽/DRAM 天花板测量与优化（cpu_matvec 行内核）。 |
 | [CPU-OCCUPANCY-REPORT.md](CPU-OCCUPANCY-REPORT.md) | decode 期间 CPU 占用实测报告（CPU-OCCUPANCY） | decode 期间 CPU 占用实测：为何用户看到 CPU 不忙、如何让专家层吃满 CPU。 |
