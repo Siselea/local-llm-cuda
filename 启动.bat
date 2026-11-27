@@ -99,15 +99,50 @@ exit /b %RC%
 
 rem ---- restart branch ------------------------------------------------------
 :restart
-echo Stopping the running engine ...
-curl -s -m 3 -X POST "http://%HOST%:%PORT%/shutdown" >nul 2>nul
+echo Stopping the running engine on %HOST%:%PORT% ...
+set "HTTP_CODE="
+for /f %%C in ('curl -s -m 3 -o nul -w "%%{http_code}" -X POST "http://%HOST%:%PORT%/shutdown" 2^>nul') do set "HTTP_CODE=%%C"
+if not defined HTTP_CODE (
+  echo [WARN] HTTP /shutdown failed ^(curl missing or server busy^).
+) else if not "!HTTP_CODE!"=="200" (
+  echo [WARN] HTTP /shutdown returned !HTTP_CODE! ^(not 200^).
+)
 for /l %%i in (1,1,20) do (
   ping -n 2 127.0.0.1 >nul 2>nul
   netstat -ano 2>nul | findstr /r /c:":%PORT% .*LISTENING" >nul 2>nul
   if errorlevel 1 goto restarted
 )
-echo Engine did not stop through /shutdown; terminating engine.exe ...
-taskkill /f /im engine.exe >nul 2>nul
+echo Port %PORT% is still busy; resolving only its listening PID ...
+set "FOREIGN="
+for /f "tokens=5" %%P in ('netstat -ano 2^>nul ^| findstr /r /c:":%PORT% .*LISTENING"') do (
+  set "PID=%%P"
+  set "IMG="
+  for /f "tokens=1 delims=," %%I in ('tasklist /fi "PID eq !PID!" /fo csv /nh 2^>nul') do set "IMG=%%~I"
+  if /i "!IMG!"=="engine.exe" (
+    echo [3/3] taskkill /pid !PID! ^(engine.exe on port %PORT%^) ...
+    taskkill /f /pid !PID! >nul 2>nul
+  ) else (
+    if defined IMG (
+      echo [WARN] port %PORT% is held by !IMG! ^(PID !PID!^), not engine.exe; refusing to kill it.
+      set "FOREIGN=1"
+    )
+  )
+)
+for /l %%i in (1,1,20) do (
+  ping -n 2 127.0.0.1 >nul 2>nul
+  netstat -ano 2>nul | findstr /r /c:":%PORT% .*LISTENING" >nul 2>nul
+  if errorlevel 1 goto restarted
+)
+if defined FOREIGN (
+  echo [ERROR] Port %PORT% is held by a non-engine process; refusing to restart.
+  echo         Close it manually, or choose a different port.
+  pause
+  exit /b 1
+)
+echo [ERROR] Could not stop the engine on port %PORT%.
+echo         No unrelated engine.exe process was touched.
+pause
+exit /b 1
 :restarted
 echo.
 goto pick
