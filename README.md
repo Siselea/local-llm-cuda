@@ -254,6 +254,12 @@ pyref/                    Python 参考实现（IR/GGUF/safetensors 解析 + pla
 
 ---
 
+- **显存余量策略（v0.1.10）**：`serve` 装载后若实测 free VRAM 低于 `--vram-margin`（默认 1200 MiB）
+  但仍有 ≥700 MiB，会打印可操作 WARN 后继续启动（桌面 WDDM 会在装载检查与 serve 守卫之间异步吃掉
+  1.5–3 GiB，固定拒绝会让默认启动随环境抖动而失败）。追求无分页风险的稳定速度时用
+  `--strict-vram`（恢复 v0.1.6 行为）。MoE 部分卸载模型在 serve 下额外预留 2048 MiB，dense 模型不受影响。
+  详见 [`docs/SERVE.md`](docs/SERVE.md) §5.6 与 [`docs/reports/PLACEMENT-VRAM-MARGIN.md`](docs/reports/PLACEMENT-VRAM-MARGIN.md) §2.4。
+
 ## 测试与 CI
 
 本地五套验证（在仓库根目录执行）（需要模型文件；先 `export MODEL_DIR=<你的模型目录>`，脚本内可 `PY=` 覆盖 Python）：

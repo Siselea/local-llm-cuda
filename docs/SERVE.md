@@ -342,15 +342,29 @@ full-row 对比，不依赖 serve）。
 
 ### 5.6 启动自检与 prefill 诊断（2026-11-21 新增）
 
-**加载后 VRAM 守卫（默认开）**：模型加载完成后若**剩余显存 < `vram_margin_mb`（默认 1200 MiB）**，
-serve 直接 `ERROR` 退出并提示 "the CUDA driver will page and decode can collapse to a few tok/s"，
-而不是 WARN + 降级 chunk 继续跑。原因是实测：显存超订时 WDDM 换页会把 decode 从 ~25 tok/s
-拖到 3–4 tok/s、长上下文请求从 0.65 s 拖到 22–43 s，比启动失败更难排查。
-確有需要（例如已知会换页但只想先起来）可加 `--allow-oversubscribe` 强制启动。
-> 注意这是**第二道防线**：`--vram-margin` 很大时 placement 规划阶段通常就会先拒绝
-> （`[placement] ERROR: model does not fit ...`），post-load guard 覆盖的是 placement 之后
-> 才增长的显存（graph 捕获/其它进程）。无论哪一道，都是"明确报错退出"而不是带病启动。
-日志：`[serve] ERROR: only N MiB VRAM free after load, below the M MiB margin: ...`。
+**加载后 VRAM 守卫（默认开，v0.1.10 起为“警告带 + 严格模式”两段式）**：
+模型加载完成后实测剩余显存：
+
+| 实测 free | 行为 |
+|---|---|
+| `>= vram_margin_mb`（默认 1200 MiB） | 正常启动 |
+| `[700 MiB, margin)` | **WARN 后继续启动**：日志 `[serve] WARN: only N MiB free after load (< margin M, >= hard floor 700); starting anyway...`，并提示 `lower --ctx / --gpu-layers`、关闭其它 GPU 程序、或用 `--strict-vram` 拒绝 |
+| `< 700 MiB` | `ERROR` 拒绝启动（可重试的测量夹紧 / 明确报错） |
+
+**为什么改成两段式**：实测桌面 WDDM 会在 loader 的 `[vram] check OK` 与 serve 守卫之间
+异步吃掉 **1.5–3 GiB**（同一 35B 命令 gap 从 1604 波动到 3230 MiB），固定“free<margin 就拒绝”
+会让默认 launcher 启动随环境抖动而间歇失败（v0.1.10 实测 35B auto ctx8192 就因此失败过）。
+为补偿这段，serve 模式对 **MoE 部分卸载模型**额外预留 `ENGINE_SERVE_RESERVE_MB`（默认 2048 MiB），
+让 placement 少放 1–2 层而不是装载后失败。
+
+- **严格模式**：`--strict-vram` / `ENGINE_STRICT_VRAM=1` 恢复 v0.1.6 行为（`free < margin` 就拒绝，
+  不进入警告带）；适合追求稳定 tok/s、明确不想承担 WDDM 换页风险的场景。
+- `--allow-oversubscribe` 仍然是“决策器判定装不下也尝试”的总开关（预期单数字 tok/s）。
+日志：
+```
+[serve] WARN: only 1093 MiB free after load (< margin 1200 MiB, >= hard floor 700 MiB); starting anyway...
+[serve] ERROR: only N MiB VRAM free after load, below the M MiB margin: ...
+```
 
 **装载后自预热（默认开）**：模型加载完成后先跑一次 128-token 哑 prefill + 8-token tail +
 1-token decode（捕获 canonical CUDA graph/首次触碰），再用 `prefix_state_save/restore`

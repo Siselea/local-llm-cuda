@@ -256,6 +256,8 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
 | f32 | 16 | 16 | no | 0 | 75.0 | 2427 | 10293 | 200（prefill 189.2 ms，首载含 CPU 专家） |
 | f32 | 4096 | 4096 | no | 160 | 57.6 | 2910 | 10239 | 200（53.0 ms） |
 | f32 | 32768 | **5217** | **yes** | 203 | **258.0** | 2814 | 10391 | 200（53.5 ms，`ctx_clamped=true`） |
+| f32 | 8192 | 8192 | no | 320 | 75.1 | 2483 | 10262 | 200（prefill 192.6 ms，v0.1.9 复测） |
+| f32 | 16384 | **4802** | **yes** | 188 | **156.8**（2 次装载） | 2196 | 11810 | 200（prefill 222.8 ms，v0.1.9 复测） |
 
 结论：
 - 35B（20.33 GiB 权重，14/40 层 CPU 专家）在 ctx16/4096 下 **verbatim 接受**、正常生成；
@@ -264,6 +266,21 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
   时夹紧 + requested→actual 可观测”在**大模型**上的实证；
 - 代价：这次 3 次装载重试共 **258 s**（35B 每次重载 ~75–90 s），来自“先按预估算装、实测后
   回退重试”的诚实策略；改进项见 §7（把 ledger gap 建模进装载前预算可减少重试）。
+  该问题已在 §2.14/§2.16 修复（单次装载），上表 ctx32768 是修复前基线。
+- **v0.1.9 复测（2026-11-27，HEAD `1c0f85b`，engine sha `91788b4…`）**：ctx8192 直接 verbatim
+  （load 75.1 s，post-load free 2483 MiB）；ctx16384 走了 **2 次装载（合计 156.8 s）**：
+  - 加载瞬间环境干净：`nvidia-smi` 起进程前 used **447 MiB**（桌面 WDDM 未膨胀），
+    所以这一行**不是环境问题**，必须按代码账目解释；
+  - 预载 split-MoE 预算先把 16384 夹到 **13107**（`split budget` 日志），装载后 runner 的
+    `[vram] check OK` 报 free 2196 MiB ≥ margin 1200；但 serve 挂完 tokenizer/prefix-cache
+    等再测时 free 只剩 **1132 MiB < 1200**（两次读数差 ~1.06 GB，即 §2.16 提到的
+    “check 与 serve-guard 之间账本外分配”在长 ctx 下再次出现）；
+  - serve 的实测夹紧建议 `(shortfall 68 MiB + safety 256 MiB)/40 KiB/token` ⇒ 一刀砍掉
+    ~8294 token，直接给到 **4802**；重载 68.3 s 后通过（post-load free 2870，读 KV 188 MiB）。
+  - **结论**：能跑、无崩溃、requested→actual 清晰，但两处是真正的**可用性优化点**（非回归）：
+    ①实测夹紧 suggestion 的 256 MiB safety 对 40 KiB/token 的模型粒度太粗（应改成
+    `max(32 MiB, 256×kv_per_token)` 之类）；②check→serve-guard 的 ~1.06 GB 账本外分配应
+    计入装载预算。列为 **v0.1.11 candidates**。绝对 tok/s 与历史不可比（模型/环境不同轮次）。
 
 ### 2.14 启动时间与装载次数（35B 长上下文的单次装载优化，commit `dd674ae`）
 
@@ -363,6 +380,44 @@ serve 口径，基线 24.4 是 test_gen 口径；同口径复测 25.4）。
 自动加层被 cushion 正确挡住，46 s 启动更快。注意：测量必须排除外部 GPU 占用（并发 A/B 时
 min_free 会掉到 20 MiB，9B 都会被误报超订）。**教训**：任何“账本外”的 CUDA
 分配（图池、cuBLAS workspace）必须先于自动放置发生，否则 margin 契约会被静默破坏。
+
+### 2.17 serve 侧预算缺口修复（v0.1.10，commit `0c1ba72`）
+
+**问题**（2026-11-27 实测，v0.1.10 HEAD，环境桌面 baseline 仅 ~450 MiB）：
+```
+[vram] check OK: 2035 MiB free >= 1200 MiB margin   ← loader 认为 OK（ledger gap 3230 MiB）
+[serve] ERROR: only 487 MiB VRAM free after load    ← serve 守卫再测，缺口 1548 MiB
+```
+同一二进制、同一命令，缺口实测 **1548 / 1743 MiB**，且 loader 的 `ledger gap` 在
+**1604 → 3230 MiB** 之间波动 ⇒ 这部分不是常数（桌面 WDDM 异步增长 + CUDA context/cuBLAS/
+图池等账本外分配），旧的“free < margin 就拒绝”会让**默认 launcher 启动随环境抖动而间歇失败**
+（本轮 35B auto ctx8192 就失败过；早先同代码 free 2483 时又能成功）。
+
+**修复（lead 批准的“两段式 + 严格模式”）**：
+1. **serve 预留**：`engine serve` 对 **MoE 部分卸载模型**预留 `ENGINE_SERVE_RESERVE_MB`
+   （默认 **2048 MiB**）；`derive_ctx_limit` / `vram_layer_fits` / auto-vram 提升预留 /
+   chunk 增长 margin / `check_post_load_vram` 全部减去它 ⇒ placement 少放 1–2 层而不是
+   装载后守卫失败。dense 模型（9B/0.5B）无专家，完全不受影响。
+2. **两段式守卫**：free ∈ [**700 MiB hard floor**, `--vram-margin`) ⇒ 打印可操作 WARN 后启动
+   （`free/margin/floor` + lower --ctx/--gpu-layers/close GPU apps/use --strict-vram）；
+   free < 700 MiB 才拒绝/实测夹紧重试。
+3. **严格模式**：`--strict-vram` / `ENGINE_STRICT_VRAM=1` 恢复 v0.1.6 行为（free < margin 拒绝）。
+
+**验收（2026-11-27，干净窗口）**：
+
+| 用例 | 结果 |
+|---|---|
+| 35B auto ctx4096 | **listening**（placement 13→10 层，check free 4390 ≥ margin+reserve） |
+| 35B auto ctx8192 | **listening**（13→9 层，check free 4686） |
+| 35B 显式 `--gpu-layers 13` | **listening**（受预留约束后实际 10 层，check free 4390） |
+| 35B `--strict-vram --vram-margin 3000` | **拒绝启动（rc=1）** ✓ 旧行为可恢复 |
+| 35B 同条件不带 strict | **listening**（不再失败） |
+| 9B / Coder / 0.5B auto ctx4096 | 全部 listening（dense 不变；Coder 12→6 层但启动正常） |
+
+**代价与标定**：35B 默认 GPU 专家层数从 13 降到 9–10（decode 会慢一些），换来默认启动在桌面
+WDDM 抖动下稳定；需要绝对速度时可用显式 `--gpu-layers`（本轮显式 13 也能启动）或
+`--strict-vram` 环境干净时追求 margin。`docs/reports/PLACEMENT-VRAM-MARGIN.md` §2.4 已更新
+“ledger gap 不是常数”的标定结论。
 
 ### 2.15 35B 30 轮会话 ⏳ v0.1.6
 

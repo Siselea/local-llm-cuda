@@ -123,6 +123,8 @@ Q5_K 12288x4096  = q5k_dp4a_s
 | `ssd_stream` | `--ssd-stream` | `ENGINE_SSD_STREAM` | bool | `false` | 仅当模型同时超过 VRAM+RAM 时才考虑 SSD 专家流式；**默认关闭**（PCIe×8/机械盘上流式通常净负收益），**本版本未实现**：显式开启会得到确定性错误 + 接口占位说明 |
 | `ssd_cache` | `--ssd-cache <dir>` | `ENGINE_SSD_CACHE` | string | `""` | SSD 专家缓存目录（接口占位；决策日志会报告该路径，流式加载本体未实现） |
 | `allow_oversubscribe` | `--allow-oversubscribe` | `ENGINE_ALLOW_OVERSUBSCRIBE` | bool | `false` | 决策器判定“VRAM+RAM 装不下”时仍尝试装载（驱动会分页，预期单数字 tok/s）；默认关闭 |
+| `strict_vram` | `--strict-vram` | `ENGINE_STRICT_VRAM` | bool | `false` | `serve` 的严格显存策略：装载后实测 free VRAM < `--vram-margin` 时**拒绝启动**（v0.1.6 行为）。默认关闭：free 落在 **700 MiB hard floor 与 margin 之间**时打印可操作 WARN 后继续启动（桌面 WDDM 会在 loader 检查与 serve 守卫之间吃掉 1.5–3 GiB，固定拒绝会让默认启动随环境抖动而失败）。追求稳定速度/无分页风险时开 `--strict-vram` |
+| `serve` 预留 | （内部 env）`ENGINE_SERVE_RESERVE_MB` | — | int | `2048` | **仅 serve 模式、仅 MoE 专家部分卸载的模型**：loader 的 placement / 逐层自适应 / post-load check 会为此预留 2048 MiB，覆盖 “loader check 与 serve 守卫之间”的账本外分配（实测 1.5–1.7 GiB；见 `docs/reports/PLACEMENT-VRAM-MARGIN.md` §2.4）。dense 模型（9B/0.5B）完全不受影响；显式设置该 env 可覆盖默认值（调试用） |
 
 ### 3.2.1 启动交互（本轮新增）
 

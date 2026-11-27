@@ -73,3 +73,31 @@
 1. **并发占用无法完全防住**：预算用的是**启动瞬间**的设备级 free VRAM；如果另一个进程在本进程装载期间抢走显存，仍可能低于 margin。此时现在会打印 `[vram] ERROR` + 明确修法（而不是静默换页）。彻底解法是"装载后真减层 + 重载"，改动较大，建议排进后续（需要动 loader 的层上传循环，或在上层做 retry 包装）。
 2. **`planner.cpp` 的 `engine plan` 建议值**尚未加同样的预留项（该路径只用于展示建议，不影响真实分层）。若要口径一致，可在 `planner::compute` 里加同一常数。
 3. 相关：`has_retry`（`verify_generality.sh`）保留为诊断兜底，但验收证明它已不是必需。
+
+---
+
+## 2.4 2026-11-27 更新：ledger gap 在 WDDM 下不是常数（serve 侧预算缺口）
+
+v0.1.9/v0.1.10 复测 35B（auto 放置 + `engine serve`）时发现：**同一条命令、同一个二进制**，
+装载后 loader 的 `[vram] check OK` 与 serve 守卫之间还会再少 **1.5–3 GiB**，且 `ledger gap`
+本身在 1604 → 3230 MiB 之间波动：
+
+```
+[vram] check OK: 2035 MiB free >= 1200 margin (gpu_moe_layers=11) [ledger gap 3230 MiB]
+[serve] ERROR: only 487 MiB VRAM free after load, below 1200 MiB margin   # Δ=1548 MiB
+```
+
+此前本节把 gap 当作可标定常数（1024/1152）。**新结论：在桌面 WDDM 共享显存活跃的机器上，
+gap 包含“桌面异步增长 + CUDA 上下文/cuBLAS/图池”两部分，是可变量**，因此：
+
+1. **serve 模式为 MoE 部分卸载模型额外预留** `ENGINE_SERVE_RESERVE_MB`（默认 **2048 MiB**，
+   在 placement / 逐层自适应 / post-load check 中扣除）：让 placement 少放 1–2 层，而不是装载后
+   serve 守卫失败。dense 模型（9B/0.5B）不受影响。
+2. **serve 守卫改为两段式**：free ∈ [700 MiB hard floor, margin) ⇒ WARN 后启动（提示环境原因与
+   修法）；free < 700 ⇒ 拒绝。`--strict-vram` 恢复旧行为（free < margin 直接拒绝）。
+3. **标定建议**：`vram_extra_reserve_mb=1024` 仍是引擎自身账本外的驱动/allocator 预留；
+   但“桌面 WDDM 波动”不应塞进这个全局标定（会把 9B 的 ctx 上限也压低），而应由
+   `ENGINE_SERVE_RESERVE_MB` + 警告带处理。
+4. 实测验收（2026-11-27，clean window）：35B serve auto ctx4096/8192 在 reserve=1280 时已能
+   listening（serve free 2364/1919 MiB ≥ margin 1200）；reserve=2048 + 警告带后，显式
+   `--gpu-layers 13` 在抖动条件下也不再失败。数据见 `docs/reports/CTX-AND-EXTREMES.md` §2.16/§2.17。
