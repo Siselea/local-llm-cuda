@@ -36,7 +36,7 @@ REQUIRED_ROOT_FILES = [
     "engine.cfg.example",
 ]
 # Whole trees that belong in a source release.
-INCLUDE_DIRS = ["src", "include", "tests", "tools", "pyref", "docs", ".github"]
+INCLUDE_DIRS = ["src", "include", "tests", "tools", "pyref", "docs", ".github", "webui"]
 # Never pack these, even inside included trees.
 EXCLUDE_SUFFIXES = (".pre", ".v1", ".bak", ".orig", ".rej", ".pyc", ".pyo", ".swp")
 EXCLUDE_DIR_NAMES = {"__pycache__", ".git", ".pytest_cache", ".mypy_cache"}

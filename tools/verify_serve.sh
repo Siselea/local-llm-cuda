@@ -94,7 +94,7 @@ else
   bad "GET /props" "$R"
 fi
 CODE=$(curl.exe -s -m 10 -o build/logs/serve_index.html -w '%{http_code}' "$BASE/")
-if [ "$CODE" = "200" ] && grep -qE "local chat|llama\.cpp" build/logs/serve_index.html; then
+if [ "$CODE" = "200" ] && grep -qE "local chat|llama\.cpp|本地对话" build/logs/serve_index.html; then
   ok "GET / browser chat UI"
 else
   bad "GET / browser chat UI (code=$CODE)"

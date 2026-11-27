@@ -38,15 +38,23 @@ jobs:
         shell: bash
         run: bash build.sh
 
-      - name: Package release zip (no models / no webui / no logs)
+      - name: Fetch official llama.cpp web UI (MIT)
+        shell: bash
+        run: |
+          bash tools/fetch_webui.sh
+          test -s build/webui/index.html
+
+      - name: Package release zip (no models / no logs; bundles official llama.cpp webui)
         shell: bash
         env:
           TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          mkdir -p dist/pkg
+          mkdir -p dist/pkg/webui
           cp build/engine.exe build/launcher.exe 启动.bat stop.bat engine.cfg.example README.md dist/pkg/
           cp docs/release/运行说明.txt dist/pkg/
+          cp build/webui/index.html dist/pkg/webui/index.html
+          cp webui/LICENSE.llama.cpp.txt dist/pkg/webui/LICENSE.llama.cpp.txt
           PYTHONIOENCODING=utf-8 python - <<'PY'
           import hashlib
           import os
@@ -61,6 +69,11 @@ jobs:
           with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
               for f in files:
                   z.write(pkg / f, arcname=f)
+              for p in sorted((pkg / "webui").rglob("*")):
+                  if p.is_file():
+                      z.write(p, arcname=p.relative_to(pkg).as_posix())
+          with zipfile.ZipFile(target) as check:
+              assert "webui/index.html" in check.namelist(), "webui/index.html missing from release zip"
           sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
           lines = [f"{sha(target)}  {target.name}",
                    f"{sha(pkg / 'engine.exe')}  engine.exe",

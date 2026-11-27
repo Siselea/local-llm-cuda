@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -71,6 +72,11 @@ def main() -> int:
             last_error = f"not a valid gzip bundle: {exc}"
             print(f"  FAILED: {last_error}")
             continue
+        # Apply the documented offline edit (see docs/WEBUI.md / THIRD-PARTY.md):
+        # the Python interpreter Web Worker was the only CDN dependency; point it
+        # at a local path so the bundled page has zero network dependencies.
+        html = re.sub(rb'https://cdn\.jsdelivr\.net/pyodide/[^"\']+/pyodide\.js',
+                      b'/webui/pyodide.js', html)
         gz_path.write_bytes(data)
         html_path.write_bytes(html)
         sha = hashlib.sha256(data).hexdigest()[:16]

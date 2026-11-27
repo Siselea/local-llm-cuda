@@ -1,12 +1,14 @@
 # Third-party notices / 第三方声明
 
-This repository contains **only original source code and documentation** written
-for this project, except where explicitly noted below. It does **not** contain
-model weights, CUDA redistribution binaries, or the upstream llama.cpp web UI
-bundle (the latter is downloaded by the user at build/setup time).
+The source repository contains **only original source code and documentation**
+written for this project, except where explicitly noted below. It does **not**
+commit model weights, CUDA redistribution binaries, or the upstream llama.cpp
+web UI bundle; the official **Release binary zip bundles the web UI** under
+`webui/index.html` with its MIT license at `webui/LICENSE.llama.cpp.txt`.
 
-本仓库只包含本项目自研源码与文档；**不包含模型权重、CUDA 二进制分发、llama.cpp
-webui 前端 bundle**（后者由用户首次运行时自行下载）。
+本仓库源码树只包含本项目自研源码与文档；**不提交模型权重、CUDA 二进制分发、
+llama.cpp webui 前端 bundle**。官方 **Release 的 Windows zip 已内置**该前端
+（`webui/index.html`）及其 MIT 许可证（`webui/LICENSE.llama.cpp.txt`）。
 
 ## 1. llama.cpp official web UI
 
@@ -14,9 +16,11 @@ webui 前端 bundle**（后者由用户首次运行时自行下载）。
 - Component used: `tools/server/public/index.html.gz` from tag **b6000**
   (upstream commit `4762ad7316`, 2025-07-27).
 - Our usage: `engine serve` serves this single-file chat UI at `/`.
-  The file is **not committed** to this repository (≈4.4 MB after gunzip); fetch
-  it with `python tools/fetch_webui.py` (or `bash tools/fetch_webui.sh`), which
-  stores it under `build/webui/` (git-ignored).
+  The web UI bundle is **not committed** to the source repository (≈4.4 MB after
+  gunzip); official Release zips bundle it at `webui/index.html` together with
+  `webui/LICENSE.llama.cpp.txt`. Source builds can fetch it with
+  `python tools/fetch_webui.py` (or `bash tools/fetch_webui.sh`), which stores it
+  under `build/webui/` (git-ignored).
 - Upstream project: <https://github.com/ggml-org/llama.cpp>
 - Upstream license: <https://github.com/ggml-org/llama.cpp/blob/master/LICENSE>
 

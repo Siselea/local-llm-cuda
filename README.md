@@ -5,8 +5,8 @@
 [![build](https://github.com/Siselea/local-llm-cuda/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Siselea/local-llm-cuda/actions/workflows/build.yml)
 
 > **不想自己编译？** 从 [Releases 最新版](https://github.com/Siselea/local-llm-cuda/releases/latest)
-> 下载 Windows x64 zip（engine.exe + launcher.exe + 启动脚本，不含模型）。
-> 首次运行 web UI 前用 `bash tools/fetch_webui.sh` 获取聊天前端（MIT，4.4 MB，不随仓库分发）。
+> 下载 Windows x64 zip（engine.exe + launcher.exe + 启动脚本 + **官方 llama.cpp 聊天界面
+> `webui/index.html`（MIT）**，不含模型）。从源码构建时可用 `bash tools/fetch_webui.sh` 获取。
 
 ## 截图
 
@@ -20,7 +20,7 @@
 
 ![llama.cpp 官方聊天界面](docs/images/webui-chat.png)
 
-*`engine serve` 直接服务的 llama.cpp 官方 web UI（MIT；首次用 `bash tools/fetch_webui.sh` 获取，未获取时使用内置极简页）。*
+*`engine serve` 直接服务的 llama.cpp 官方 web UI（MIT）。Release zip 已内置；源码构建可用 `bash tools/fetch_webui.sh` 获取，未获取时使用内置极简页。*
 
 
 
@@ -144,13 +144,14 @@ build/launcher.exe        # 或双击仓库根目录的 启动.bat
 - 首次启动会扫描**所有固定盘/移动盘**上的 `.gguf`（缓存位于 `build/engine-models-cache.json`，
   之后秒开；“重新扫描（后台）”按钮可强刷）。
 - 在模型下拉里选模型 → 「启动引擎」→ 「打开对话页」。
-- 首次使用 web UI 前，建议先 fetch 官方前端（4.4MB，MIT，不随仓库分发）：
+- Release zip **已内置官方 llama.cpp 聊天界面**（`webui/index.html`，MIT）；从源码构建时
+  可先 fetch 官方前端（4.4MB，不随仓库提交）：
 
 ```bash
 bash tools/fetch_webui.sh     # 或 python tools/fetch_webui.py
 ```
 
-  （不 fetch 也能用：服务会提供一个内置的极简聊天页。）
+  （不 fetch 也能用：服务会提供一个内置的极简聊天页；zip 内始终使用官方页面。）
 - 启动器会把日志写到 `build/launcher-engine.log`；停止/退出会清理子进程。
 
 ### 4. 命令行
@@ -313,8 +314,9 @@ GitHub Actions（`.github/workflows/`）：
 ## 许可与第三方
 
 - 本项目代码：**MIT License**，见 [`LICENSE`](LICENSE)（Copyright (c) 2026 Siselea）。
-- 聊天前端来自 **llama.cpp**（MIT，`ggml-org/llama.cpp` tag b6000），运行时不随仓库分发，
-  由 `tools/fetch_webui.py` 下载。
+- 聊天前端来自 **llama.cpp**（MIT，`ggml-org/llama.cpp` tag b6000）。源码树不提交该
+  bundle；**官方 Release zip 已内置 `webui/index.html` + `webui/LICENSE.llama.cpp.txt`**，
+  源码构建可用 `tools/fetch_webui.py` 下载。
 - 运行时使用 **NVRTC / cuBLAS / cudart**（NVIDIA，用户自备）与 **ziglang**（MIT，构建工具）。
 - **不包含任何模型权重**；Qwen / DeepSeek / Gemma 等模型遵循各自许可证，详见
   [`THIRD-PARTY.md`](THIRD-PARTY.md)。
@@ -337,7 +339,8 @@ GPUs** (C++17 + CUDA, no MSVC/CUDA Toolkit/admin required: ziglang + NVRTC + pip
 - Quick start: `python -m pip install ziglang nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12
   nvidia-cuda-runtime-cu12` → `bash build.sh` → `build/launcher.exe` (or
   `./build/engine.exe serve <MODEL_DIR>/model.gguf --port 7030 --ctx 4096`),
-  then open `http://127.0.0.1:7030/`. Chat UI: `bash tools/fetch_webui.sh`.
+  then open `http://127.0.0.1:7030/`. The release zip bundles the official llama.cpp web UI;
+  source builds can fetch it with `bash tools/fetch_webui.sh`.
 - MIT licensed code; third-party notices in [`THIRD-PARTY.md`](THIRD-PARTY.md).
 - Docs: [`docs/CONFIG.md`](docs/CONFIG.md), [`docs/SERVE.md`](docs/SERVE.md),
   [`docs/reports/INDEX.md`](docs/reports/INDEX.md).
