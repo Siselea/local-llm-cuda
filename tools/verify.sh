@@ -79,6 +79,7 @@ if [ -x ./build/test_cpu_moe.exe ]; then ./build/test_cpu_moe.exe || fail=1; els
 if [ -x ./build/test_gemv.exe ]; then ./build/test_gemv.exe || fail=1; else echo "missing build/test_gemv.exe"; fail=1; fi
 if [ -x ./build/test_kv.exe ]; then ./build/test_kv.exe || fail=1; else echo "missing build/test_kv.exe"; fail=1; fi
 if [ -x ./build/test_kernel_bounds.exe ]; then ./build/test_kernel_bounds.exe || fail=1; else echo "missing build/test_kernel_bounds.exe"; fail=1; fi
+if [ -x ./build/test_q35_geometry.exe ]; then ./build/test_q35_geometry.exe || fail=1; else echo "missing build/test_q35_geometry.exe"; fail=1; fi
 if [ -x ./build/test_model.exe ]; then
   ./build/test_model.exe || fail=1
   ./build/test_model.exe build/fixtures/tiny_model4 || fail=1

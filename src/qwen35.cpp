@@ -35,9 +35,88 @@ constexpr float kQ35Eps = 1e-6f;
 bool tensor_exists(const std::shared_ptr<void>&, const std::string&);
 }  // namespace
 
+// ------------------------------------------ Gated DeltaNet geometry checks ----
+// These run at load time (from load_q35_linear / load_q35_attn) so a checkpoint whose
+// geometry the kernels cannot represent is rejected with a precise message instead of
+// silently computing a wrong head map or recurrent state.
+namespace q35_geometry {
+
+void validate_ssm(const ir::SSMDesc& s, bool gguf_container) {
+  if (s.variant != "gated_delta") return;
+  // gd_conv_state implements the K=4 shift explicitly (and gd_ssm_prep keeps hist[8]).
+  // Every shipped qwen35 checkpoint uses conv_kernel=4; reject anything else instead of
+  // keeping a wrong conv history.
+  if (s.conv_kernel != 4) {
+    throw std::runtime_error(
+        "Gated DeltaNet conv kernel K=" + std::to_string(s.conv_kernel) +
+        " unsupported (this build implements K=4 only); refusing the model instead of "
+        "computing a wrong recurrent state");
+  }
+  if (s.n_key_head <= 0 || s.n_value_head <= 0) {
+    throw std::runtime_error("Gated DeltaNet head geometry: n_key_head=" +
+                             std::to_string(s.n_key_head) + " n_value_head=" +
+                             std::to_string(s.n_value_head) + " (both must be > 0)");
+  }
+  if (s.key_head_dim <= 0 || s.value_head_dim <= 0) {
+    throw std::runtime_error("Gated DeltaNet head geometry: key_head_dim=" +
+                             std::to_string(s.key_head_dim) + " value_head_dim=" +
+                             std::to_string(s.value_head_dim) + " (both must be > 0)");
+  }
+  if (s.value_head_dim > 1024) {
+    throw std::runtime_error("Gated DeltaNet value_head_dim=" +
+                             std::to_string(s.value_head_dim) +
+                             " exceeds the 1024-thread delta-rule launch");
+  }
+  if (s.key_head_dim > s.value_head_dim) {
+    throw std::runtime_error(
+        "Gated DeltaNet key_head_dim=" + std::to_string(s.key_head_dim) +
+        " > value_head_dim=" + std::to_string(s.value_head_dim) +
+        ": the generic delta-rule kernel cannot fill its key/query staging");
+  }
+  if (!gguf_container && s.n_value_head % s.n_key_head != 0) {
+    throw std::runtime_error(
+        "Gated DeltaNet HF head map needs divisibility: value_head_count=" +
+        std::to_string(s.n_value_head) + " % key_head_count=" + std::to_string(s.n_key_head) +
+        " != 0 (repeat_interleave mapping)");
+  }
+  if (s.key_dim != s.n_key_head * s.key_head_dim) {
+    throw std::runtime_error("Gated DeltaNet key_dim=" + std::to_string(s.key_dim) +
+                             " != key_head_count*key_head_dim=" +
+                             std::to_string(s.n_key_head * s.key_head_dim));
+  }
+  if (s.value_dim != s.n_value_head * s.value_head_dim) {
+    throw std::runtime_error("Gated DeltaNet value_dim=" + std::to_string(s.value_dim) +
+                             " != value_head_count*value_head_dim=" +
+                             std::to_string(s.n_value_head * s.value_head_dim) +
+                             " (metadata truncating division?)");
+  }
+  if (s.conv_dim != 2 * s.key_dim + s.value_dim) {
+    throw std::runtime_error(
+        "Gated DeltaNet conv_dim=" + std::to_string(s.conv_dim) +
+        " != 2*key_dim + value_dim=" + std::to_string(2 * s.key_dim + s.value_dim) +
+        " (conv kernel width does not match the q|k|v head geometry)");
+  }
+}
+
+void validate_attention_heads(int n_head, int n_kv) {
+  if (n_head <= 0 || n_kv <= 0) {
+    throw std::runtime_error("attention head geometry: head_count=" + std::to_string(n_head) +
+                             " head_count_kv=" + std::to_string(n_kv) + " (both must be > 0)");
+  }
+  if (n_head % n_kv != 0) {
+    throw std::runtime_error(
+        "attention head_count=" + std::to_string(n_head) + " % head_count_kv=" +
+        std::to_string(n_kv) + " != 0: the GQA group map would silently drop heads");
+  }
+}
+
+}  // namespace q35_geometry
+
+
 // ---------------------------------------------------------------- loading ----
 void DenseRunner::load_q35_linear(int i, LayerW& w) {
   const auto& S = ir_.ssm;
+  q35_geometry::validate_ssm(S, container_ == Container::Gguf);
   const int C = S.conv_dim;
   const std::string p = "blk." + std::to_string(i) + ".";
   w.is_linear = true;
@@ -240,6 +319,7 @@ void DenseRunner::load_q35_ffn(int i, LayerW& w) {
 }
 
 void DenseRunner::load_q35_attn(int i, LayerW& w) {
+  q35_geometry::validate_attention_heads(n_head_, n_kv_);
   const std::string p = "blk." + std::to_string(i) + ".";
   w.ln1 = upload(tensor_f32(p + "attn_norm.weight"));
   w.ln2 = upload(tensor_f32(p + "post_attention_norm.weight"));

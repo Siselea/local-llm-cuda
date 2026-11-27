@@ -44,6 +44,7 @@ build tests/test_cpu_quant.cpp test_cpu_quant.exe
 build tests/test_cpu_moe.cpp test_cpu_moe.exe
 build tests/test_q35_conv.cpp test_q35_conv.exe
 build tests/test_kernel_bounds.cpp test_kernel_bounds.exe
+build tests/test_q35_geometry.cpp test_q35_geometry.exe
 build tests/test_mla_cache_cmp.cpp test_mla_cmp.exe
 build tests/test_matrix.cpp test_matrix.exe
 build tests/test_tokenizer.cpp test_tokenizer.exe
