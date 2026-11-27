@@ -128,7 +128,10 @@
 3. `hidden % n_head` 未校验（`key_length` 回退计算会截断）；
 4. GDN 量级无护栏（conv_kernel/groups/state 异常大）。
 **修复**：`ir.cpp` 加载期抛 `std::runtime_error`（GQA head 计数关系、GDN `inner % tsr == 0` 与 `tsr > 0`、`hidden % n_head`、非法量级），错误信息指出具体字段。
-**归属**：`qwen35.cpp` 的**运行时**卷积/混合头几何（per-layer 不同 head 数、conv 状态索引）属 `edge-kernels` 执行路径，本轮只做了 **IR 加载期校验**；已同步给 lead 转交。
+**归属（已核实）**：`qwen35.cpp` 的 **Gated DeltaNet 加载期几何校验**（K=4、head map、conv_dim 一致性）已由另一路在 commit **`f7a4ca9`**（`fix(qwen35): load-time Gated DeltaNet geometry validation`，含 `tests/test_q35_geometry.cpp` 门禁）完成，**与本轮的 ir.cpp 校验互补不冲突**：
+- `f7a4ca9`：qwen35 专属的 GDN 参数/卷积几何（在 IR 构建后的 qwen35 路径）；
+- 本轮 `ir.cpp`：通用 IR 层（GQA `n_head % n_head_kv`、GDN `inner % tsr`/`tsr > 0`、`hidden % n_head`、量级护栏），任何架构都会先经过。
+两者叠加后 #13 的加载期校验完整；`run_moe`/混合注意力的**运行时**索引仍建议 `edge-kernels` 在 D6/D7 审计时复核（本轮未动执行路径）。
 
 ---
 
