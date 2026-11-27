@@ -20,17 +20,22 @@
 
 namespace planner {
 
-PlacementPlan compute(const ir::Model& m, int ctx, int kv_bpe, uint64_t vram_total,
+PlacementPlan compute(const ir::Model& m, int ctx, int kv_type, uint64_t vram_total,
                       uint64_t vram_reserve, uint64_t workspace) {
   PlacementPlan p;
   p.ctx = ctx;
-  p.kv_bpe = kv_bpe;
+  p.kv_type = kv_type;
+  p.kv_name = kv_type == 1 ? "q8_0" : (kv_type == 2 ? "q4_0" : "f32");
   p.vram_total = vram_total;
   p.vram_reserve = vram_reserve;
   p.workspace_bytes = workspace;
 
   p.fixed_bytes = m.fixed_bytes();
-  p.kv_bytes = m.kv_bytes_per_token(kv_bpe) * static_cast<uint64_t>(ctx);
+  // The budget must use the layout the runner really allocates (kv_type), not the
+  // legacy bytes-per-value estimate: the two differ 2x for the default f32 cache, and
+  // the plan's own [placement] section already used kv_type (same command printed
+  // "kv cache 256 MiB" next to "KV 512 MiB").
+  p.kv_bytes = placement::kv_bytes(m, ctx, kv_type);
   p.expert_total = m.expert_bytes();
   p.expert_per_layer = m.expert_bytes_per_layer();
   const int n_moe_layers = static_cast<int>(p.expert_per_layer.size());
@@ -48,6 +53,8 @@ PlacementPlan compute(const ir::Model& m, int ctx, int kv_bpe, uint64_t vram_tot
     p.slots_per_layer = 0;
     p.fully_resident = true;
   } else {
+    // Advisory uniform estimate (what --n-cpu-moe expresses): how many MoE layers fit if
+    // every layer had the average expert size.  Kept for display/back-compat.
     // double division to match pyref/planner.py exactly (int vs float diverges at boundaries)
     const double avg_layer = static_cast<double>(p.expert_total) / n_moe_layers;
     const uint64_t divisor = avg_layer >= 1.0 ? static_cast<uint64_t>(avg_layer) : 1;
@@ -56,8 +63,22 @@ PlacementPlan compute(const ir::Model& m, int ctx, int kv_bpe, uint64_t vram_tot
     if (m.moe.n_expert > 0)
       p.slots_per_layer = std::min(p.slots_per_layer, m.moe.n_expert);
     p.slots_per_layer = std::max(0, p.slots_per_layer);
-    p.layers_on_gpu = p.fully_resident ? n_moe_layers : std::min(n_moe_layers, p.slots_per_layer);
+    // Exact layer-granular placement: walk the real per-layer expert bytes instead of
+    // assuming the average (#27).  Tensor sizes differ per layer, so the average can
+    // over/under-estimate where VRAM actually runs out.
+    p.layers_on_gpu = 0;
+    uint64_t used = 0;
+    for (const auto& [layer, bytes] : p.expert_per_layer) {
+      if (used + bytes > p.expert_budget) break;
+      used += bytes;
+      ++p.layers_on_gpu;
+    }
     p.layers_on_cpu = std::max(0, n_moe_layers - p.layers_on_gpu);
+    int idx = 0;
+    for (const auto& [layer, bytes] : p.expert_per_layer) {
+      (void)bytes;
+      p.layer_placement[layer] = (idx++ < p.layers_on_gpu) ? "gpu" : "cpu";
+    }
   }
 
   // projections
@@ -77,7 +98,7 @@ PlacementPlan compute(const ir::Model& m, int ctx, int kv_bpe, uint64_t vram_tot
       static_cast<double>(active_expert_bytes) / (BW_PCIE_H2D_GBPS * 1e9) * 1e3);
 
   if (!p.fully_resident && n_moe_layers)
-    p.notes.push_back("uniform placement: " + std::to_string(p.layers_on_gpu) + "/" +
+    p.notes.push_back("expert placement: " + std::to_string(p.layers_on_gpu) + "/" +
                       std::to_string(n_moe_layers) + " MoE layers fit; llama.cpp equivalent is --n-cpu-moe " +
                       std::to_string(p.layers_on_cpu));
   if (m.ctx_train && ctx > m.ctx_train)
@@ -309,8 +330,6 @@ Decision decide(const Input& in) {
   const auto per_layer = m.expert_bytes_per_layer();
   d.n_moe_layers = static_cast<int>(per_layer.size());
   const uint64_t vram_need_all = d.vram_need + d.expert_bytes;
-  const double avg_layer =
-      d.n_moe_layers ? static_cast<double>(d.expert_bytes) / d.n_moe_layers : 0.0;
 
   if (!in.vram.valid) {
     d.kind = Kind::Gpu;
@@ -336,9 +355,17 @@ Decision decide(const Input& in) {
     d.fits_all = in.host.valid && d.host_need <= d.host_usable;
     if (d.fits_all) {
       d.kind = Kind::Split;
-      d.gpu_moe_layers = avg_layer > 0.0
-                             ? static_cast<int>(static_cast<double>(d.vram_left) / avg_layer)
-                             : 0;
+      // Exact layer-granular estimate (same rule as the budget plan): walk the real
+      // per-layer expert bytes instead of dividing by the average layer size, which
+      // over/under-estimates where VRAM actually runs out (#27).
+      d.gpu_moe_layers = 0;
+      uint64_t used = 0;
+      for (const auto& [layer, bytes] : per_layer) {
+        (void)layer;
+        if (used + bytes > d.vram_left) break;
+        used += bytes;
+        ++d.gpu_moe_layers;
+      }
       d.gpu_moe_layers = std::max(0, std::min(d.gpu_moe_layers, d.n_moe_layers));
       d.reason = "weights exceed VRAM but fit VRAM + host RAM: CPU expert offload path";
       d.notes.push_back("VRAM keeps " + fmt_bytes(d.vram_left) + " of experts -> about " +

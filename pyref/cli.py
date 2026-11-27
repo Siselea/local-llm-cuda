@@ -91,20 +91,84 @@ def cmd_ir(args) -> int:
     return 0
 
 
+def _host_memory() -> "object":
+    """Best-effort host RAM probe (no third-party dependency).  The parity gate always
+    passes --host-gib, so this path only matters for ad-hoc use."""
+    from .placement import MemoryInfo
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return MemoryInfo(True, int(st.ullTotalPhys), int(st.ullAvailPhys))
+        else:
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            avail = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+            return MemoryInfo(True, int(total), int(avail))
+    except Exception:
+        pass
+    return MemoryInfo(False, 0, 0)
+
+
+def _kv_type(value: str) -> int:
+    v = str(value).strip().lower()
+    if v in ("f32", "0", "auto", ""):
+        return 0
+    if v in ("q8_0", "q8", "1"):
+        return 1
+    if v in ("q4_0", "q4", "2"):
+        return 2
+    raise SystemExit(f"--kv-type expects f32|q8_0|q4_0 (or 0|1|2), got {value}")
+
+
 def cmd_plan(args) -> int:
+    from . import placement as pl
+
     ir = _load(args.model)
-    p = plan(ir, ctx=args.ctx, kv_bpe=args.kv_bpe,
+    kv_type = _kv_type(args.kv_type)
+    vram = pl.MemoryInfo(True, int(args.vram_gib * (1 << 30)), int(args.vram_gib * (1 << 30)))
+    host = (_host_memory() if args.host_gib is None
+            else pl.MemoryInfo(True, int(args.host_gib * (1 << 30)),
+                               int(args.host_gib * (1 << 30))))
+    mib = 1 << 20
+    vram_reserve = int((args.vram_margin_mb + args.workspace_mb) * mib)
+    workspace = int(args.workspace_mb * mib)
+    host_reserve = (int(args.host_margin_mb * mib) if args.host_margin_mb
+                    else pl.default_host_reserve(host.total_bytes))
+    p = plan(ir, ctx=args.ctx, kv_type=kv_type,
              vram_total=int(args.vram_gib * (1 << 30)))
+    have = vram.valid
+    d = None
+    fit = None
+    if have:
+        d = pl.decide(ir, p.ctx, kv_type, vram, host, vram_reserve, host_reserve, workspace)
+        fit = pl.estimate_ctx(ir, kv_type, vram.free_bytes, vram_reserve, args.row_cap)
+
     print(f"model        : {ir.path}")
-    print(f"ctx={p.ctx} kv_bpe={p.kv_bpe} vram={args.vram_gib} GiB")
+    print(f"ctx={p.ctx} kv_type={p.kv_name} vram={args.vram_gib} GiB")
     print(f"fixed        : {_human(p.fixed_bytes)}")
     print(f"kv cache     : {_human(p.kv_bytes)}")
     print(f"workspace    : {_human(p.workspace_bytes)}")
     print(f"expert budget: {_human(p.expert_budget)} / total experts {_human(p.expert_total)}")
     if ir.moe.n_expert:
-        print(f"slots/layer  : {p.slots_per_layer}")
+        print(f"slots/layer  : {p.slots_per_layer} (uniform advisory)")
         print(f"layers       : {p.layers_on_gpu} on GPU / {p.layers_on_cpu} on CPU"
               f"  (fully_resident={p.fully_resident})")
+        for layer, where in p.layer_placement.items():
+            print(f"layer {layer:<6} : {where}")
     else:
         need = p.fixed_bytes + p.kv_bytes + p.workspace_bytes
         print(f"dense model  : no experts; resident need = {_human(need)} "
@@ -114,9 +178,56 @@ def cmd_plan(args) -> int:
           f"pcie {p.proj_decode_pcie_ms:.1f} ms/token")
     for n in p.notes:
         print(f"note         : {n}")
+    if have:
+        print(f"[placement] decision: {pl.kind_name(d.kind)}")
+        print(f"[placement] reason  : {d.reason}")
+        for n in d.notes:
+            print(f"[placement] note    : {n}")
+        print(f"[suggested]  ctx {fit.max_ctx} ({fit.kv_name}, {fit.kv_per_token} B/token, "
+              f"KV {_human(fit.kv_at_max)} at max)")
+
     if args.json:
+        doc = {"model": ir.path, **p.to_json()}
+        if have:
+            doc["placement"] = {
+                "kind": pl.kind_name(d.kind),
+                "n_moe_layers": d.n_moe_layers,
+                "gpu_moe_layers": d.gpu_moe_layers,
+                "fits_vram": d.fits_vram,
+                "fits_all": d.fits_all,
+                "dense_offload_unsupported": d.dense_offload_unsupported,
+                "model_bytes": d.model_bytes,
+                "fixed_bytes": d.fixed_bytes,
+                "expert_bytes": d.expert_bytes,
+                "kv_bytes": d.kv_bytes,
+                "workspace_bytes": d.workspace_bytes,
+                "vram_total": d.vram_total,
+                "vram_free": d.vram_free,
+                "vram_reserve": d.vram_reserve,
+                "vram_usable": d.vram_usable,
+                "vram_need": d.vram_need,
+                "vram_left": d.vram_left,
+                "host_total": d.host_total,
+                "host_free": d.host_free,
+                "host_reserve": d.host_reserve,
+                "host_usable": d.host_usable,
+                "host_need": d.host_need,
+                "reason": d.reason,
+                "notes": list(d.notes),
+            }
+            doc["suggested_ctx"] = {
+                "kv_type": fit.kv_type,
+                "kv_name": fit.kv_name,
+                "kv_per_token": fit.kv_per_token,
+                "max_ctx": fit.max_ctx,
+                "kv_at_max": fit.kv_at_max,
+                "row_cap": args.row_cap,
+            }
+        else:
+            doc["placement"] = None
+            doc["suggested_ctx"] = None
         with open(args.json, "w", encoding="utf-8") as f:
-            json.dump({"model": ir.path, **p.to_json()}, f, ensure_ascii=False, indent=2)
+            json.dump(doc, f, ensure_ascii=False, indent=2)
         print(f"wrote {args.json}")
     return 0
 
@@ -131,7 +242,13 @@ def main(argv=None) -> int:
     b.add_argument("--force", action="store_true"); b.set_defaults(fn=cmd_ir)
     c = sub.add_parser("plan")
     c.add_argument("model"); c.add_argument("--ctx", type=int, default=8192)
-    c.add_argument("--kv-bpe", type=int, default=2); c.add_argument("--vram-gib", type=float, default=12)
+    c.add_argument("--kv-type", default="f32")
+    c.add_argument("--vram-gib", type=float, default=12)
+    c.add_argument("--host-gib", type=float, default=None)
+    c.add_argument("--row-cap", type=int, default=512)
+    c.add_argument("--vram-margin-mb", type=int, default=1200)
+    c.add_argument("--workspace-mb", type=int, default=768)
+    c.add_argument("--host-margin-mb", type=int, default=0)
     c.add_argument("--json"); c.set_defaults(fn=cmd_plan)
 
     args = ap.parse_args(argv)

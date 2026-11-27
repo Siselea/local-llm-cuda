@@ -123,6 +123,13 @@ for m in "${MODELS[@]}"; do
   [ -e "$m" ] || { echo "skip (missing): $m"; continue; }
   "$PY" tools/diff_plan.py "$m" || fail=1
 done
+# Planner parity matrix (budget plan + placement decision + suggested ctx, CPU-only):
+# needs the GGUF release models; skipped when MODEL_DIR is unset.
+if [ -n "${MODEL_DIR}" ]; then
+  MODEL_DIR="${MODEL_DIR}" "$PY" tools/planner_parity.py || fail=1
+else
+  echo "skip planner parity (MODEL_DIR unset)"
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then

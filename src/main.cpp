@@ -340,17 +340,96 @@ int cmd_ir(const std::string& path, const std::string& out, bool with_tensors, b
   return 0;
 }
 
-int cmd_plan(const std::string& path, int ctx, double vram_gib, bool vram_given, int kv_bpe,
+int cmd_plan(const std::string& path, int ctx, double vram_gib, bool vram_given,
+             double host_gib, bool host_given, int kv_type, int row_cap,
              const std::string& json_out) {
   Loaded l = load(path);
   const auto& m = l.model;
-  auto p = planner::compute(m, ctx, kv_bpe, static_cast<uint64_t>(vram_gib * (1ull << 30)));
+  auto p = planner::compute(m, ctx, kv_type, static_cast<uint64_t>(vram_gib * (1ull << 30)));
+
+  // The placement decision and the pre-load ctx recommendation use the same memory
+  // inputs as the budget plan.  --vram-gib / --host-gib simulate the device/host
+  // budgets for offline, byte-deterministic planning (the launcher passes the real
+  // probes); without them the real probes are used and the JSON section is null when
+  // no CUDA device is available.
+  placement::MemoryInfo vram;
+  if (vram_given) {
+    vram.valid = true;
+    vram.total_bytes = vram.free_bytes = static_cast<uint64_t>(vram_gib * (1ull << 30));
+  } else {
+    vram = placement::device_memory();
+  }
+  placement::MemoryInfo host;
+  if (host_given) {
+    host.valid = true;
+    host.total_bytes = host.free_bytes = static_cast<uint64_t>(host_gib * (1ull << 30));
+  } else {
+    host = placement::host_memory();
+  }
+  engine::config::Config& cfg = engine::config::Config::get();
+  const uint64_t host_reserve = [&]() {
+    const uint64_t v = static_cast<uint64_t>(cfg.get_int("host_margin_mb")) << 20;
+    if (v) return v;
+    return placement::default_host_reserve(host.total_bytes);
+  }();
+  const uint64_t vram_reserve = placement_reserve_bytes();
+  const uint64_t workspace = static_cast<uint64_t>(cfg.get_int("workspace_mb")) << 20;
+  placement::Decision d;
+  bool have_decision = false;
+  if (vram.valid) {
+    placement::Input in;
+    in.model = &m;
+    in.ctx = p.ctx > 0 ? p.ctx : 1;
+    in.kv_type = kv_type;
+    in.vram = vram;
+    in.host = host;
+    in.vram_reserve = vram_reserve;
+    in.host_reserve = host_reserve;
+    in.workspace = workspace;
+    in.ssd_requested = cfg.get_bool("ssd_stream") || cfg.get_string("placement_policy") == "ssd";
+    d = placement::decide(in);
+    have_decision = true;
+  }
+  placement::CtxFit fit;
+  if (vram.valid) fit = placement::estimate_ctx(m, kv_type, vram.free_bytes, vram_reserve, row_cap);
+
   if (!json_out.empty()) {
+    auto write_placement = [&](json::Writer& w) {
+      w.begin_obj();
+      w.key("kind"); w.str(placement::kind_name(d.kind));
+      w.key("n_moe_layers"); w.integer(d.n_moe_layers);
+      w.key("gpu_moe_layers"); w.integer(d.gpu_moe_layers);
+      w.key("fits_vram"); w.boolean(d.fits_vram);
+      w.key("fits_all"); w.boolean(d.fits_all);
+      w.key("dense_offload_unsupported"); w.boolean(d.dense_offload_unsupported);
+      w.key("model_bytes"); w.uinteger(d.model_bytes);
+      w.key("fixed_bytes"); w.uinteger(d.fixed_bytes);
+      w.key("expert_bytes"); w.uinteger(d.expert_bytes);
+      w.key("kv_bytes"); w.uinteger(d.kv_bytes);
+      w.key("workspace_bytes"); w.uinteger(d.workspace_bytes);
+      w.key("vram_total"); w.uinteger(d.vram_total);
+      w.key("vram_free"); w.uinteger(d.vram_free);
+      w.key("vram_reserve"); w.uinteger(d.vram_reserve);
+      w.key("vram_usable"); w.uinteger(d.vram_usable);
+      w.key("vram_need"); w.uinteger(d.vram_need);
+      w.key("vram_left"); w.uinteger(d.vram_left);
+      w.key("host_total"); w.uinteger(d.host_total);
+      w.key("host_free"); w.uinteger(d.host_free);
+      w.key("host_reserve"); w.uinteger(d.host_reserve);
+      w.key("host_usable"); w.uinteger(d.host_usable);
+      w.key("host_need"); w.uinteger(d.host_need);
+      w.key("reason"); w.str(d.reason);
+      w.key("notes"); w.begin_arr();
+      for (const auto& n : d.notes) w.str(n);
+      w.end_arr();
+      w.end_obj();
+    };
     json::Writer w;
     w.begin_obj();
     w.key("model"); w.str(m.path);
     w.key("ctx"); w.integer(p.ctx);
-    w.key("kv_bpe"); w.integer(p.kv_bpe);
+    w.key("kv_type"); w.integer(p.kv_type);
+    w.key("kv_name"); w.str(p.kv_name);
     w.key("vram_total"); w.uinteger(p.vram_total);
     w.key("vram_reserve"); w.uinteger(p.vram_reserve);
     w.key("fixed_bytes"); w.uinteger(p.fixed_bytes);
@@ -361,6 +440,9 @@ int cmd_plan(const std::string& path, int ctx, double vram_gib, bool vram_given,
     w.key("expert_per_layer"); w.begin_obj();
     for (const auto& [k, v] : p.expert_per_layer) { w.key(std::to_string(k)); w.uinteger(v); }
     w.end_obj();
+    w.key("layer_placement"); w.begin_obj();
+    for (const auto& [k, v] : p.layer_placement) { w.key(std::to_string(k)); w.str(v); }
+    w.end_obj();
     w.key("slots_per_layer"); w.integer(p.slots_per_layer);
     w.key("layers_on_gpu"); w.integer(p.layers_on_gpu);
     w.key("layers_on_cpu"); w.integer(p.layers_on_cpu);
@@ -370,6 +452,21 @@ int cmd_plan(const std::string& path, int ctx, double vram_gib, bool vram_given,
     w.key("notes"); w.begin_arr();
     for (const auto& n : p.notes) w.str(n);
     w.end_arr();
+    w.key("placement");
+    if (have_decision) write_placement(w); else w.null();
+    w.key("suggested_ctx");
+    if (have_decision) {
+      w.begin_obj();
+      w.key("kv_type"); w.integer(fit.kv_type);
+      w.key("kv_name"); w.str(fit.kv_name);
+      w.key("kv_per_token"); w.uinteger(fit.kv_per_token);
+      w.key("max_ctx"); w.integer(fit.max_ctx);
+      w.key("kv_at_max"); w.uinteger(fit.kv_at_max);
+      w.key("row_cap"); w.integer(row_cap);
+      w.end_obj();
+    } else {
+      w.null();
+    }
     w.end_obj();
     std::ofstream f(json_out, std::ios::binary);
     if (!f.is_open()) {
@@ -382,16 +479,18 @@ int cmd_plan(const std::string& path, int ctx, double vram_gib, bool vram_given,
     return 0;
   }
   std::printf("model        : %s\n", m.path.c_str());
-  std::printf("ctx=%d kv_bpe=%d vram=%.1f GiB\n", p.ctx, p.kv_bpe, vram_gib);
+  std::printf("ctx=%d kv_type=%s vram=%.1f GiB\n", p.ctx, p.kv_name, vram_gib);
   std::printf("fixed        : %s\n", human(p.fixed_bytes).c_str());
   std::printf("kv cache     : %s\n", human(p.kv_bytes).c_str());
   std::printf("workspace    : %s\n", human(p.workspace_bytes).c_str());
   std::printf("expert budget: %s / total experts %s\n", human(p.expert_budget).c_str(),
               human(p.expert_total).c_str());
   if (m.moe.n_expert) {
-    std::printf("slots/layer  : %d\n", p.slots_per_layer);
+    std::printf("slots/layer  : %d (uniform advisory)\n", p.slots_per_layer);
     std::printf("layers       : %d on GPU / %d on CPU  (fully_resident=%s)\n",
                 p.layers_on_gpu, p.layers_on_cpu, p.fully_resident ? "true" : "false");
+    for (const auto& [layer, where] : p.layer_placement)
+      std::printf("layer %-6d : %s\n", layer, where.c_str());
   } else {
     const uint64_t need = p.fixed_bytes + p.kv_bytes + p.workspace_bytes;
     const uint64_t usable = p.vram_total > p.vram_reserve ? p.vram_total - p.vram_reserve : 0;
@@ -404,23 +503,14 @@ int cmd_plan(const std::string& path, int ctx, double vram_gib, bool vram_given,
   for (const auto& n : p.notes) std::printf("note         : %s\n", n.c_str());
 
   // ---- placement decision (same decider the launcher runs before loading) ----
-  // --vram-gib simulates the device budget (offline planning); otherwise the real
-  // free VRAM / host RAM are measured.
-  placement::MemoryInfo vram;
-  if (vram_given) {
-    vram.valid = true;
-    vram.total_bytes = vram.free_bytes = static_cast<uint64_t>(vram_gib * (1ull << 30));
-  } else {
-    vram = placement::device_memory();
-  }
-  const placement::MemoryInfo host = placement::host_memory();
   if (!vram.valid) {
     std::printf("[placement] skipped: CUDA/VRAM probe unavailable\n");
     return 0;
   }
-  const int kv_type = kv_type_from_cfg();
-  const placement::Decision d = compute_decision(m, p.ctx, kv_type, vram, host);
   placement::print(d, stdout);
+  std::printf("[suggested]  ctx %d (%s, %llu B/token, KV %s at max)\n", fit.max_ctx, fit.kv_name,
+              static_cast<unsigned long long>(fit.kv_per_token),
+              human(fit.kv_at_max).c_str());
   return 0;
 }
 
@@ -433,8 +523,8 @@ void usage() {
                "commands:\n"
                "  info   <model>                 parsed IR summary + validation\n"
                "  ir     <model> [--out FILE]    export the full IR as JSON\n"
-               "  plan   <model> [--ctx N] [--vram-gib F] [--kv-bpe N]\n"
-               "                                 budget / expert placement plan + placement decision\n"
+               "  plan   <model> [--ctx N] [--vram-gib F] [--host-gib F] [--kv-type f32|q8_0|q4_0]\n"
+               "                                 budget / per-layer placement plan + placement decision\n"
                "  run    <model> --ids 1,2,3 [--n 8]\n"
                "                                 greedy generate N tokens (interactive when tty)\n"
                "  serve  <model> [--host 127.0.0.1] [--port 7030] [--ctx 4096]\n"
@@ -1010,8 +1100,9 @@ int main(int argc, char** argv) {
   for (int i = start; i < argc; ++i)
     if (std::strcmp(argv[i], "--print-config") == 0) wants_print_config = true;
   int pick = -1;
-  int n_gen = 4, kv_bpe = 2;
-  double vram = 12.0;
+  int n_gen = 4, kv_type = -1, row_cap = 512;
+  double vram = 12.0, host = 32.0;
+  bool host_given = false;
 
   // Subcommand-specific options are consumed here so the common config parser
   // only sees engine-wide options (they all live in docs/CONFIG.md).
@@ -1045,11 +1136,26 @@ int main(int argc, char** argv) {
       else if (a == "--min-size-mb") scan_min_size_mb = std::stoll(need("--min-size-mb"));
       else if (a == "--no-tensors") with_tensors = false;
       else if (a == "--force") force = true;
-      else if (a == "--kv-bpe") kv_bpe = std::stoi(need("--kv-bpe"));
+      else if (a == "--kv-bpe")
+        throw std::runtime_error(
+            "--kv-bpe was removed: the plan now accounts the KV layout the runner really "
+            "allocates; use --kv-type {f32,q8_0,q4_0}");
+      else if (a == "--kv-type") {
+        const std::string v = need("--kv-type");
+        if (v == "f32" || v == "0") kv_type = 0;
+        else if (v == "q8_0" || v == "q8" || v == "1") kv_type = 1;
+        else if (v == "q4_0" || v == "q4" || v == "2") kv_type = 2;
+        else throw std::runtime_error("--kv-type expects f32|q8_0|q4_0 (or 0|1|2), got " + v);
+      }
       else if (a == "--vram-gib") {
         vram = std::stod(need("--vram-gib"));
         vram_given = true;
       }
+      else if (a == "--host-gib") {
+        host = std::stod(need("--host-gib"));
+        host_given = true;
+      }
+      else if (a == "--row-cap") row_cap = std::stoi(need("--row-cap"));
       else if (a == "--ids" || a == "--tokens") ids_arg = need("--ids");
       else if (a == "--n" || a == "--max-new-tokens") {
         n_gen = std::stoi(need("--n"));
@@ -1198,7 +1304,8 @@ int main(int argc, char** argv) {
     if (cmd == "ir") return cmd_ir(path, out, with_tensors, force);
     if (cmd == "plan") {
       const int ctx = cfg.was_set("ctx") ? static_cast<int>(cfg.get_int("ctx")) : 8192;
-      return cmd_plan(path, ctx, vram, vram_given, kv_bpe, json_out);
+      return cmd_plan(path, ctx, vram, vram_given, host, host_given,
+                      kv_type < 0 ? kv_type_from_cfg() : kv_type, row_cap, json_out);
     }
     if (is_serve) {
       engine::serve::Options o;
