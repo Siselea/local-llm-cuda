@@ -346,9 +346,14 @@ int child_capture_probe(bool expect_throw) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc >= 3) {
+  // Child modes must be dispatched for ANY accepted argc, not just argc>=3:
+  // --child-capture-strict / --child-capture-lenient are spawned with a single
+  // argument (argc==2).  With the old `argc >= 3` guard those children fell
+  // through to the full suite and re-spawned themselves, which is an exponential
+  // fork bomb (observed: 170+ concurrent processes, GPU VRAM 2GB -> 12GB).
+  if (argc >= 2) {
     const std::string mode = argv[1];
-    const int value = std::atoi(argv[2]);
+    const int value = (argc >= 3) ? std::atoi(argv[2]) : 0;
     if (mode == "--child-kvsplit-reject") return child_kvsplit_reject(value);
     if (mode == "--child-kvsplit-eq") return child_kvsplit_eq(value);
     if (mode == "--child-capture-strict") return child_capture_probe(true);
