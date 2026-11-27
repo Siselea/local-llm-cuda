@@ -11,6 +11,7 @@
 // encode(), which is what the chat template needs.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -29,6 +30,15 @@ struct ChatMessage {
   std::string role;
   std::string content;
   std::string reasoning_content;
+};
+
+// Work budget for encode_bounded().  max_chars == 0 disables the input-size check,
+// max_ms == 0 disables the wall-clock check.  Violations throw std::runtime_error so
+// network-facing callers can map them to HTTP 400.
+struct EncodeBudget {
+  size_t max_chars = 0;
+  int max_ms = 0;
+  std::chrono::steady_clock::time_point deadline{};
 };
 
 class Tokenizer {
@@ -59,6 +69,12 @@ class Tokenizer {
   // parse_special: keep special tokens (control/user-defined/unknown) atomic
   std::vector<int> encode(const std::string& text, bool add_special = false,
                           bool parse_special = true) const;
+  // Bounded-work variant for network-facing callers (serve).  Rejects inputs above
+  // max_chars UTF-8 codepoints and aborts a single encode that runs longer than
+  // max_ms (0 disables either check).  Throws std::runtime_error on violation.
+  std::vector<int> encode_bounded(const std::string& text, bool add_special,
+                                  bool parse_special, size_t max_chars,
+                                  int max_ms) const;
 
   // Detokenize.  skip_special=true drops CONTROL/UNKNOWN tokens, like
   // llama.cpp's token_to_piece(special=false); user-defined tokens are kept.
@@ -91,9 +107,12 @@ class Tokenizer {
   enum class Template { None, Chatml };
 
   std::vector<std::string> pre_split(const std::string& text) const;
-  std::vector<int> encode_ordinary(const std::string& text) const;
-  std::vector<int> bpe_word(const std::string& word) const;
-  std::vector<int> spm_text(const std::string& text) const;
+  std::vector<int> encode_impl(const std::string& text, bool add_special,
+                               bool parse_special, const EncodeBudget* budget) const;
+  std::vector<int> encode_ordinary(const std::string& text,
+                                   const EncodeBudget* budget) const;
+  std::vector<int> bpe_word(const std::string& word, const EncodeBudget* budget) const;
+  std::vector<int> spm_text(const std::string& text, const EncodeBudget* budget) const;
 
   Kind kind_ = Kind::Bpe;
   Pre pre_kind_ = Pre::Qwen2;

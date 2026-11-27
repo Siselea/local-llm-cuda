@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -36,6 +37,15 @@ namespace tokenizer {
 namespace {
 
 constexpr uint32_t kOutOfRange = 0xFFFFFFFFu;
+
+// Wall-clock budget for one network-facing encode() call (serve passes it); throws so
+// the HTTP layer can answer 400 instead of tying up the single-threaded server.
+void check_encode_budget(const EncodeBudget* budget) {
+  if (budget == nullptr || budget->max_ms <= 0) return;
+  if (std::chrono::steady_clock::now() > budget->deadline)
+    throw std::runtime_error("tokenize time budget exceeded (limit " +
+                             std::to_string(budget->max_ms) + " ms)");
+}
 
 // ---------------------------------------------------------------------------
 // GPT-2 byte <-> unicode mapping (bytes_to_unicode from the GPT-2 paper).
@@ -546,9 +556,11 @@ std::vector<std::string> Tokenizer::pre_split(const std::string& text) const {
 }
 
 // ---------------------------------------------------------------------------
-std::vector<int> Tokenizer::bpe_word(const std::string& word) const {
+std::vector<int> Tokenizer::bpe_word(const std::string& word,
+                                     const EncodeBudget* budget) const {
   auto cached = word_cache_.find(word);
   if (cached != word_cache_.end()) return cached->second;
+  check_encode_budget(budget);
 
   // byte-level unicode form -> codepoint symbols
   std::string encoded;
@@ -566,58 +578,120 @@ std::vector<int> Tokenizer::bpe_word(const std::string& word) const {
     return it == merge_ranks_.end() ? -1 : it->second;
   };
 
-  while (syms.size() > 1) {
-    int best = -1;
-    int best_rank = std::numeric_limits<int>::max();
-    for (size_t i = 0; i + 1 < syms.size(); ++i) {
-      const int r = rank_of(syms[i], syms[i + 1]);
-      if (r >= 0 && r < best_rank) {
-        best_rank = r;
-        best = static_cast<int>(i);
-      }
+  // A long run without separators (e.g. 1 MB of CJK) becomes ONE word here.  The
+  // reference implementation rescanned every adjacent pair on every merge:
+  // O(n^2) rank lookups and O(n) key allocations per round => 5k chars took 5.2 s,
+  // 20k chars 92 s (and a 1 MB request hours).  Keep symbols in a linked list and
+  // drive merges from a min-heap of (rank, left position): O(n log n), same merge
+  // order (lowest rank, ties -> lowest position) so the emitted ids are identical.
+  struct Sym {
+    std::string text;
+    int prev = -1;
+    int next = -1;
+    bool alive = true;
+  };
+  std::vector<Sym> sy(syms.size());
+  for (size_t i = 0; i < syms.size(); ++i) {
+    sy[i].text = std::move(syms[i]);
+    if (i > 0) {
+      sy[i].prev = static_cast<int>(i - 1);
+      sy[i - 1].next = static_cast<int>(i);
     }
-    if (best < 0) break;
-    syms[best] += syms[best + 1];
-    syms.erase(syms.begin() + best + 1);
   }
 
+  struct Pending {
+    int rank;
+    int left;
+    int right;
+  };
+  struct Cmp {
+    bool operator()(const Pending& a, const Pending& b) const {
+      if (a.rank != b.rank) return a.rank > b.rank;  // min-heap on rank
+      return a.left > b.left;                        // ties: lowest position first
+    }
+  };
+  std::priority_queue<Pending, std::vector<Pending>, Cmp> queue;
+  auto push_pair = [&](int l) {
+    if (l < 0) return;
+    const int r = sy[static_cast<size_t>(l)].next;
+    if (r < 0) return;
+    const int rank = rank_of(sy[static_cast<size_t>(l)].text,
+                             sy[static_cast<size_t>(r)].text);
+    if (rank >= 0) queue.push(Pending{rank, l, r});
+  };
+  for (size_t i = 0; i + 1 < sy.size(); ++i) push_pair(static_cast<int>(i));
+
+  size_t pops = 0;
+  while (!queue.empty()) {
+    const Pending p = queue.top();
+    queue.pop();
+    if ((++pops & 63) == 0) check_encode_budget(budget);
+    Sym& l = sy[static_cast<size_t>(p.left)];
+    Sym& r = sy[static_cast<size_t>(p.right)];
+    if (!l.alive || !r.alive || l.next != p.right) continue;  // stale heap entry
+    // The stored rank can be stale when either symbol's text changed after this entry
+    // was pushed (a symbol may have merged with its other neighbour).  Recompute and
+    // re-queue instead of merging with an old priority -- otherwise the merge order
+    // differs from the reference implementation and token ids change.
+    const int rank_now = rank_of(l.text, r.text);
+    if (rank_now < 0) continue;
+    if (rank_now != p.rank) {
+      queue.push(Pending{rank_now, p.left, p.right});
+      continue;
+    }
+    l.text += r.text;
+    r.alive = false;
+    l.next = r.next;
+    if (r.next >= 0) sy[static_cast<size_t>(r.next)].prev = p.left;
+    push_pair(l.prev);
+    push_pair(p.left);
+  }
+  check_encode_budget(budget);
+
   std::vector<int> ids;
-  ids.reserve(syms.size());
-  for (const auto& s : syms) {
-    auto it = token_to_id_.find(s);
+  ids.reserve(sy.size());
+  for (const Sym& sym : sy) {
+    if (!sym.alive) continue;
+    auto it = token_to_id_.find(sym.text);
     if (it != token_to_id_.end()) {
       ids.push_back(it->second);
       continue;
     }
     // byte fallback (should not happen for a consistent vocab)
-    for (unsigned char b : s) {
+    for (unsigned char b : sym.text) {
       auto bt = token_to_id_.find(byte_to_utf8_[b]);
       if (bt != token_to_id_.end()) ids.push_back(bt->second);
     }
   }
-  if (word_cache_.size() > 1u << 17) word_cache_.clear();
-  word_cache_.emplace(word, ids);
+  // Do not retain very long words in the per-word cache (a long no-space input would
+  // otherwise pin its token ids for the whole process lifetime).
+  if (word.size() <= 64 * 1024) {
+    if (word_cache_.size() > 1u << 17) word_cache_.clear();
+    word_cache_.emplace(word, ids);
+  }
   return ids;
 }
 
-std::vector<int> Tokenizer::encode_ordinary(const std::string& text) const {
+std::vector<int> Tokenizer::encode_ordinary(const std::string& text,
+                                           const EncodeBudget* budget) const {
   std::vector<int> ids;
   if (text.empty()) return ids;
   if (kind_ == Kind::Bpe) {
     for (const auto& word : pre_tokenize(text)) {
-      std::vector<int> w = bpe_word(word);
+      std::vector<int> w = bpe_word(word, budget);
       ids.insert(ids.end(), w.begin(), w.end());
     }
     return ids;
   }
-  return spm_text(text);
+  return spm_text(text, budget);
 }
 
 // ---------------------------------------------------------------------------
 // SentencePiece: score-ordered bigram merges + resegment.
 // Port of llama.cpp llm_tokenizer_spm_session (b12128).
 // ---------------------------------------------------------------------------
-std::vector<int> Tokenizer::spm_text(const std::string& text) const {
+std::vector<int> Tokenizer::spm_text(const std::string& text,
+                                       const EncodeBudget* budget) const {
   struct Sym {
     std::string text;
     int prev = -1, next = -1;
@@ -669,7 +743,9 @@ std::vector<int> Tokenizer::spm_text(const std::string& text) const {
 
   for (size_t k = 1; k < syms.size(); ++k) try_add(static_cast<int>(k - 1), static_cast<int>(k));
 
+  size_t pops = 0;
   while (!queue.empty()) {
+    if ((++pops & 63) == 0) check_encode_budget(budget);
     const Bigram b = queue.top();
     queue.pop();
     Sym& left = syms[b.left];
@@ -720,6 +796,35 @@ std::vector<int> Tokenizer::spm_text(const std::string& text) const {
 // ---------------------------------------------------------------------------
 std::vector<int> Tokenizer::encode(const std::string& text, bool add_special,
                                    bool parse_special) const {
+  return encode_impl(text, add_special, parse_special, nullptr);
+}
+
+std::vector<int> Tokenizer::encode_bounded(const std::string& text, bool add_special,
+                                           bool parse_special, size_t max_chars,
+                                           int max_ms) const {
+  EncodeBudget budget;
+  budget.max_chars = max_chars;
+  budget.max_ms = max_ms > 0 ? max_ms : 0;
+  if (budget.max_ms > 0) {
+    budget.deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(budget.max_ms);
+  }
+  if (max_chars > 0) {
+    size_t chars = 0;
+    for (unsigned char c : text)
+      if ((c & 0xC0) != 0x80) ++chars;
+    if (chars > max_chars) {
+      throw std::runtime_error("input too large: " + std::to_string(chars) +
+                               " characters (limit " + std::to_string(max_chars) + ")");
+    }
+  }
+  return encode_impl(text, add_special, parse_special, &budget);
+}
+
+std::vector<int> Tokenizer::encode_impl(const std::string& text, bool add_special,
+                                        bool parse_special,
+                                        const EncodeBudget* budget) const {
+  check_encode_budget(budget);
   std::vector<int> out;
   if (add_special && add_bos_) out.push_back(bos_id_);
   if (text.empty()) {
@@ -749,10 +854,10 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_special,
       if (add_space_prefix_) escaped += " ";
       escaped += text;
       escaped = escape_spm_spaces(escaped);
-      std::vector<int> ids = spm_text(escaped);
+      std::vector<int> ids = spm_text(escaped, budget);
       out.insert(out.end(), ids.begin(), ids.end());
     } else {
-      std::vector<int> ids = encode_ordinary(text);
+      std::vector<int> ids = encode_ordinary(text, budget);
       out.insert(out.end(), ids.begin(), ids.end());
     }
     if (add_special && add_eos_) out.push_back(eos_id_);
@@ -768,6 +873,7 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_special,
   std::vector<Piece> frags;
   size_t pos = 0;
   while (pos < text.size()) {
+    check_encode_budget(budget);
     int best_id = -1;
     size_t best_pos = std::string::npos;
     size_t best_len = 0;
@@ -802,6 +908,7 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_special,
 
   bool prev_special = true;
   for (const auto& f : frags) {
+    check_encode_budget(budget);
     if (f.special) {
       out.push_back(f.id);
       prev_special = true;
@@ -811,11 +918,11 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_special,
       std::string escaped = f.text;
       if (add_space_prefix_ && prev_special) escaped = " " + escaped;
       escaped = escape_spm_spaces(escaped);
-      std::vector<int> ids = spm_text(escaped);
+      std::vector<int> ids = spm_text(escaped, budget);
       out.insert(out.end(), ids.begin(), ids.end());
       prev_special = false;
     } else {
-      std::vector<int> ids = encode_ordinary(f.text);
+      std::vector<int> ids = encode_ordinary(f.text, budget);
       out.insert(out.end(), ids.begin(), ids.end());
     }
   }

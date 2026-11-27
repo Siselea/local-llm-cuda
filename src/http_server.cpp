@@ -130,6 +130,25 @@ constexpr size_t kMaxHeaderBytes = 64 * 1024;
 constexpr size_t kMaxBodyBytes = 32 * 1024 * 1024;
 constexpr int kRecvTimeoutMs = 30000;
 
+// Strict Content-Length: ASCII digits only, no sign, no empty value, bounded so the
+// conversion cannot overflow.  `TooLarge` means syntactically valid but above the
+// body cap (-> 413); `Invalid` means malformed (-> 400).
+enum class ContentLengthParse { Ok, Invalid, TooLarge };
+ContentLengthParse parse_content_length(const std::string& v, size_t* out) {
+  if (v.empty()) return ContentLengthParse::Invalid;
+  for (char c : v)
+    if (c < '0' || c > '9') return ContentLengthParse::Invalid;
+  size_t n = 0;
+  for (char c : v) {
+    const size_t digit = static_cast<size_t>(c - '0');
+    if (n > (kMaxBodyBytes - digit) / 10) return ContentLengthParse::TooLarge;
+    n = n * 10 + digit;
+  }
+  if (n > kMaxBodyBytes) return ContentLengthParse::TooLarge;
+  *out = n;
+  return ContentLengthParse::Ok;
+}
+
 std::string lower_ascii(std::string s) {
   for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return s;
@@ -339,6 +358,9 @@ bool Conn::read_request(bool* keep_alive) {
   size_t line_start = 0;
   bool first = true;
   size_t content_length = 0;
+  int content_length_count = 0;
+  bool bad_content_length = false;
+  bool has_transfer_encoding = false;
   std::string conn_header;
   bool expect_continue = false;
   while (line_start < head.size()) {
@@ -372,13 +394,50 @@ bool Conn::read_request(bool* keep_alive) {
     const std::string key = lower_ascii(trim_ws(line.substr(0, colon)));
     const std::string value = trim_ws(line.substr(colon + 1));
     req_.headers[key] = value;
-    if (key == "content-length") content_length = static_cast<size_t>(std::atoll(value.c_str()));
-    else if (key == "connection") conn_header = lower_ascii(value);
-    else if (key == "expect" && lower_ascii(value).find("100-continue") != std::string::npos)
+    if (key == "content-length") {
+      ++content_length_count;
+      size_t parsed = 0;
+      const ContentLengthParse r = parse_content_length(value, &parsed);
+      if (content_length_count > 1) {
+        // Request-smuggling defence: never accept two framing headers.
+        send_error(400, "duplicate Content-Length header");
+        failed_ = true;
+        return false;
+      }
+      if (r == ContentLengthParse::Invalid) {
+        bad_content_length = true;
+      } else if (r == ContentLengthParse::TooLarge) {
+        send_error(413, "request body too large");
+        failed_ = true;
+        return false;
+      } else {
+        content_length = parsed;
+      }
+    } else if (key == "connection") {
+      conn_header = lower_ascii(value);
+    } else if (key == "transfer-encoding") {
+      // Chunked request bodies are not implemented; treating them as a normal body
+      // would desynchronise the stream, so reject explicitly (contract: send
+      // Content-Length).
+      has_transfer_encoding = true;
+    } else if (key == "expect" && lower_ascii(value).find("100-continue") != std::string::npos) {
       expect_continue = true;
+    }
   }
-  if (content_length > kMaxBodyBytes) {
-    send_error(413, "request body too large");
+  if (bad_content_length) {
+    send_error(400, "invalid Content-Length header (ASCII digits only)");
+    failed_ = true;
+    return false;
+  }
+  if (has_transfer_encoding) {
+    send_error(501, "request Transfer-Encoding is not supported; send a Content-Length body");
+    failed_ = true;
+    return false;
+  }
+  // Re-check the header size after the CRLFCRLF terminator was found: one recv() can
+  // overshoot the limit while the read loop only looks for the terminator.
+  if (header_end > kMaxHeaderBytes) {
+    send_error(431, "request headers too large");
     failed_ = true;
     return false;
   }

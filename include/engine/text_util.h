@@ -18,31 +18,77 @@ inline size_t utf8_seq_len(unsigned char c) {
   return 1;
 }
 
-// Decode one codepoint at s[i]; returns the codepoint and advances i.
-// Invalid bytes are returned as their byte value (0..255) and advance by one,
-// which keeps invalid input round-trippable instead of throwing.
-inline uint32_t utf8_next(const std::string& s, size_t& i) {
+// Strict UTF-8 codepoint decode: returns false for overlong sequences, UTF-16
+// surrogate half-pairs (ED A0 80..), codepoints above U+10FFFF (F5..), truncated
+// sequences and bad continuation bytes.  On failure `i` advances by one byte so a
+// caller can resynchronise; *cp is set to U+FFFD.
+inline bool utf8_decode_strict(const std::string& s, size_t& i, uint32_t* cp) {
+  if (cp) *cp = 0xFFFD;
+  if (i >= s.size()) return false;
   const unsigned char c0 = static_cast<unsigned char>(s[i]);
   if (c0 < 0x80) {
+    if (cp) *cp = c0;
     ++i;
-    return c0;
+    return true;
   }
   const size_t len = utf8_seq_len(c0);
   if (len == 1 || i + len > s.size()) {
     ++i;
-    return c0;
+    return false;
   }
-  uint32_t cp = c0 & (len == 2 ? 0x1F : len == 3 ? 0x0F : 0x07);
+  uint32_t v = c0 & (len == 2 ? 0x1F : len == 3 ? 0x0F : 0x07);
   for (size_t k = 1; k < len; ++k) {
     const unsigned char c = static_cast<unsigned char>(s[i + k]);
     if ((c & 0xC0) != 0x80) {
       ++i;
-      return c0;
+      return false;
     }
-    cp = (cp << 6) | (c & 0x3F);
+    v = (v << 6) | (c & 0x3F);
   }
+  const uint32_t min_cp = (len == 2) ? 0x80u : (len == 3) ? 0x800u : 0x10000u;
+  if (v < min_cp || v > 0x10FFFFu || (v >= 0xD800u && v <= 0xDFFFu)) {
+    ++i;
+    return false;
+  }
+  if (cp) *cp = v;
   i += len;
+  return true;
+}
+
+// Decode one codepoint at s[i]; invalid input yields U+FFFD and advances by one
+// byte (strict validation: overlong forms, surrogate halves and codepoints above
+// U+10FFFF are rejected instead of being passed through).
+inline uint32_t utf8_next(const std::string& s, size_t& i) {
+  uint32_t cp = 0xFFFD;
+  utf8_decode_strict(s, i, &cp);
   return cp;
+}
+
+// True when the whole string is well-formed UTF-8.
+inline bool is_valid_utf8(const std::string& s) {
+  size_t i = 0;
+  while (i < s.size()) {
+    uint32_t cp = 0;
+    if (!utf8_decode_strict(s, i, &cp)) return false;
+  }
+  return true;
+}
+
+// Number of UTF-8 codepoints, counting at most `cap` (request budgets use it so a
+// 32 MiB body is never scanned twice).
+inline size_t count_utf8_codepoints(const std::string& s,
+                                    size_t cap = static_cast<size_t>(-1)) {
+  size_t n = 0;
+  size_t i = 0;
+  while (i < s.size() && n < cap) {
+    uint32_t cp = 0;
+    if (!utf8_decode_strict(s, i, &cp)) {
+      ++n;
+      continue;
+    }
+    ++n;
+  }
+  return n;
 }
 
 inline void append_utf8(std::string& out, uint32_t cp) {
@@ -106,39 +152,29 @@ inline size_t incomplete_utf8_tail(const std::string& s) {
 }
 
 // Decode a byte string that may end in the middle of a multi-byte sequence.
-// `replacement` is appended for invalid bytes.
+// Invalid encodings (truncated / overlong / surrogate / > U+10FFFF) are replaced
+// with U+FFFD, matching json::Writer::quote's sanitisation.
 inline std::string decode_utf8_lossy(const std::string& bytes) {
   std::string out;
   out.reserve(bytes.size());
   size_t i = 0;
   while (i < bytes.size()) {
     const size_t start = i;
-    const unsigned char c = static_cast<unsigned char>(bytes[i]);
-    const size_t len = utf8_seq_len(c);
-    if (len == 1 && c >= 0x80) {
-      out.push_back(static_cast<char>(0xEF));  // U+FFFD
-      out.append("\xBF\xBD");
-      ++i;
+    uint32_t cp = 0;
+    if (utf8_decode_strict(bytes, i, &cp)) {
+      out.append(bytes, start, i - start);
       continue;
     }
-    if (i + len > bytes.size()) {
-      out.append("\xEF\xBF\xBD");
-      break;
-    }
-    bool ok = true;
-    for (size_t k = 1; k < len; ++k) {
-      if ((static_cast<unsigned char>(bytes[i + k]) & 0xC0) != 0x80) {
-        ok = false;
-        break;
-      }
-    }
-    if (!ok) {
-      out.append("\xEF\xBF\xBD");
-      i = start + 1;
-      continue;
-    }
-    out.append(bytes, i, len);
-    i += len;
+    out.append("\xEF\xBF\xBD");
+    // Consume the maximal structurally-complete prefix of the malformed sequence
+    // (lead byte + following continuation bytes) so one bad character becomes one
+    // replacement char, matching json::Writer::quote.
+    const size_t lead_len = utf8_seq_len(static_cast<unsigned char>(bytes[start]));
+    size_t adv = 1;
+    while (adv < lead_len && start + adv < bytes.size() &&
+           (static_cast<unsigned char>(bytes[start + adv]) & 0xC0) == 0x80)
+      ++adv;
+    i = start + adv;
   }
   return out;
 }

@@ -235,6 +235,81 @@ struct ServerState {
   std::atomic<bool> busy{false};
 };
 
+// ---------------------------------------------------------------------------
+// Bounded-work request budgets (DoS defence, v0.1.8)
+//
+// A single network request must have bounded CPU/RAM cost: the 32 MiB body cap
+// alone is not enough because a long run without separators makes the BPE merge
+// superlinear (a 1 MB CJK /tokenize used to block the single-threaded server for
+// hours).  Every user-controlled text that will be encoded is checked against a
+// character budget before encoding, and the encode itself has a wall-clock budget
+// as a backstop for any remaining pathological path.
+// ---------------------------------------------------------------------------
+constexpr size_t kMaxEncodeCharsHard = 200000;  // absolute ceiling for one encode
+constexpr int kEncodeBudgetMs = 1500;           // wall-clock backstop per encode call
+constexpr size_t kMaxStopChars = 4096;          // total across all stop strings
+constexpr size_t kMaxDetokenizeIds = 200000;    // ids array cap for /detokenize
+
+size_t max_encode_chars_for_ctx(int ctx) {
+  const size_t ctx_scaled = static_cast<size_t>(ctx > 0 ? ctx : 1) * 8;
+  return std::min(kMaxEncodeCharsHard, ctx_scaled);
+}
+
+// Bounded encode of user text: maps tokenizer budget violations to HTTP 400.
+std::vector<int> encode_user_text_limit(const ServerState& st, const std::string& text,
+                                        bool add_special, bool parse_special,
+                                        size_t max_chars) {
+  const char* kPrefix = "input too large: ";
+  try {
+    return st.tk.encode_bounded(text, add_special, parse_special, max_chars,
+                                kEncodeBudgetMs);
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    if (msg.rfind(kPrefix, 0) == 0)
+      throw UserError("prompt too long to tokenize: " + msg.substr(std::strlen(kPrefix)));
+    throw UserError(std::string("tokenization failed: ") + msg);
+  }
+}
+
+// Generation endpoints: the encoded prompt must fit the context, so the budget is
+// min(hard cap, ctx * 8) characters.
+std::vector<int> encode_user_text(const ServerState& st, const std::string& text,
+                                  bool add_special, bool parse_special) {
+  return encode_user_text_limit(st, text, add_special, parse_special,
+                                max_encode_chars_for_ctx(st.ctx));
+}
+
+// Numeric body fields must be finite and inside [lo, hi]; anything else is a 400
+// instead of an out-of-range double -> int conversion (undefined behaviour).
+int int_field(const jsonp::Value& body, const char* key, int lo, int hi, int fallback) {
+  const jsonp::Value* v = body.find(key);
+  if (!v) return fallback;
+  if (!v->is_number()) return fallback;  // wrong JSON type: keep client default
+  const double d = v->num;
+  if (!std::isfinite(d))
+    throw UserError(std::string("parameter '") + key + "' must be a finite number");
+  if (d < static_cast<double>(lo) || d > static_cast<double>(hi))
+    throw UserError(std::string("parameter '") + key + "' out of range [" +
+                    std::to_string(lo) + ", " + std::to_string(hi) + "]: " +
+                    std::to_string(d));
+  return static_cast<int>(std::llround(d));
+}
+
+double num_field(const jsonp::Value& body, const char* key, double lo, double hi,
+                 double fallback) {
+  const jsonp::Value* v = body.find(key);
+  if (!v) return fallback;
+  if (!v->is_number()) return fallback;
+  const double d = v->num;
+  if (!std::isfinite(d))
+    throw UserError(std::string("parameter '") + key + "' must be a finite number");
+  if (d < lo || d > hi)
+    throw UserError(std::string("parameter '") + key + "' out of range [" +
+                    std::to_string(lo) + ", " + std::to_string(hi) + "]: " +
+                    std::to_string(d));
+  return d;
+}
+
 ServerState* g_state = nullptr;
 http::Server* g_server = nullptr;
 
@@ -277,7 +352,9 @@ std::string prompt_too_long_message(const ServerState& st, int prompt_tokens) {
 }
 
 void validate_prompt(const ServerState& st, const std::string& prompt, const GenParams& gp) {
-  const std::vector<int> ids = st.tk.encode(prompt, false, true);
+  if (!text::is_valid_utf8(prompt))
+    throw UserError("prompt is not valid UTF-8");
+  const std::vector<int> ids = encode_user_text(st, prompt, false, true);
   if (ids.empty()) throw UserError("prompt encodes to zero tokens");
   if (static_cast<int>(ids.size()) >= st.ctx)
     throw UserError(prompt_too_long_message(st, static_cast<int>(ids.size())));
@@ -292,7 +369,10 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
   tokenizer::Tokenizer& tk = st.tk;
   runner::DenseRunner& model = *st.model;
 
-  std::vector<int> ids = tk.encode(prompt, /*add_special=*/false, /*parse_special=*/true);
+  if (!text::is_valid_utf8(prompt))
+    throw UserError("prompt is not valid UTF-8");
+  std::vector<int> ids = encode_user_text(st, prompt, /*add_special=*/false,
+                                          /*parse_special=*/true);
   if (ids.empty()) throw UserError("prompt encodes to zero tokens");
   out.prompt_tokens = static_cast<int>(ids.size());
   if (static_cast<int>(ids.size()) >= st.ctx)
@@ -306,7 +386,7 @@ GenOutcome generate(ServerState& st, const std::string& prompt, const std::strin
   // pass no history and therefore skip the cache.
   int boundary = static_cast<int>(ids.size());
   if (!history_prompt.empty()) {
-    const std::vector<int> hid = tk.encode(history_prompt, false, true);
+    const std::vector<int> hid = encode_user_text(st, history_prompt, false, true);
     if (hid.size() <= ids.size() && std::equal(hid.begin(), hid.end(), ids.begin()))
       boundary = static_cast<int>(hid.size());
   }
@@ -909,9 +989,10 @@ GenParams params_from_body(const ServerState& st, const jsonp::Value& body) {
   //  thinking block first, so a small default (256) truncated every reply before the
   // answer even started (content empty, finish=length).  "思考长度不限" = let it run to
   // the context limit unless the client asks for less.
-  gp.max_tokens = int_or(body, "max_tokens",
-                         int_or(body, "max_completion_tokens",
-                                int_or(body, "n_predict", st.opts.default_max_tokens)));
+  gp.max_tokens = int_field(body, "max_tokens", -1, 1 << 20,
+                            int_field(body, "max_completion_tokens", -1, 1 << 20,
+                                      int_field(body, "n_predict", -1, 1 << 20,
+                                                st.opts.default_max_tokens)));
   // llama.cpp clients (including the official webui) send max_tokens:-1 for
   // "no limit beyond the context".  Fully unlimited means a thinking model can
   // spend minutes in one reply, so this maps to serve_no_limit_tokens (default
@@ -921,16 +1002,22 @@ GenParams params_from_body(const ServerState& st, const jsonp::Value& body) {
     gp.max_tokens = std::min(st.ctx, cap);
   }
   gp.max_tokens = std::max(1, std::min(gp.max_tokens, st.ctx));
-  gp.temperature = num_or(body, "temperature", st.opts.default_temperature);
-  if (gp.temperature < 0.0) gp.temperature = 0.0;
-  gp.top_p = num_or(body, "top_p", st.opts.default_top_p);
-  gp.min_p = num_or(body, "min_p", 0.0);
-  gp.top_k = int_or(body, "top_k", st.opts.default_top_k);
+  gp.temperature = num_field(body, "temperature", 0.0, 100.0,
+                             st.opts.default_temperature);
+  gp.top_p = num_field(body, "top_p", 0.0, 1.0, st.opts.default_top_p);
+  gp.min_p = num_field(body, "min_p", 0.0, 1.0, 0.0);
+  gp.top_k = int_field(body, "top_k", -1, 1 << 20, st.opts.default_top_k);
   gp.repetition_penalty =
-      num_or(body, "repetition_penalty",
-             num_or(body, "repeat_penalty", st.opts.default_repetition_penalty));
-  gp.seed = int_or(body, "seed", -1);
+      num_field(body, "repetition_penalty", 0.0, 100.0,
+                num_field(body, "repeat_penalty", 0.0, 100.0,
+                          st.opts.default_repetition_penalty));
+  gp.seed = int_field(body, "seed", -1, 2147483647, -1);
   gp.stop = parse_stop(body);
+  size_t stop_chars = 0;
+  for (const std::string& stp : gp.stop) stop_chars += stp.size();
+  if (stop_chars > kMaxStopChars)
+    throw UserError("stop sequences too long: " + std::to_string(stop_chars) +
+                    " bytes (limit " + std::to_string(kMaxStopChars) + ")");
   return gp;
 }
 
@@ -1687,7 +1774,12 @@ void handle_tokenize(const ServerState& st, const http::Request& req, http::Conn
   else if (body.is_string()) content = body.str;
   else throw UserError("'content' (string) is required");
   const bool add_special = body.get_bool("add_special", false);
-  const std::vector<int> ids = st.tk.encode(content, add_special, true);
+  if (!text::is_valid_utf8(content))
+    throw UserError("'content' is not valid UTF-8");
+  // /tokenize does not allocate KV state: only the global hard cap applies (a user
+  // may count tokens of a long document even when the model context is small).
+  const std::vector<int> ids = encode_user_text_limit(st, content, add_special, true,
+                                                      kMaxEncodeCharsHard);
   json::Writer w;
   w.begin_obj();
   w.key("tokens");
@@ -1706,11 +1798,17 @@ void handle_detokenize(const ServerState& st, const http::Request& req, http::Co
   const jsonp::Value body = parse_json_body(req);
   const jsonp::Value* t = body.find("tokens");
   if (!t || !t->is_array()) throw UserError("'tokens' (array of ids) is required");
+  if (t->arr.size() > kMaxDetokenizeIds)
+    throw UserError("too many ids to detokenize: " + std::to_string(t->arr.size()) +
+                    " (limit " + std::to_string(kMaxDetokenizeIds) + ")");
   std::vector<int> ids;
   ids.reserve(t->arr.size());
   for (const auto& v : t->arr) {
     if (!v.is_number()) throw UserError("'tokens' must contain numbers");
-    ids.push_back(static_cast<int>(v.num));
+    const double d = v.num;
+    if (!std::isfinite(d) || d < -2147483647.0 || d > 2147483647.0)
+      throw UserError("'tokens' contains an out-of-range id");
+    ids.push_back(static_cast<int>(d));
   }
   json::Writer w;
   w.begin_obj();

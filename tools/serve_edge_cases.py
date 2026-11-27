@@ -133,13 +133,15 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=7051)
     ap.add_argument("--threads", type=int, default=12)
     ap.add_argument("--fast", action="store_true", help="skip the slow long-generation cases")
+    ap.add_argument("--gpu-layers", default="-1",
+                    help="-1 = all layers on GPU; 0 = CPU-only (HTTP-layer tests)")
     args = ap.parse_args()
     port = args.port
     log_path = Path("build/logs/serve_edge_server.log")
     log = open(log_path, "w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen(
         [args.binary, "serve", "--model", args.model, "--host", "127.0.0.1",
-         "--port", str(port), "--ctx", str(args.ctx), "--gpu-layers", "-1",
+         "--port", str(port), "--ctx", str(args.ctx), "--gpu-layers", str(args.gpu_layers),
          "--threads", str(args.threads), "--default-max-tokens", "1048576"],
         stdout=log, stderr=subprocess.STDOUT)
     results = []
@@ -385,6 +387,53 @@ def main() -> int:
                 cut_detail.append(f"chat mt={mt}: INVALID ({e})")
         check(results, "K1 non-stream JSON valid UTF-8 for mid-character cuts",
               cut_ok, "; ".join(cut_detail))
+
+        # ---------------- L. input-driven DoS budgets ----------------
+        big = "中" * 349525  # ~1 MB UTF-8
+        t0 = time.time()
+        r = http(port, "POST", "/tokenize", {"content": big}, timeout=60)
+        secs = time.time() - t0
+        body = r.get("body") or ""
+        check(results, "L1 /tokenize 1MB CJK rejected fast",
+              r["status"] == 400 and secs < 0.5 and "prompt too long to tokenize" in body,
+              f"status={r['status']} secs={secs:.2f}s body={body[:120]}")
+        mid = "中" * 50000  # under the global 200k hard cap, far above ctx*8 for ctx4096
+        t0 = time.time()
+        r = http(port, "POST", "/tokenize", {"content": mid}, timeout=120)
+        secs = time.time() - t0
+        try:
+            toks = len((json.loads(r.get("body") or "{}").get("tokens")) or [])
+        except Exception:
+            toks = -1
+        check(results, "L2 /tokenize 50k chars works (global cap, not ctx)",
+              r["status"] == 200 and secs < 2.0 and toks == 50000,
+              f"status={r['status']} secs={secs:.2f}s tokens={toks}")
+        # invalid UTF-8 in content must be a clean 400 (strict text_util)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/tokenize",
+            data=b'{"content":"\xC0\xAF"}', headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                invalid_status, invalid_body = resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            invalid_status, invalid_body = e.code, e.read()
+        check(results, "L3 /tokenize invalid UTF-8 -> 400",
+              invalid_status == 400 and b"not valid UTF-8" in invalid_body,
+              f"status={invalid_status} body={invalid_body[:100].decode('latin1', 'replace')}")
+        huge = "中" * 349525
+        t0 = time.time()
+        r = http(port, "POST", "/v1/chat/completions",
+                 {"messages": [{"role": "user", "content": huge}],
+                  "max_tokens": 4, "temperature": 0,
+                  "chat_template_kwargs": {"enable_thinking": False}}, timeout=60)
+        secs = time.time() - t0
+        check(results, "L4 chat with 1MB CJK prompt rejected fast",
+              r["status"] == 400 and secs < 0.5,
+              f"status={r['status']} secs={secs:.2f}s")
+        stop_long = "X" * 10000
+        r = chat(port, {"stop": stop_long}, max_tokens=4, timeout=30)
+        check(results, "L5 10KB stop sequence -> 400",
+              r["status"] == 400, f"status={r['status']}")
 
         # ---------------- Wipe/done ----------------
         summary = {"passed": sum(1 for x in results if x["ok"]),

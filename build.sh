@@ -50,5 +50,7 @@ build tests/test_q35_geometry.cpp test_q35_geometry.exe
 build tests/test_mla_cache_cmp.cpp test_mla_cmp.exe
 build tests/test_matrix.cpp test_matrix.exe
 build tests/test_tokenizer.cpp test_tokenizer.exe
+build tests/test_text_util.cpp test_text_util.exe
+build tests/test_tokenizer_budget.cpp test_tokenizer_budget.exe
 build tests/test_sampler.cpp test_sampler.exe
 build tests/test_serve_guard.cpp test_serve_guard.exe
