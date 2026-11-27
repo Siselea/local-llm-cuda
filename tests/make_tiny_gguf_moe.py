@@ -33,7 +33,11 @@ SEED = 20261115
 
 T_STRING, T_UINT32, T_FLOAT32, T_ARRAY = 8, 4, 6, 9
 T_F32 = 0
+T_F16 = 1
 T_Q8_0 = 8
+# EXPERT_TYPE selects the expert tensor encoding: Q8_0 (default, quantized path),
+# F16 or F32 (the non-quantized fallback path).
+EXPERT_TYPE = os.environ.get("EXPERT_TYPE", "Q8_0").upper()
 
 
 def _s(text: str) -> bytes:
@@ -84,7 +88,17 @@ def write_gguf(path: Path, kv: list, tensors: list[tuple[str, np.ndarray]]) -> N
     for name, arr in tensors:
         arr = np.ascontiguousarray(arr, dtype=np.float32)
         dims = list(arr.shape[::-1])          # gguf stores innermost first
-        if "_exps" in name:
+        if "_exps" in name and EXPERT_TYPE == "F16":
+            arr16 = arr.astype(np.float16)
+            infos.append((name, dims, offset, T_F16))
+            payloads.append(arr16.tobytes())
+            # the reference must use the values the file actually stores
+            deq[name] = arr16.astype(np.float32)
+        elif "_exps" in name and EXPERT_TYPE == "F32":
+            infos.append((name, dims, offset, T_F32))
+            payloads.append(arr.tobytes())
+            deq[name] = arr
+        elif "_exps" in name:
             blob, dq = quant_q8_0(arr)
             infos.append((name, dims, offset, T_Q8_0))
             payloads.append(blob)
@@ -247,7 +261,8 @@ def main() -> int:
     xf = rmsnorm(x, T["output_norm.weight"])
     logits = (xf @ T["output.weight"].T).astype(np.float32)
     logits.tofile(out / "ref_logits.f32")
-    print(f"model    : {out}/model.gguf  layers={N_LAYER} experts={N_EXPERT} topk={TOP_K}")
+    print(f"model    : {out}/model.gguf  layers={N_LAYER} experts={N_EXPERT} topk={TOP_K}"
+          f"  expert_type={EXPERT_TYPE}")
     print(f"logits   : argmax(last)={int(logits[-1].argmax())} std={logits.std():.4f}")
     return 0
 

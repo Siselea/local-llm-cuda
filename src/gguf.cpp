@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 namespace gguf {
@@ -66,11 +67,19 @@ class Reader {
   uint64_t size_ = 0;
 };
 
-Value read_value(Reader& r, uint32_t vtype, bool capture);
+Value read_value(Reader& r, uint32_t vtype, bool capture, int depth);
 
-Value read_array(Reader& r, bool capture) {
+// Nested metadata arrays are attacker-controlled recursion: bound the depth the same
+// way the JSON parser bounds nesting (v0.1.6).  Real GGUFs nest at most a couple of
+// levels (per-layer arrays of arrays).
+constexpr int kMaxArrayDepth = 16;
+
+Value read_array(Reader& r, bool capture, int depth) {
   Value v;
   v.kind = Value::Kind::ARRAY;
+  if (depth > kMaxArrayDepth)
+    throw std::runtime_error("metadata arrays nested deeper than " +
+                             std::to_string(kMaxArrayDepth) + " levels");
   v.array_elem_type = r.get<uint32_t>();
   v.array_len = r.get<uint64_t>();
   if (v.array_len > 100000000ull) throw std::runtime_error("implausible array length");
@@ -82,6 +91,9 @@ Value read_array(Reader& r, bool capture) {
   const bool numeric = (et <= 7) || (et >= 10 && et <= 12);
   const bool auto_capture = numeric && v.array_len <= 4096;
   auto take_bytes = [&](uint64_t bytes) {
+    // #18: an array length is only bounded by a constant so far; also require the
+    // payload to fit in the file before materialising it (1e8 u64 = 800 MB otherwise).
+    if (bytes > r.size()) throw std::runtime_error("array payload larger than file");
     if (capture || auto_capture) {
       v.raw.resize(static_cast<size_t>(bytes));
       if (bytes) r.read_raw(v.raw.data(), static_cast<size_t>(bytes));
@@ -118,7 +130,8 @@ Value read_array(Reader& r, bool capture) {
       }
       break;
     case ValueType::ARRAY:
-      for (uint64_t i = 0; i < v.array_len; ++i) read_array(r, /*capture=*/false);
+      for (uint64_t i = 0; i < v.array_len; ++i)
+        read_array(r, /*capture=*/false, depth + 1);
       break;
     default:
       throw std::runtime_error("bad array element type");
@@ -126,7 +139,7 @@ Value read_array(Reader& r, bool capture) {
   return v;
 }
 
-Value read_value(Reader& r, uint32_t vtype, bool capture) {
+Value read_value(Reader& r, uint32_t vtype, bool capture, int depth) {
   Value v;
   switch (static_cast<ValueType>(vtype)) {
     case ValueType::UINT8: v.kind = Value::Kind::INT; v.i = r.get<uint8_t>(); break;
@@ -138,7 +151,7 @@ Value read_value(Reader& r, uint32_t vtype, bool capture) {
     case ValueType::FLOAT32: v.kind = Value::Kind::FLOAT; v.f = r.get<float>(); break;
     case ValueType::BOOL: v.kind = Value::Kind::BOOL; v.b = r.get<uint8_t>() != 0; break;
     case ValueType::STRING: v.kind = Value::Kind::STRING; v.s = r.str(); break;
-    case ValueType::ARRAY: return read_array(r, capture);
+    case ValueType::ARRAY: return read_array(r, capture, depth + 1);
     case ValueType::UINT64: v.kind = Value::Kind::INT; v.i = static_cast<int64_t>(r.get<uint64_t>()); break;
     case ValueType::INT64: v.kind = Value::Kind::INT; v.i = r.get<int64_t>(); break;
     case ValueType::FLOAT64: v.kind = Value::Kind::FLOAT; v.f = r.get<double>(); break;
@@ -254,6 +267,19 @@ Model read(const std::string& path, const std::vector<std::string>& capture_keys
     throw std::runtime_error("unsupported GGUF version " + std::to_string(m.version));
   m.n_tensors = r.get<uint64_t>();
   m.n_kv = r.get<uint64_t>();
+  // #18: both counts come straight from the file.  Every metadata entry / tensor record
+  // occupies at least a few bytes, so a count larger than the file could possibly hold is
+  // corrupt.  Reject before reserve() (a bogus n_tensors = 2^60 used to attempt a
+  // multi-exabyte allocation).  The constants are deliberately loose (>= the smallest
+  // legal encoding) so real models are never rejected.
+  constexpr uint64_t kMinTensorRecordBytes = 24;  // name len/name + dims + type + offset
+  constexpr uint64_t kMinKvRecordBytes = 16;      // key len/key + type + smallest value
+  if (m.n_tensors > m.file_size / kMinTensorRecordBytes + 1)
+    throw std::runtime_error("implausible n_tensors " + std::to_string(m.n_tensors) +
+                             " for a " + std::to_string(m.file_size) + " byte file");
+  if (m.n_kv > m.file_size / kMinKvRecordBytes + 1)
+    throw std::runtime_error("implausible n_kv " + std::to_string(m.n_kv) + " for a " +
+                             std::to_string(m.file_size) + " byte file");
 
   // Sorted capture list -> binary search, no allocation per metadata key.
   std::vector<std::string> capture = capture_keys;
@@ -263,7 +289,7 @@ Model read(const std::string& path, const std::vector<std::string>& capture_keys
     uint32_t vtype = r.get<uint32_t>();
     const bool want_capture =
         !capture.empty() && std::binary_search(capture.begin(), capture.end(), key);
-    m.kv.emplace(std::move(key), read_value(r, vtype, want_capture));
+    m.kv.emplace(std::move(key), read_value(r, vtype, want_capture, /*depth=*/0));
   }
 
   m.tensors.reserve(static_cast<size_t>(m.n_tensors));
@@ -282,18 +308,46 @@ Model read(const std::string& path, const std::vector<std::string>& capture_keys
                                       std::to_string(t.type_id));
     t.type_name = ti->name;
     t.shape.assign(dims.rbegin(), dims.rend());
+    // #9: the dimension product and the byte size are attacker-controlled arithmetic;
+    // check every step so nothing wraps around (a wrapped n_elements made a impossible
+    // tensor look small/empty and later reads ran past the buffer).
     t.n_elements = 1;
-    for (auto d : dims) t.n_elements *= d;
+    for (auto d : dims) {
+      if (d == 0) throw std::runtime_error("tensor " + t.name + ": zero dimension");
+      if (t.n_elements > std::numeric_limits<uint64_t>::max() / d)
+        throw std::runtime_error("tensor " + t.name + ": dimension product overflow");
+      t.n_elements *= d;
+    }
     if (ti->block > 1 && t.n_elements % static_cast<uint64_t>(ti->block) != 0)
       throw std::runtime_error("tensor " + t.name + ": element count not divisible by block");
-    t.nbytes = t.n_elements / static_cast<uint64_t>(ti->block) * static_cast<uint64_t>(ti->bytes);
+    const uint64_t n_blocks = t.n_elements / static_cast<uint64_t>(ti->block);
+    if (n_blocks > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(ti->bytes))
+      throw std::runtime_error("tensor " + t.name + ": byte size overflow");
+    t.nbytes = n_blocks * static_cast<uint64_t>(ti->bytes);
     m.tensors.push_back(std::move(t));
   }
 
+  // #8: the alignment is attacker-controlled metadata.  A value that does not fit the
+  // uint32 member (e.g. 2^32) used to truncate to zero and the data-offset computation
+  // below then divided by zero (SIGFPE).  Require a power of two of sane size.
   int64_t align = m.get_int("general.alignment", 32);
-  m.alignment = static_cast<uint32_t>(align > 0 ? align : 32);
-  uint64_t pos = r.tell();
-  m.data_offset = (pos + m.alignment - 1) / m.alignment * m.alignment;
+  if (align <= 0 || align > (1ll << 26) || (align & (align - 1)) != 0)
+    throw std::runtime_error("bad general.alignment " + std::to_string(align) +
+                             " (must be a power of two in [1, 64 MiB])");
+  m.alignment = static_cast<uint32_t>(align);
+  const uint64_t pos = r.tell();
+  const uint64_t pad = (m.alignment - (pos % m.alignment)) % m.alignment;
+  if (pos > std::numeric_limits<uint64_t>::max() - pad)
+    throw std::runtime_error("data offset overflow");
+  m.data_offset = pos + pad;
+  if (m.data_offset > m.file_size)
+    throw std::runtime_error("tensor data offset past end of file");
+  // Every tensor must lie inside the file: offset + nbytes is untrusted arithmetic.
+  const uint64_t avail = m.file_size - m.data_offset;
+  for (const auto& t : m.tensors) {
+    if (t.offset > avail || t.nbytes > avail - t.offset)
+      throw std::runtime_error("tensor " + t.name + " extends past end of file");
+  }
   return m;
 }
 

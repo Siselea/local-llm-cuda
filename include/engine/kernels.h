@@ -2,6 +2,10 @@
 // All kernels are float32 and correctness-first; optimized variants come later.
 #pragma once
 
+#include <string>
+
+#include "engine/fp16.h"
+
 namespace kernels {
 
 inline const char* kRmsNorm = R"cuda(
@@ -130,29 +134,10 @@ extern "C" __global__ void add_three_inplace(float* __restrict__ a, const float*
 
 // ---- quantized block dequantization (K-quants) ----------------------------
 // Shared helpers are emitted once and prepended to both dequant programs.
-inline const char* kQuantCommon = R"cuda(
-__device__ __forceinline__ float half_to_float(unsigned short h) {
-  unsigned int sign = (unsigned int)(h & 0x8000u) << 16;
-  unsigned int exp = (h >> 10) & 0x1Fu;
-  unsigned int mant = h & 0x3FFu;
-  unsigned int bits;
-  if (exp == 0) {
-    if (mant == 0) {
-      bits = sign;
-    } else {
-      int e = 127 - 15 + 1;
-      while ((mant & 0x400u) == 0) { mant <<= 1; --e; }
-      mant &= 0x3FFu;
-      bits = sign | ((unsigned int)e << 23) | (mant << 13);
-    }
-  } else if (exp == 31) {
-    bits = sign | 0x7F800000u | (mant << 13);
-  } else {
-    bits = sign | ((exp + 112u) << 23) | (mant << 13);
-  }
-  return __uint_as_float(bits);
-}
-
+// half_to_float comes from engine::fp16::kDeviceSrc (include/engine/fp16.h), which is
+// also the source of the host-side conversion -- so the device and host decoders can
+// never drift apart again (tests/test_fp16.cpp checks all 65536 patterns).
+inline const std::string kQuantCommon = engine::fp16::kDeviceSrc + R"cuda(
 // 6-bit scale/min pair per 32-element sub-block (ggml get_scale_min_k4)
 __device__ __forceinline__ void q4k_scale_min(int j, const unsigned char* q, int* sc, int* mn) {
   if (j < 4) {
@@ -1143,7 +1128,9 @@ extern "C" __global__ void gd_conv1d_silu(const float* __restrict__ x,
 }
 )cuda";
 
-// keep the last K-1 input rows; must run after gd_conv1d_silu for the chunk
+// keep the last K-1 input rows; must run after gd_conv1d_silu for the chunk.
+// The K=4 tap shift below is the only implementation: q35_geometry::validate_ssm()
+// rejects conv_kernel != 4 at load time, so models with another K never reach here.
 inline const char* kGdConvState = R"cuda(
 extern "C" __global__ void gd_conv_state(const float* __restrict__ x,
                                          float* __restrict__ state, int T, int C, int K) {

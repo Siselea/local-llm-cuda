@@ -1,8 +1,10 @@
 #include "engine/st.h"
 
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 #include "engine/json_parse.h"
@@ -10,6 +12,25 @@
 namespace st {
 
 namespace {
+
+// #14: safetensors is JSON, so every number arrives as a double.  Shape entries and
+// data offsets must be non-negative integers: a cast of -1 or 1.5 silently turned into
+// 0xFFFFFFFFFFFFFFFF / a truncated value and the header was accepted.
+uint64_t as_index(const jsonp::Value& v, const std::string& ctx) {
+  if (!v.is_number()) throw std::runtime_error(ctx + ": expected a number");
+  const double d = v.num;
+  if (!(d >= 0.0)) throw std::runtime_error(ctx + ": negative value");
+  if (d != std::floor(d)) throw std::runtime_error(ctx + ": non-integer value");
+  if (d > 9007199254740992.0) throw std::runtime_error(ctx + ": value too large");
+  return static_cast<uint64_t>(d);
+}
+
+// #15: overflow-checked multiplication for element counts / byte sizes.
+uint64_t checked_mul(uint64_t a, uint64_t b, const std::string& ctx) {
+  if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a)
+    throw std::runtime_error(ctx + ": size overflow");
+  return a * b;
+}
 
 std::string read_text(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
@@ -19,6 +40,7 @@ std::string read_text(const std::string& path) {
   f.seekg(0, std::ios::beg);
   std::string s(n, '\0');
   f.read(&s[0], static_cast<std::streamsize>(n));
+  if (static_cast<size_t>(f.gcount()) != n) throw std::runtime_error("short read: " + path);
   return s;
 }
 
@@ -78,16 +100,22 @@ std::map<std::string, Tensor> read_file(const std::string& path) {
     t.data_start = data_start;
     t.dtype = need(info, "dtype", name).str;
     const auto& shape = need(info, "shape", name);
-    for (const auto& d : shape.arr) t.shape.push_back(static_cast<uint64_t>(d.num));
+    for (const auto& d : shape.arr)
+      t.shape.push_back(as_index(d, name + ": shape"));
     const auto& offs = need(info, "data_offsets", name);
     if (offs.arr.size() != 2) throw std::runtime_error(name + ": bad data_offsets");
-    t.begin = static_cast<uint64_t>(offs.arr[0].num);
-    t.end = static_cast<uint64_t>(offs.arr[1].num);
+    // #14: offsets are uint64 in the format; require two non-negative integers.
+    t.begin = as_index(offs.arr[0], name + ": data_offsets[0]");
+    t.end = as_index(offs.arr[1], name + ": data_offsets[1]");
 
-    const uint64_t expect = t.n_elements() * dtype_bytes(t.dtype);
+    // #15: every step here can overflow with a hostile header.
+    uint64_t n_elems = 1;
+    for (uint64_t d : t.shape) n_elems = checked_mul(n_elems, d, name + ": shape");
+    const uint64_t expect = checked_mul(n_elems, dtype_bytes(t.dtype), name + ": size");
+    if (t.end < t.begin) throw std::runtime_error(name + ": data_offsets end < begin");
     if (t.end - t.begin != expect)
       throw std::runtime_error(name + ": data size mismatch (shape x dtype)");
-    if (data_start + t.end > fsize)
+    if (t.end > fsize || data_start > fsize || data_start + t.end > fsize)
       throw std::runtime_error(name + ": data exceeds file size");
     out.emplace(name, std::move(t));
   }

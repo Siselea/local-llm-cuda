@@ -54,3 +54,6 @@ build tests/test_text_util.cpp test_text_util.exe
 build tests/test_tokenizer_budget.cpp test_tokenizer_budget.exe
 build tests/test_sampler.cpp test_sampler.exe
 build tests/test_serve_guard.cpp test_serve_guard.exe
+build tests/test_fp16.cpp     test_fp16.exe
+build tests/test_loader_bounds.cpp test_loader_bounds.exe
+build tests/test_gguf_moe_offload.cpp test_gguf_moe_offload.exe

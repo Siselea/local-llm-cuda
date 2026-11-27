@@ -15,12 +15,30 @@
 #include "engine/config.h"
 #include "engine/cublas.h"
 #include "engine/cpu_matvec.h"
-#include "engine/gguf.h"
+#include "engine/cuda.h"
+#include "engine/fp16.h"
 #include "engine/kernels.h"
 #include "engine/st.h"
 
 
 namespace runner {
+
+namespace {
+
+// #17: ifstream::read leaves the buffer untouched when the file ends early, and a short
+// read used to be accepted silently (a truncated or concurrently-modified model file then
+// produced zeros or stale bytes instead of an error).  Every loader read goes through
+// this helper so the byte count is verified.
+void read_exact(std::ifstream& f, void* dst, size_t bytes, const std::string& what) {
+  if (bytes == 0) return;
+  f.read(static_cast<char*>(dst), static_cast<std::streamsize>(bytes));
+  if (!f || static_cast<size_t>(f.gcount()) != bytes)
+    throw std::runtime_error("short read (" + std::to_string(f.gcount()) + " of " +
+                             std::to_string(bytes) + " bytes) while loading " + what);
+}
+
+}  // namespace
+
 
 int DenseRunner::attn_warps_for_ctx(int ctx_len) {
   static const int mid = static_cast<int>(engine::config::get_int("attn_warp_ctx_mid"));
@@ -1279,6 +1297,20 @@ DenseRunner::~DenseRunner() {
   prof_acc::dump();
 }
 
+DenseRunner::ExpertPlacement DenseRunner::debug_expert_placement(int layer) const {
+  ExpertPlacement p;
+  if (layer < 0 || layer >= static_cast<int>(layers_.size())) return p;
+  const LayerW& L = layers_[static_cast<size_t>(layer)];
+  p.gpu_experts = static_cast<int>(L.experts.size() + L.q_experts.size() / 3);
+  const int ne = ir_.moe.n_expert;
+  const bool quant_host = !L.h_gate_bytes.empty() && !L.h_up_bytes.empty() &&
+                          !L.h_down_bytes.empty();
+  p.host_experts = static_cast<int>(L.host_gate.size());
+  if (quant_host) p.host_experts = ne;   // quantized bytes kept on the host (GGUF path)
+  p.cpu_begin = L.cpu_begin;
+  return p;
+}
+
 std::vector<float> DenseRunner::debug_mla_cache(int layer) {
   if (layer < 0 || layer >= static_cast<int>(layers_.size())) return {};
   auto& L = layers_[layer];
@@ -1346,26 +1378,20 @@ std::vector<float> DenseRunner::tensor_f32(const std::string& name) const {
     const size_t nbytes = static_cast<size_t>(t.nbytes());
     if (t.dtype == "F32") {
       std::vector<float> out(nbytes / 4);
-      f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(nbytes));
+      read_exact(f, out.data(), nbytes, name);
       return out;
     }
     if (t.dtype == "BF16" || t.dtype == "F16") {
       std::vector<uint16_t> raw(nbytes / 2);
-      f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(nbytes));
+      read_exact(f, raw.data(), nbytes, name);
       std::vector<float> out(raw.size());
       for (size_t i = 0; i < raw.size(); ++i) {
-        uint32_t bits;
         if (t.dtype == "BF16") {
-          bits = static_cast<uint32_t>(raw[i]) << 16;
+          const uint32_t bits = static_cast<uint32_t>(raw[i]) << 16;
+          std::memcpy(&out[i], &bits, 4);
         } else {  // F16
-          const uint32_t h = raw[i];
-          const uint32_t sign = (h & 0x8000u) << 16;
-          uint32_t exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu;
-          if (exp == 0) bits = sign | (mant ? (112u << 23) | (mant << 13) : 0);
-          else if (exp == 31) bits = sign | 0x7F800000u | (mant << 13);
-          else bits = sign | ((exp + 112u) << 23) | (mant << 13);
+          out[i] = engine::fp16::half_to_float(raw[i]);
         }
-        std::memcpy(&out[i], &bits, 4);
       }
       return out;
     }
@@ -1385,7 +1411,7 @@ std::vector<float> DenseRunner::tensor_f32(const std::string& name) const {
   if (!f) throw std::runtime_error("cannot open " + g->path);
   f.seekg(static_cast<std::streamoff>(g->data_offset + ti->offset));
   std::vector<unsigned char> raw(static_cast<size_t>(ti->nbytes));
-  f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+  read_exact(f, raw.data(), raw.size(), name);
 
   if (ti->type_name == "F32") {
     std::vector<float> out(raw.size() / 4);
@@ -1396,17 +1422,12 @@ std::vector<float> DenseRunner::tensor_f32(const std::string& name) const {
     std::vector<float> out(raw.size() / 2);
     for (size_t i = 0; i < out.size(); ++i) {
       const uint16_t h = static_cast<uint16_t>(raw[2 * i] | (raw[2 * i + 1] << 8));
-      uint32_t bits;
       if (ti->type_name == "BF16") {
-        bits = static_cast<uint32_t>(h) << 16;
+        const uint32_t bits = static_cast<uint32_t>(h) << 16;
+        std::memcpy(&out[i], &bits, 4);
       } else {
-        const uint32_t sign = (h & 0x8000u) << 16;
-        uint32_t exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu;
-        if (exp == 0) bits = sign | (mant ? (112u << 23) | (mant << 13) : 0);
-        else if (exp == 31) bits = sign | 0x7F800000u | (mant << 13);
-        else bits = sign | ((exp + 112u) << 23) | (mant << 13);
+        out[i] = engine::fp16::half_to_float(h);
       }
-      std::memcpy(&out[i], &bits, 4);
     }
     return out;
   }
@@ -1951,23 +1972,53 @@ void DenseRunner::load_weights() {
             w.h_down_bytes = read_gguf_raw(down_name);
           }
         } else {
+          // #10 (HIGH): F16/F32 (or mixed-type) experts land here.  This branch used to
+          // upload EVERY expert to the GPU and leave the host-side buffers empty, so any
+          // layer the placement decided to keep on the CPU had no data at all:
+          // run_moe's host branch indexes w.host_gate/w.host_up/w.host_down by expert
+          // (the vector is empty -> out-of-range / garbage output).  Mirror the
+          // quantized path: keep f32 host copies for every expert and upload only the
+          // GPU-resident ones (gpu_n from the layer-granular placement above).
           if (std::getenv("ENGINE_DBG_LOAD2"))
-            std::fprintf(stderr, "[load2] layer %d -> F32 fallback\n", i);
+            std::fprintf(stderr, "[load2] layer %d -> F32 fallback (gpu_n=%d/%d)\n", i, gpu_n,
+                         ne_all);
           const auto gate_all = tensor_f32(gate_name);
           const auto up_all = tensor_f32(up_name);
           const auto down_all = tensor_f32(down_name);
-          w.experts.resize(static_cast<size_t>(ir_.moe.n_expert));
-          for (int e = 0; e < ir_.moe.n_expert; ++e) {
-            std::vector<float> g(gate_all.begin() + e * g_elems,
-                                 gate_all.begin() + (e + 1) * g_elems);
-            std::vector<float> u(up_all.begin() + e * g_elems,
-                                 up_all.begin() + (e + 1) * g_elems);
-            std::vector<float> dn(down_all.begin() + e * d_elems,
-                                  down_all.begin() + (e + 1) * d_elems);
-            w.experts[e].gate = upload(g);
-            w.experts[e].up = upload(u);
-            w.experts[e].down = upload(dn);
+          const bool need_host = gpu_n < ne_all;
+          w.cpu_begin = gpu_n;
+          w.experts.resize(static_cast<size_t>(gpu_n));
+          if (need_host) {
+            w.host_gate.clear();
+            w.host_up.clear();
+            w.host_down.clear();
+            w.host_gate.reserve(static_cast<size_t>(ne_all));
+            w.host_up.reserve(static_cast<size_t>(ne_all));
+            w.host_down.reserve(static_cast<size_t>(ne_all));
           }
+          for (int e = 0; e < ne_all; ++e) {
+            std::vector<float> g(gate_all.begin() + static_cast<long>(e) * g_elems,
+                                 gate_all.begin() + static_cast<long>(e + 1) * g_elems);
+            std::vector<float> u(up_all.begin() + static_cast<long>(e) * g_elems,
+                                 up_all.begin() + static_cast<long>(e + 1) * g_elems);
+            std::vector<float> dn(down_all.begin() + static_cast<long>(e) * d_elems,
+                                  down_all.begin() + static_cast<long>(e + 1) * d_elems);
+            if (e < gpu_n) {
+              w.experts[e].gate = upload(g);
+              w.experts[e].up = upload(u);
+              w.experts[e].down = upload(dn);
+            }
+            if (need_host) {
+              w.host_gate.push_back(std::move(g));
+              w.host_up.push_back(std::move(u));
+              w.host_down.push_back(std::move(dn));
+            }
+          }
+          // The host matvec path needs the tensor types even for f32 experts (the CPU
+          // dispatcher reads h_type_* to pick the row kernel).
+          w.h_type_g = "F32";
+          w.h_type_u = "F32";
+          w.h_type_d = "F32";
         }
       } else {
         const bool qg = load_qtensor(L(i, "ffn_gate.weight"), w.qg);
@@ -2020,21 +2071,41 @@ void DenseRunner::load_weights() {
           w.sh_down = upload(tensor_f32(L(i, "mlp.shared_experts.down_proj.weight")));
         }
         w.router = conv(L(i, "mlp.gate.weight"));
-        w.experts.resize(static_cast<size_t>(ir_.moe.n_expert));
-        for (int e = 0; e < ir_.moe.n_expert; ++e) {
+        // #26: with an explicit expert budget (gpu_experts_ >= 0) the CPU path keeps host
+        // copies, but this loop still uploaded *every* expert to the GPU as well, so the
+        // experts kept for the CPU were resident twice (host + device).  Upload only the
+        // GPU-resident prefix and keep host copies for the rest, like the GGUF path.
+        const int st_ne = ir_.moe.n_expert;
+        const int st_gpu_n = (gpu_experts_ < 0) ? st_ne : std::min(gpu_experts_, st_ne);
+        w.cpu_begin = st_gpu_n;
+        w.experts.resize(static_cast<size_t>(st_gpu_n));
+        const bool st_need_host = st_gpu_n < st_ne;
+        if (st_need_host) {
+          w.host_gate.clear();
+          w.host_up.clear();
+          w.host_down.clear();
+        }
+        for (int e = 0; e < st_ne; ++e) {
           const std::string ep = "model.layers." + std::to_string(i) + ".mlp.experts." +
                                  std::to_string(e) + ".";
           auto g = tensor_f32(ep + "gate_proj.weight");
           auto u = tensor_f32(ep + "up_proj.weight");
           auto dn = tensor_f32(ep + "down_proj.weight");
-          if (gpu_experts_ >= 0) {
-            w.host_gate.push_back(g);
-            w.host_up.push_back(u);
-            w.host_down.push_back(dn);
+          if (e < st_gpu_n) {
+            w.experts[e].gate = upload(g);
+            w.experts[e].up = upload(u);
+            w.experts[e].down = upload(dn);
           }
-          w.experts[e].gate = upload(g);
-          w.experts[e].up = upload(u);
-          w.experts[e].down = upload(dn);
+          if (st_need_host) {
+            w.host_gate.push_back(std::move(g));
+            w.host_up.push_back(std::move(u));
+            w.host_down.push_back(std::move(dn));
+          }
+        }
+        if (st_need_host) {
+          w.h_type_g = "F32";
+          w.h_type_u = "F32";
+          w.h_type_d = "F32";
         }
       } else {
         w.gate = conv(L(i, "mlp.gate_proj.weight"));
@@ -4152,7 +4223,7 @@ bool DenseRunner::load_qtensor(const std::string& name, QTensor& out) {
   if (!f) throw std::runtime_error("cannot open " + g->path);
   f.seekg(static_cast<std::streamoff>(g->data_offset + ti->offset));
   std::vector<unsigned char> raw(static_cast<size_t>(ti->nbytes));
-  f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+  read_exact(f, raw.data(), raw.size(), name);
   out.data = cuda::Buffer(raw.size());
   out.data.upload(raw.data(), raw.size());
   out.type = ti->type_name;
@@ -4196,7 +4267,7 @@ std::vector<unsigned char> DenseRunner::read_gguf_raw(const std::string& name) {
   if (!f) throw std::runtime_error("cannot open " + g->path);
   f.seekg(static_cast<std::streamoff>(g->data_offset + ti->offset));
   std::vector<unsigned char> raw(static_cast<size_t>(ti->nbytes));
-  f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+  read_exact(f, raw.data(), raw.size(), name);
   return raw;
 }
 
@@ -4216,7 +4287,7 @@ bool DenseRunner::load_qtensor_span(const std::string& name, size_t byte_offset,
   if (!f) throw std::runtime_error("cannot open " + g->path);
   f.seekg(static_cast<std::streamoff>(g->data_offset + ti->offset + byte_offset));
   std::vector<unsigned char> raw(nbytes);
-  f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(nbytes));
+  read_exact(f, raw.data(), nbytes, name);
   out.data = cuda::Buffer(nbytes);
   out.data.upload(raw.data(), nbytes);
   out.type = ti->type_name;

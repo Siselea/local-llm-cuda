@@ -65,6 +65,16 @@ class DenseRunner {
   const ir::Model& ir() const { return ir_; }
   // test hook: contents of the MLA k-cache for one layer
   std::vector<float> debug_mla_cache(int layer);
+  // Test hook (loader contract, see tests/test_gguf_moe_offload.cpp): how many experts
+  // of one layer ended up GPU-resident (uploaded) and how many CPU copies were kept, plus
+  // the first CPU expert index.  Lets the offload tests assert the placement was honoured
+  // without depending on GPU memory accounting.
+  struct ExpertPlacement {
+    int gpu_experts = 0;
+    int host_experts = 0;
+    int cpu_begin = -1;
+  };
+  ExpertPlacement debug_expert_placement(int layer) const;
 
   // experimental switches (used by the layout sweep tool): q=0 perhead / 1 global /
   // 2 global with the rope half first; kv=0 global / 1 perhead / 2 global v-first /

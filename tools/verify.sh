@@ -42,6 +42,8 @@ N_LAYER=4 "$PY" tests/make_tiny_model.py build/fixtures/tiny_model4 >/dev/null |
 "$PY" tests/make_tiny_moe.py >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_moe.py >/dev/null || fail=1
 N_EXPERT=300 "$PY" tests/make_tiny_gguf_moe.py build/fixtures/tiny_gguf_moe300 >/dev/null || fail=1
+EXPERT_TYPE=F16 "$PY" tests/make_tiny_gguf_moe.py build/fixtures/tiny_gguf_moe_f16 >/dev/null || fail=1
+EXPERT_TYPE=F32 "$PY" tests/make_tiny_gguf_moe.py build/fixtures/tiny_gguf_moe_f32 >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_mla.py >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_ds2.py >/dev/null || fail=1
 QW="${MODEL_DIR}/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_K_M.gguf"
@@ -106,6 +108,14 @@ else echo "missing build/test_gguf.exe"; fail=1; fi
 if [ -x ./build/test_serve_guard.exe ]; then
   ./build/test_serve_guard.exe || fail=1
 else echo "missing build/test_serve_guard.exe"; fail=1; fi
+if [ -x ./build/test_fp16.exe ]; then ./build/test_fp16.exe || fail=1; else
+  echo "missing build/test_fp16.exe"; fail=1; fi
+if [ -x ./build/test_loader_bounds.exe ]; then ./build/test_loader_bounds.exe || fail=1; else
+  echo "missing build/test_loader_bounds.exe"; fail=1; fi
+if [ -x ./build/test_gguf_moe_offload.exe ]; then
+  ./build/test_gguf_moe_offload.exe build/fixtures/tiny_gguf_moe_f16/model.gguf build/fixtures/tiny_gguf_moe_f16 || fail=1
+  ./build/test_gguf_moe_offload.exe build/fixtures/tiny_gguf_moe_f32/model.gguf build/fixtures/tiny_gguf_moe_f32 || fail=1
+else echo "missing build/test_gguf_moe_offload.exe"; fail=1; fi
 
 echo
 echo "== M2: C++ plan == Python plan =="

@@ -168,8 +168,29 @@ Model build_from_gguf(const gguf::Model& g) {
       static_cast<int>(meta_int(g, m.arch, "leading_dense_block_count"));
 
   if (a.key_length == 0 && a.n_head > 0) {
+    if (m.hidden % a.n_head != 0)
+      throw std::runtime_error("IR: hidden_size " + std::to_string(m.hidden) +
+                               " is not divisible by attention.head_count " +
+                               std::to_string(a.n_head));
     a.key_length = a.value_length = m.hidden / a.n_head;
   }
+  // #13: GQA/MQA group geometry must be integral.  The attention kernels map query head
+  // h to kv head h / (n_head / n_head_kv); with n_head % n_head_kv != 0 that integer
+  // division silently drops heads and indexes the wrong K/V rows.
+  if (a.n_head > 0 && a.n_head_kv > 0) {
+    if (a.n_head_kv > a.n_head)
+      throw std::runtime_error("IR: attention.head_count_kv (" +
+                               std::to_string(a.n_head_kv) +
+                               ") exceeds attention.head_count (" + std::to_string(a.n_head) +
+                               ")");
+    if (a.n_head % a.n_head_kv != 0)
+      throw std::runtime_error("IR: attention.head_count (" + std::to_string(a.n_head) +
+                               ") is not divisible by attention.head_count_kv (" +
+                               std::to_string(a.n_head_kv) + ")");
+  }
+  if (a.key_length > 0 && m.hidden > 0 && a.key_length > m.hidden)
+    throw std::runtime_error("IR: attention.key_length " + std::to_string(a.key_length) +
+                             " exceeds hidden_size " + std::to_string(m.hidden));
   if (a.kv_lora_rank > 0) a.variant = "mla";
   else if (a.n_head_kv > 0 && a.n_head > 0) {
     if (a.n_head_kv == 1) a.variant = "mqa";
@@ -276,6 +297,21 @@ Model build_from_gguf(const gguf::Model& g) {
     const int groups = static_cast<int>(meta_int(g, m.arch, "ssm.group_count"));
     const int tsr = static_cast<int>(meta_int(g, m.arch, "ssm.time_step_rank"));
     if (conv_k > 0 && inner > 0 && state > 0 && groups > 0) {
+      // #13: gated-delta-net geometry.  The mixer indexes q/k/v and the conv state by
+      // these strides; `inner / tsr` used to truncate silently for a corrupt (or
+      // unsupported) time_step_rank, and a 0/negative tsr produced a zero head dim.
+      if (tsr <= 0)
+        throw std::runtime_error("IR: ssm.time_step_rank must be positive (got " +
+                                 std::to_string(tsr) + ")");
+      if (inner % tsr != 0)
+        throw std::runtime_error("IR: ssm.inner_size (" + std::to_string(inner) +
+                                 ") is not divisible by ssm.time_step_rank (" +
+                                 std::to_string(tsr) + ")");
+      if (conv_k > 4096 || groups > 1 << 20 || state > 1 << 20)
+        throw std::runtime_error("IR: implausible gated-delta-net geometry (conv_kernel=" +
+                                 std::to_string(conv_k) + ", group_count=" +
+                                 std::to_string(groups) + ", state_size=" +
+                                 std::to_string(state) + ")");
       m.ssm.variant = "gated_delta";
       m.ssm.conv_kernel = conv_k;
       m.ssm.n_key_head = groups;
