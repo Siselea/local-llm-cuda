@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -514,6 +516,32 @@ bool lower_eq(const std::string& a, const char* b) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Recursive config includes: a config file may name another config file with
+// `config = <path>` (the child is applied on top of the parent).  There was no
+// cycle guard, so a.cfg -> b.cfg -> a.cfg recursed until the process ran out of
+// file handles (misleading "cannot open config file") or, on platforms with a
+// larger handle limit, the native stack.  Track the include chain per thread and
+// reject repeated paths / excessive depth with an explicit diagnostic.
+// ---------------------------------------------------------------------------
+constexpr int kMaxConfigIncludeDepth = 8;
+
+std::string normalized_config_path(const std::string& path) {
+  std::error_code ec;
+  const std::filesystem::path abs = std::filesystem::absolute(path, ec);
+  if (ec) return path;
+  const std::filesystem::path canon = std::filesystem::weakly_canonical(abs, ec);
+  return (ec ? abs.lexically_normal() : canon).string();
+}
+
+struct ConfigLoadScope {
+  std::vector<std::string>* chain;
+  ConfigLoadScope(std::vector<std::string>* c, std::string p) : chain(c) {
+    chain->push_back(std::move(p));
+  }
+  ~ConfigLoadScope() { chain->pop_back(); }
+};
+
 }  // namespace
 
 const char* source_name(Source s) {
@@ -595,6 +623,14 @@ bool Config::apply_text(const OptionDef& def, const std::string& text, Source sr
       const double v = std::strtod(t.c_str(), &end);
       if (errno != 0 || end == t.c_str() || *end != '\0') {
         *err = std::string(where) + ": option '" + def.key + "' expects a number, got '" + t + "'";
+        return false;
+      }
+      // strtod("nan") succeeds and every comparison with NaN is false, so the old
+      // range check let NaN through and the following (int64_t) cast was UB (observed
+      // payload: it.i == INT64_MIN).  Reject non-finite values explicitly.
+      if (!std::isfinite(v)) {
+        *err = std::string(where) + ": option '" + def.key +
+               "' expects a finite number, got '" + t + "'";
         return false;
       }
       if (v < def.minv || v > def.maxv) {
@@ -704,12 +740,28 @@ void Config::ensure_initialized() const {
 
 bool Config::load_file(const std::string& path, std::string* err) {
   ensure_initialized();
+  static thread_local std::vector<std::string> load_chain;
+  const std::string norm_path = normalized_config_path(path);
+  for (const auto& loaded : load_chain) {
+    if (loaded == norm_path) {
+      std::string chain;
+      for (const auto& p : load_chain) chain += p + " -> ";
+      *err = "config include cycle detected: " + chain + norm_path;
+      return false;
+    }
+  }
+  if (static_cast<int>(load_chain.size()) >= kMaxConfigIncludeDepth) {
+    *err = "config include depth exceeds " + std::to_string(kMaxConfigIncludeDepth) +
+           " (check the 'config = <file>' chain)";
+    return false;
+  }
   std::ifstream f(path);
   if (!f) {
     *err = "cannot open config file '" + path + "'";
     return false;
   }
   loaded_file_ = path;
+  ConfigLoadScope load_scope(&load_chain, norm_path);
   std::string line;
   int lineno = 0;
   bool kernel_section = false;
@@ -755,10 +807,9 @@ bool Config::load_file(const std::string& path, std::string* err) {
                     (path + ":" + std::to_string(lineno)).c_str()))
       return false;
     if (def->cli && std::strcmp(def->cli, "config") == 0) {
-      // A config file naming another config file: apply it on top.
-      if (!val.empty() && val != path) {
-        if (!load_file(val, err)) return false;
-      }
+      // A config file naming another config file: apply it on top.  The recursive
+      // call is guarded by the include chain above (cycles / depth are rejected).
+      if (!val.empty() && !load_file(val, err)) return false;
     }
   }
   return true;

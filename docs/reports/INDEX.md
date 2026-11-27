@@ -22,6 +22,7 @@
 | [GENERALITY-AUDIT.md](GENERALITY-AUDIT.md) | 泛化性审计：硬编码模型假设与魔法常量 | 泛化性审计：硬编码模型假设与魔法常量清单。 |
 | [GENERALITY-REPORT.md](GENERALITY-REPORT.md) | 通用化改造交付报告（v1） | 通用化改造交付（v1）：配置面、自适应显存放置、优雅失败。 |
 | [ARCH-GENERALITY.md](ARCH-GENERALITY.md) | 按 metadata 驱动的架构泛化：per-layer 几何 + 通用层块（gemma4） | 不按 arch 名特判：per-layer 注意力几何/可选算子从 metadata 推导；真实 gemma4-12B 可加载+生成，数值 parity 未完成（默认关闭）。 |
+| [REVIEW-JSON-CONFIG.md](REVIEW-JSON-CONFIG.md) | 外部审查 v0.1.7 — JSON 解析器 + 配置系统 7 条核对 | 逐条实测：#1/#2/#3/#6 已确认并修复，#4 误报（无 OOB），#5 已修（e0f79d3），#7 部分确认（本机为句柄耗尽非崩溃）并加环检测/深度上限；新增两个单测并接入 clean-build gate。 |
 | [HOSTLAYER-35B-REPORT.md](HOSTLAYER-35B-REPORT.md) | hostlayer-35b 交付报告（2026-11-15） | 35B CPU 专家层调度与主机侧带宽分析。 |
 | [KV-LONGCTX-REPORT.md](KV-LONGCTX-REPORT.md) | KV cache 量化 + 长上下文 attention + 上下文上限自适应（KV-LONGCTX-REPORT） | KV 量化与长上下文报告：q8_0/q4_0 KV、ctx 自适应与长上下文实测。 |
 | [LONGCTX-REPORT.md](LONGCTX-REPORT.md) | 长上下文（4k / 2k 预填）报告：一个必然崩溃的 bug + 修复后的数据 | 长上下文（2048/4k/8k）填充与性能实测。 |

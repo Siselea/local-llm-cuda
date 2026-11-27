@@ -1,5 +1,7 @@
 #include "engine/json_parse.h"
 
+#include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -50,7 +52,15 @@ class Parser {
     return s_[pos_];
   }
 
-  char take() { return s_[pos_++]; }
+  // Every single-byte advance goes through here.  Bounds are checked so a malformed
+  // document can never index past s_[size()] (std::string::operator[](size()) is
+  // defined in C++11, but [] beyond size() is UB) even if a future call site forgets
+  // to check.  This is defence in depth for the truncated-escape class of inputs
+  // ("abc\, "\u12", ...): they are rejected with a normal parse error.
+  char take() {
+    if (pos_ >= s_.size()) fail("unexpected end");
+    return s_[pos_++];
+  }
 
   void expect(char c) {
     if (pos_ >= s_.size() || s_[pos_] != c) fail("unexpected character");
@@ -167,6 +177,7 @@ class Parser {
   }
 
   unsigned parse_hex4() {
+    if (pos_ + 4 > s_.size()) fail("truncated \\u escape");
     unsigned v = 0;
     for (int i = 0; i < 4; ++i) {
       char c = take();
@@ -186,6 +197,7 @@ class Parser {
       if (pos_ >= s_.size()) fail("unterminated string");
       unsigned char c = static_cast<unsigned char>(take());
       if (c == '"') break;
+      if (c < 0x20) fail("unescaped control character in string");
       if (c != '\\') {
         out += static_cast<char>(c);
         continue;
@@ -201,13 +213,19 @@ class Parser {
         case 'r': out += '\r'; break;
         case 't': out += '\t'; break;
         case 'u': {
+          // RFC 8259 requires valid Unicode: a high surrogate must be paired with a
+          // low surrogate, and unpaired low surrogates are invalid.  The old code
+          // accepted \ud800 (encoded as CESU-8 ED A0 80), \udc00 and mismatched
+          // pairs, i.e. produced invalid UTF-8 from valid-looking input.
           unsigned cp = parse_hex4();
+          if (cp >= 0xDC00 && cp <= 0xDFFF) fail("unpaired low surrogate in \\u escape");
           if (cp >= 0xD800 && cp <= 0xDBFF) {
-            if (pos_ + 1 < s_.size() && s_[pos_] == '\\' && s_[pos_ + 1] == 'u') {
-              pos_ += 2;
-              unsigned lo = parse_hex4();
-              cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-            }
+            if (!(pos_ + 1 < s_.size() && s_[pos_] == '\\' && s_[pos_ + 1] == 'u'))
+              fail("unpaired high surrogate in \\u escape");
+            pos_ += 2;
+            const unsigned lo = parse_hex4();
+            if (lo < 0xDC00 || lo > 0xDFFF) fail("invalid low surrogate in \\u escape");
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
           }
           append_utf8(out, cp);
           break;
@@ -218,20 +236,44 @@ class Parser {
     return out;
   }
 
+  // Strict RFC 8259 number: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+  // The previous implementation scanned [+-.eE0-9] and handed the run to strtod(),
+  // which accepted 01, -01, 1., +1, ".", "-", "1e", "1.e5", "e5" (and mapped some of
+  // them to 0) plus "1e999" -> +inf.  It now validates the grammar byte by byte and
+  // rejects non-finite results, so downstream (int) conversions cannot see NaN/Inf.
   Value parse_number() {
-    size_t start = pos_;
-    if (pos_ < s_.size() && (s_[pos_] == '-' || s_[pos_] == '+')) ++pos_;
-    while (pos_ < s_.size()) {
-      char c = s_[pos_];
-      if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-')
-        ++pos_;
-      else
-        break;
+    const size_t start = pos_;
+    auto is_digit = [&]() {
+      return pos_ < s_.size() && s_[pos_] >= '0' && s_[pos_] <= '9';
+    };
+    if (pos_ < s_.size() && s_[pos_] == '-') ++pos_;
+    if (!is_digit()) fail("bad number");
+    if (s_[pos_] == '0') {
+      ++pos_;
+      if (is_digit()) fail("leading zero in number");
+    } else {
+      while (is_digit()) ++pos_;
     }
-    if (pos_ == start) fail("bad number");
+    if (pos_ < s_.size() && s_[pos_] == '.') {
+      ++pos_;
+      if (!is_digit()) fail("missing fraction digits in number");
+      while (is_digit()) ++pos_;
+    }
+    if (pos_ < s_.size() && (s_[pos_] == 'e' || s_[pos_] == 'E')) {
+      ++pos_;
+      if (pos_ < s_.size() && (s_[pos_] == '+' || s_[pos_] == '-')) ++pos_;
+      if (!is_digit()) fail("missing exponent digits in number");
+      while (is_digit()) ++pos_;
+    }
+    const std::string token = s_.substr(start, pos_ - start);
+    errno = 0;
+    char* end = nullptr;
+    const double num = std::strtod(token.c_str(), &end);
+    if (end != token.c_str() + token.size() || !std::isfinite(num))
+      fail("number out of range");
     Value v;
     v.type = Value::Type::Num;
-    v.num = std::strtod(s_.substr(start, pos_ - start).c_str(), nullptr);
+    v.num = num;
     return v;
   }
 };

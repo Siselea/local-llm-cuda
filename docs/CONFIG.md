@@ -79,7 +79,11 @@ Q5_K 12288x4096  = q5k_dp4a_s
 加载规则：
 
 - `--config <file>` 在其余命令行选项之前生效（因此 **配置文件 > 环境变量** 成立）；
-- 配置文件里再写 `config = another.cfg` 会叠加加载（后加载者覆盖前者）；
+- 配置文件里再写 `config = another.cfg` 会叠加加载（后加载者覆盖前者）。嵌套加载有
+  **环检测与深度上限**（同一文件重复出现报 `config include cycle detected: a -> b -> a`，
+  链深超过 8 层报 `config include depth exceeds 8`），不会无限递归；
+- 数值选项：整数必须是完整十进制整数；浮点必须是**有限**数字（`nan`/`inf`/`1e999`
+  一律报错，避免后续 `(int)` 转换的未定义行为）；
 - 未知键、缺 `=`、非法值、未知小节都会报错，例如：
   `engine.cfg:7: option 'ctx' expects an integer, got 'abc'`。
 

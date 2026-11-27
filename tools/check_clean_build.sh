@@ -131,6 +131,18 @@ else
     fail "test_json_depth (JSON reader must cap nesting depth, not overflow the stack)"
     tail -5 json_depth_gate.log >&2
   fi
+  if [ -x build/test_json_strict.exe ] && ! ./build/test_json_strict.exe > json_strict_gate.log 2>&1; then
+    fail "test_json_strict (JSON reader must enforce RFC 8259 numbers/strings/surrogates)"
+    tail -8 json_strict_gate.log >&2
+  else
+    echo "[gate]   json reader strictness GREEN"
+  fi
+  if [ -x build/test_config_strict.exe ] && ! ./build/test_config_strict.exe > config_strict_gate.log 2>&1; then
+    fail "test_config_strict (config floats must be finite; recursive includes must reject cycles)"
+    tail -8 config_strict_gate.log >&2
+  else
+    echo "[gate]   config validation GREEN"
+  fi
 fi
 
 echo

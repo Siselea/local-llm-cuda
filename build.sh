@@ -39,6 +39,8 @@ build tests/test_decode.cpp test_decode.exe
 build tests/test_gen.cpp test_gen.exe
 build tests/test_json_utf8.cpp test_json_utf8.exe
 build tests/test_json_depth.cpp test_json_depth.exe
+build tests/test_json_strict.cpp test_json_strict.exe
+build tests/test_config_strict.cpp test_config_strict.exe
 build tests/test_mla_kv.cpp test_mla_kv.exe
 build tests/test_cpu_quant.cpp test_cpu_quant.exe
 build tests/test_cpu_moe.cpp test_cpu_moe.exe
