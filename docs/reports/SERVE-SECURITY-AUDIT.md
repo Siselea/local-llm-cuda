@@ -92,6 +92,12 @@
 - **单测**：`test_text_util` GREEN（overlong/surrogate/>U+10FFFF/truncated/lone continuation + lossy U+FFFD）；`test_tokenizer_budget` GREEN（20k CJK < 500 ms 实测 23 ms；1 MB 拒绝 0.38 ms；消息清晰）。
 - **数值一致性**：用 **HEAD 源码重编的 pre-fix 二进制**生成 golden，修复后 **42/42 用例逐 id 完全相同**（0.5B qwen2 + 9B qwen35 tokenizer；emoji ZWJ、CJK 扩展 B、RTL、组合字符、3000 无空格、2000 CJK、ChatML、docs 节选等）。注意：旧共享 `build/tt_ref.exe` 早于 HEAD 的 tokenizer 改动，用它做 golden 会误报 14/42——最终以 HEAD 重编的 golden 为准。
 - **HTTP 用例**：`tools/serve_edge_cases.py`（0.5B）**31/31 PASS**：A1–A12 坏请求/CL/头/chunked、B stop/数值/消息/JSON 边界、C completions 一致性、D 断连/健康恢复、E 编辑历史、F 并发、G slowloris 4.7 s、H keep-alive、I tokenize 往返、J 采样复现、K 非流式 JSON UTF-8、**L1–L5 输入预算（1MB/50k tokenize、invalid UTF-8、1MB chat、10KB stop）**。
+- **发布门禁（干净 worktree @ `70c8f0c`，完整 6/6）**：`build.sh` OK、`verify.sh` ALL GREEN、
+  `smoke_models.sh` OK、**`gen_regression` GREEN（F16C 默认路径端到端）**、`verify_generality` GREEN、
+  `verify_serve` GREEN（22/22），最终打印 **`CLEAN BUILD GATE GREEN: 70c8f0c is ready to tag`**。
+  关键 loader 测试：`test_fp16` **131090 checks PASS**、`test_loader_bounds` **28 checks PASS**、
+  `test_gguf_moe_offload` **F16/F32 双模型 PASS**（GPU / all-CPU / mixed；rel_l2 2.71e-7 / 2.68e-7）。
+  注：首次 RED 仅为 `webui/index.html`（未入库抓取资产）缺失导致 `/` 404，种入资产后 22/22（代码零改动）。
 - **修复前后对照**：见 §3 表。
 
 ---
@@ -114,9 +120,9 @@
 
 ---
 
-## 6. 仍需运行时验证（本报告未覆盖，需 GPU/独占窗口）
+## 6. 仍需运行时验证（已由 Lead 决策推迟到 v0.1.9；不阻塞 v0.1.8）
 
-1. **200 次"流式发起后立即 RST"压测**：连续 200 次观察 engine RSS、VRAM、`/health` slot 计数是否稳定（本轮只做了 1–3 次单发断连 + 断连后正确性）。计划命令：
+1. **200 次"流式发起后立即 RST"压测**：连续 200 次观察 engine RSS、VRAM、`/health` slot 计数是否稳定（本轮只做了 1–3 次单发断连 + 断连后正确性）。脚本已就绪：`build/rst_shutdown_test.py`（200 cycles 采样 RSS/VRAM + shutdown 并发），v0.1.9 窗口执行。计划命令：
    `python build/keepalive_rst_stress.py --url http://127.0.0.1:7020 --cycles 200 --max-tokens 16`（启动 0.5B serve；每 25 次采样 RSS/VRAM）。
 2. **慢读客户端 + 大输出**：客户端只读 header 不读 body，服务端 `send()` 是否会阻塞（需要 >socket 缓冲的输出；本机单线程下会体现在服务不可用窗口）。SO_SNDTIMEO 只在 listening socket 上设置，accepted socket 是否继承需实测。
 3. **`/shutdown` 并发变体**：生成中 + 两个 `/shutdown` 同时到达（第二个连接在 backlog 中被处理还是被丢弃？）；shutdown 后进程退出码/端口/VRAM 清理。
@@ -205,4 +211,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7020/tokenize \
 
 - 修复 commit：**`68270dc`**（push 到 main），新增测试 `tests/test_text_util.cpp`、`tests/test_tokenizer_budget.cpp`，HTTP 用例扩展在 `tools/serve_edge_cases.py`（L1–L5）。
 - 已完成的验证：主树/worktree 构建、两个单测 GREEN、42/42 tokenizer golden、HTTP 用例 31/31。
-- **待 GPU 空闲窗口**：完整五套（verify/smoke/gen_regression/generality/verify_serve）+ `tools/check_clean_build.sh` 干净 worktree gate + §6 的 RST 200 次泄漏与 shutdown 并发运行时验证。之后本报告 §6 会更新为实测结果。
+- **发布门禁已完成（2026-11-27，`70c8f0c`）**：干净 worktree 完整 6/6 → `CLEAN BUILD GATE GREEN`（详见 §4）。
+  唯一环境项：`webui/index.html` 为未入库抓取资产，需在 gate worktree 中种入，否则 `/` 会 404（已知假失败）。
+- **推迟到 v0.1.9**：§6 的 RST 200 次泄漏采样、shutdown 并发、慢读客户端大输出实测（Lead 决策，不阻塞 v0.1.8；
+  脚本 `build/rst_shutdown_test.py` 已就绪）。
