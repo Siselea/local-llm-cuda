@@ -156,14 +156,28 @@
 | ② 空闲时两个并发 `/shutdown` | 第一个 **200**、第二个 **RST**，延迟 **0.01 s**；端口关闭、rc=0、VRAM 312 MB |
 | ③ shutdown 后清理 | `engine.exe` 退出，端口不可连接，`nvidia-smi` 回到 312 MB 基础占用，无残留进程 |
 
-判定：**无泄漏/无状态污染**。唯一可改进点（低危、非阻塞）：第二个并发 `/shutdown` 得到 TCP RST
-而不是 HTTP 200/503 之类的明确响应；建议 v0.1.10 在 accept 循环里对正在 shutdown 的连接返回
-`503 shutting down` 再关闭（纯 UX/协议礼貌，不影响正确性）。
+判定：**无泄漏/无状态污染**。第二并发连接原本得到 TCP RST（OS 在 listen socket 关闭时重置
+backlog 中的连接）。
 
-### 6.3 本轮仍未覆盖（后续低优先级）
+**改进已实现并验证（v0.1.9）**：`http_server.cpp: Server::refuse_pending_connections()` ——
+`/shutdown` handler 让 accept 循环退出后，用 20 ms×若干次非阻塞 select 把已在 backlog 里的连接
+accept 出来，直接回 **`503 {"error":"shutting down"}`** 再关闭（best-effort：listen socket 关闭后
+才到达的连接仍可能是 RST）。实测双并发 `/shutdown` 响应：
+`HTTP/1.1 200 OK` + **`HTTP/1.1 503 Service Unavailable`**，进程 rc=0、端口关闭。
+`tools/verify_serve.sh` 22/22 GREEN（shutdown 用例不受影响）。
 
-- **慢读客户端 + 大输出**：客户端只读 header 不读 body 时服务端 `send()` 的阻塞窗口（需构造 >socket
-  缓冲的响应；本轮未测，属单线程架构已知面）。
+### 6.3 慢读/大输出：已实测（结论：默认可接受，LAN 需收紧）与剩余低优先级项
+
+- **慢读客户端 + 大输出（已实测，结论：默认 loopback 可接受；LAN 需要收紧）**：
+  客户端发 `/tokenize`（50k CJK，响应 ~350 KB）后只读 header、不再读 body，另一个连接请求
+  `/health`。结果：**服务被阻塞整整 30.0 s**，客户端关闭后 0.01 s 恢复 200。30 s 恰好等于
+  listen socket 上设置的 `SO_SNDTIMEO`（`http_server.cpp: listen_socket()`，Windows 的 accepted
+  socket 继承该选项）⇒ **阻塞有界（30 s）、不是永久 hang**，写超时后 handler 的 send 失败、生成
+  会中止（`on_delta=false` 路径已有）。
+  判定：默认 `127.0.0.1` 单用户本地使用**可接受**（最坏等 30 s、对方是自己机器上的客户端）；
+  **`--host 0.0.0.0` 局域网场景需要收紧**：建议 v0.1.10 在 accepted socket 上显式设
+  `SO_SNDTIMEO`（如 10 s）或改非阻塞写 + 每请求总 deadline，避免未授权 LAN 客户端用"不读 body"
+  反复占用服务。脚本：`tools/serve_send_timeout_probe.py`、`tools/serve_shutdown_send_probe.py`。
 - `--host 0.0.0.0` 的局域网可达性：默认 loopback 安全；已改为 `0.0.0.0` 时无鉴权（见 §8/README 警告）。
 - 静态文件 HEAD/协议细节（语义小问题，低危）。
 

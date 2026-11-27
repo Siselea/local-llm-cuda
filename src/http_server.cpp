@@ -552,6 +552,46 @@ bool Server::start(std::string* err) {
   return listen_socket(err);
 }
 
+namespace {
+// 503 body answered to connections that were already queued when /shutdown stopped
+// the accept loop (best effort; a connection that arrives after the listen socket is
+// closed still gets a normal TCP reset).
+void refuse_one(SOCKET c) {
+  static const char kBody[] =
+      "{\"error\":{\"message\":\"shutting down\",\"type\":"
+      "\"server_shutting_down\",\"code\":503}}";
+  std::string resp = "HTTP/1.1 503 Service Unavailable\r\n";
+  resp += "Server: engine/1.0\r\n";
+  resp += "Content-Type: application/json\r\n";
+  resp += "Connection: close\r\n";
+  resp += "Content-Length: " + std::to_string(sizeof(kBody) - 1) + "\r\n\r\n";
+  resp += kBody;
+  Winsock& ws = winsock();
+  ws.send(c, resp.data(), static_cast<int>(resp.size()), 0);
+}
+}  // namespace
+
+void Server::refuse_pending_connections() {
+  if (listen_fd_ < 0) return;
+  Winsock& ws = winsock();
+  for (int served = 0; served < 16; ++served) {
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(static_cast<SOCKET>(listen_fd_), &readfds);
+    timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 20 * 1000;  // 20 ms per poll: shutdown latency stays tiny
+    if (ws.select(listen_fd_ + 1, &readfds, nullptr, nullptr, &tv) <= 0) break;
+    sockaddr_in peer{};
+    int peer_len = sizeof(peer);
+    const SOCKET c = ws.accept(static_cast<SOCKET>(listen_fd_),
+                               reinterpret_cast<sockaddr*>(&peer), &peer_len);
+    if (c == INVALID_SOCKET) break;
+    refuse_one(c);
+    ws.closesocket(c);
+  }
+}
+
 bool Server::run(std::string* err) {
   if (!start(err)) return false;
   Winsock& ws = winsock();
@@ -587,6 +627,9 @@ bool Server::run(std::string* err) {
     serve_connection(static_cast<intptr_t>(c), client);
   }
   if (listen_fd_ >= 0) {
+    // The handler that called stop() (POST /shutdown) has already answered 200;
+    // reply 503 to any second client already waiting in the accept backlog.
+    if (stopping_) refuse_pending_connections();
     ws.closesocket(static_cast<SOCKET>(listen_fd_));
     listen_fd_ = -1;
   }

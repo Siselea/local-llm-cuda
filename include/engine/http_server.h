@@ -98,6 +98,9 @@ class Server {
  private:
   bool listen_socket(std::string* err);
   void serve_connection(intptr_t fd, const std::string& client);
+  // Best-effort: answer connections already queued in the listen backlog with
+  // "503 shutting down" instead of letting the OS reset them when the socket closes.
+  void refuse_pending_connections();
 
   std::string host_;
   int port_ = 0;
