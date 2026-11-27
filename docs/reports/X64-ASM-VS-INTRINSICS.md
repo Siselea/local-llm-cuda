@@ -223,20 +223,20 @@ noscale（块头完全消失的假想实现）只到 26.8–27.1 GB/s（L3）/ 2
 ```bash
 cd engine/build/x64asm
 # 构建探针（包含生产的 cpu_matvec.cpp 与所有变体）
-D:/p0/py312/python.exe -m ziglang c++ -std=c++17 -O2 -I../../include \
+python -m ziglang c++ -std=c++17 -O2 -I../../include \
     probe.cpp ../../src/config.cpp -o probe.exe
 # 生成手写汇编内核（两个变体：完整 / 预解码 scale 的隔离版）
-D:/p0/py312/python.exe asmgen.py && D:/p0/py312/python.exe asmgen_pd.py
+python asmgen.py && python asmgen_pd.py
 # 数值校验：变体 vs 出货内核（期望 f16c/sd/reg/gu/asm/i8/i8f 全为 0.0e+00）
 ./probe.exe check
 # 测量（ENGINE_XA_AFF=0：不绑核；iters=20 inner=8；run.py 跑 5 个独立进程取 min/median）
-D:/p0/py312/python.exe run.py a 1  5 12 prod f16c sd gu reg 2row asm noscale read
-D:/p0/py312/python.exe run.py a 24 5 12 prod f16c sd asm noscale read
-D:/p0/py312/python.exe run.py b 24 5 12 prod i8 i8f read
-D:/p0/py312/python.exe run.py layer 24 5 12 prod f16c sd asm allfp32
+python run.py a 1  5 12 prod f16c sd gu reg 2row asm noscale read
+python run.py a 24 5 12 prod f16c sd asm noscale read
+python run.py b 24 5 12 prod i8 i8f read
+python run.py layer 24 5 12 prod f16c sd asm allfp32
 # 指令预算（编译产物统计）
-D:/p0/py312/python.exe -m ziglang c++ -std=c++17 -O2 -I../../include -S all_tu.cpp -o all_tu.s
-D:/p0/py312/python.exe count_insns.py all_tu.s
+python -m ziglang c++ -std=c++17 -O2 -I../../include -S all_tu.cpp -o all_tu.s
+python count_insns.py all_tu.s
 ```
 
 本报告记录的是**实验阶段**：`src/`、`include/`、`tools/`、`build.sh` 与实验前逐字节一致
@@ -297,3 +297,34 @@ decode（GEMV 占 ~44%）预计 **−0.4～−1.4 ms/token**。
 （信号 ~12%，噪声更大）。因此本节的速度结论采用 **9.3 的同进程 A/B**（鲁棒），
 端到端二进制 A/B 在机器安静后补测（会附在 commit 之后的消息/后续 commit 里，不挑选数据）。
 端到端唯一可用的两次输出对比：pre/new 生成 token id 序列完全一致（与 9.2 的逐位结论相符）。
+
+### 9.5 预期区间表（已确定的 vs 待测的）
+
+| 项 | 状态 | 数值 |
+|---|---|---|
+| phase A（gate+up Q4_K fp32） | **已确定**（同进程 A/B，5 进程 × 20 轮） | **+11.9%**（20.29 → 22.70 GB/s） |
+| phase B（down Q6_K int8） | **已确定** | **+10.3%**（21.06 → 23.22 GB/s） |
+| 整层 A+B+merge | **已确定** | **+5.4%**（18.99 → 20.02 GB/s）；phase 加权上限 −9.5% |
+| 35B 宿主 GEMV（基线 14.81 ms/token） | 由上面推出 | **13.4–14.0 ms/token（−0.8～−1.4 ms）** |
+| 35B decode（基线 34.3 ms） | 待端到端 A/B 填 | **预期 33.4–34.0 ms（−0.3～−0.9 ms，+2–3%）** |
+| 9B decode | 待端到端 A/B 填 | **预期持平**（9B 为 dense，CPU 内核路径占比可忽略；只验不回退） |
+| 端到端逐位（35B/9B） | 部分（2 次观察一致） | 待 3 对 35B + 1 对 toggle + 2 对 9B 确认 token id 序列 |
+| 五套验证 | verify **ALL GREEN**；其余 4 套待 GPU 窗口 | smoke / gen_regression / generality / serve |
+
+### 9.6 合并判据（如果 A/B 只测到 −0.3 ms 怎么办）
+
+**我的建议：合并。** 判据按"安全 → 正确 → 收益"排序，收益只决定打包优先级，不决定安全：
+
+1. **逐位相同**（硬性）：65536 个 fp16 pattern 全覆盖 + 4096/16384/16384 行内核 0 bit + 端到端
+   token 序列一致。这一条已满足，意味着数值行为与出货内核**无法区分**，没有精度回归风险。
+2. **无回退**（硬性）：任何有效配对里 new 不得慢于 pre（decode/GEMV 都在噪声内或更好）；
+   9B 必须持平。只要出现一致回退（而非单轮噪声）就**不合并**，先查原因。
+3. **构建/验证全绿**（硬性）：build.sh exit 0、verify.sh ALL GREEN、其余四套通过。
+4. **收益**（软性，决定是否值得进下一版）：若端到端只有 −0.3 ms/token，仍值一个 commit ——
+   代码量 254 行、纯局部改动、可运行时回退、逐位相同，维护成本低；但它不值得为它单独发版，
+   可以搭 v0.1.9 的其它内核项一起出。若收益为 0 或负（与同进程 A/B 矛盾），则先不合并，
+   按"测量与实验不一致"排查（放置/线程数/`ENGINE_NO_F16C` 开关是否真的切换了路径）。
+
+反过来说：**如果同进程 A/B 的 +11.9%/+10.3% 在端到端完全不体现**，那说明 35B 的 CPU 层时间
+并不由这两个内核的指令数决定（例如被 sync/launch 掩盖），这时应该把 F16C 留着（零风险）
+但把优化重心移到 §7 第 3/4 项（launch/sync）——用 `ENGINE_PROF_ACC` 的逐段实测说话。
