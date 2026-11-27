@@ -74,7 +74,18 @@ def main() -> int:
               f"avg/layer={avg / GIB:.3f} GiB  min={sizes[0] / GIB:.3f}  "
               f"max={sizes[-1] / GIB:.3f}  spread={sizes[-1] / max(sizes[0], 1):.2f}x")
         for ctx in (8192, 32768):
-            kv_old = ir.kv_bytes_per_token(2) * ctx            # legacy bytes-per-value
+            # retired legacy formula (2 bytes/value; MLA: compressed latent) - kept
+            # inline only so this impact table can still show the old numbers.
+            a = ir.attn
+            n_kv_layers = ir.n_layer
+            if a.full_attention_interval > 1:
+                n_kv_layers = -(-ir.n_layer // a.full_attention_interval)
+            if a.variant == "mla" and a.kv_lora_rank > 0:
+                kv_old = n_kv_layers * (a.kv_lora_rank + a.rope_dim) * 2 * ctx
+            elif a.n_head_kv <= 0 or a.key_length <= 0:
+                kv_old = 0
+            else:
+                kv_old = n_kv_layers * a.n_head_kv * (a.key_length + a.value_length) * 2 * ctx
             kv_new = pl.kv_bytes(ir, ctx, 0)                   # real f32 layout
             for vram in (4, 8, 12, 24):
                 usable = vram * GIB - DEFAULT_VRAM_RESERVE

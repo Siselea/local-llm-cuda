@@ -81,7 +81,7 @@ patch 前 plan 层 parity 已成立（6 模型 × 3 ctx × 4 vram = 72 组 `tool
 
 ## 7. 残余 / 后续
 
-- `Model::kv_bytes_per_token(bpe)` 仍被 `engine info --json` 的 **`kv_per_token_bpe2`**（legacy 显示字段，命名已自带 `bpe2`）与 Python 测试引用；launcher/GUI 取的是 `engine info` 的 `kv_per_token{f32,q8_0,q4_0}`（= placement 真实公式）→ **GUI 估算不受本 bug 影响**。建议后续把该 legacy helper 从 `engine info` 移除或改名，彻底消除第二套 KV 语义。
+- **旧 KV 语义已在本版清理**（消除"两套 KV 记账"这个下一个 bug 的温床）：删除 C++ `Model::kv_bytes_per_token(bpe)`（`ir.h`/`ir.cpp`）与 `engine info --json` 的 `kv_per_token_bpe2` 字段，pyref 的同名方法与 JSON 字段一并删除；两个 Python 单测改为断言真实 f32 记账（`placement.kv_bytes_per_token(ir, 0)`），`tools/planner_impact.py` 为保留历史对比把旧公式内联（已注释）。无外部消费者：`tools/diff_ir.py` 的 G0 不比较该字段（复跑 G0 PASS），launcher/GUI 用的是 `engine info` 的 `kv_per_token{f32,q8_0,q4_0}`（= placement 真实公式）→ **GUI 估算一直正确**。
 - `plan.layers_on_gpu` 与 `placement.gpu_moe_layers` 的 reserve 语义不同（plan 用 `DEFAULT_VRAM_RESERVE`=1024 MiB，placement 用 `vram_margin + workspace`=1968 MiB 默认），因此同一模型可能给出不同层数——**故意保留**（前者是预算估算，后者是启动决策），已在报告中注明。
 - 运行时仍是最终权威：`expert_layer_fits_vram` 逐层实测 + margin/ledger-gap 检查（`8199927`/`388106a`）；planner 现在是"乐观上限"估计，误差被实测纠正。
 - `tools/planner_impact.py` 是本次的量化脚本（保留，供复查数字）。

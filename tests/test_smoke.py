@@ -179,8 +179,9 @@ class TestIR(unittest.TestCase):
         self.assertGreater(per_layer[0], 0)
 
     def test_kv_formula(self):
-        # 2 layers * 2 kv heads * (8+8) dims * 2 bytes
-        self.assertEqual(self.ir.kv_bytes_per_token(2), 2 * 2 * 16 * 2)
+        # 2 layers * 2 kv heads * (8+8) dims * 4 bytes (f32, what the runner allocates)
+        from pyref.placement import kv_bytes_per_token
+        self.assertEqual(kv_bytes_per_token(self.ir, 0), 2 * 2 * 16 * 4)
 
 
 class TestPlanner(unittest.TestCase):

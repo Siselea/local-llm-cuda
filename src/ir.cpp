@@ -119,18 +119,6 @@ std::map<int, uint64_t> Model::expert_bytes_per_layer() const {
   return out;
 }
 
-uint64_t Model::kv_bytes_per_token(int bpe) const {
-  int n_kv_layers = n_layer;
-  if (attn.full_attention_interval > 1)
-    n_kv_layers = static_cast<int>(std::ceil(static_cast<double>(n_layer) /
-                                             attn.full_attention_interval));
-  if (attn.variant == "mla" && attn.kv_lora_rank > 0)
-    return static_cast<uint64_t>(n_kv_layers) * (attn.kv_lora_rank + attn.rope_dim) * bpe;
-  if (attn.n_head_kv <= 0 || attn.key_length <= 0) return 0;
-  return static_cast<uint64_t>(n_kv_layers) * attn.n_head_kv *
-         (attn.key_length + attn.value_length) * bpe;
-}
-
 Model build_from_gguf(const gguf::Model& g) {
   Model m;
   m.container = "gguf";

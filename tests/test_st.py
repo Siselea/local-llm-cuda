@@ -140,8 +140,9 @@ class TestHFDense(unittest.TestCase):
         self.assertEqual(counts[Role.ATTN], 8)
 
     def test_kv(self):
-        # 2 layers * 2 kv heads * (16+16) * 2 bytes
-        self.assertEqual(self.ir.kv_bytes_per_token(2), 2 * 2 * 32 * 2)
+        # 2 layers * 2 kv heads * (16+16) * 4 bytes (f32, what the runner allocates)
+        from pyref.placement import kv_bytes_per_token
+        self.assertEqual(kv_bytes_per_token(self.ir, 0), 2 * 2 * 32 * 4)
 
 
 class TestHFMoE(unittest.TestCase):

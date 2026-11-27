@@ -269,7 +269,6 @@ void write_ir_json(json::Writer& w, const ir::Model& m, bool with_tensors) {
   w.key("total"); w.uinteger(m.total_bytes());
   w.key("fixed"); w.uinteger(m.fixed_bytes());
   w.key("experts"); w.uinteger(m.expert_bytes());
-  w.key("kv_per_token_bpe2"); w.uinteger(m.kv_bytes_per_token(2));
   w.end_obj();
 
   w.key("mtp_layers"); w.integer(m.mtp_layers);

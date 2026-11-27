@@ -9,7 +9,6 @@ the C++ loader or the C++ loader is wrong.
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -167,21 +166,6 @@ class ModelIR:
                 out[t.layer] = out.get(t.layer, 0) + t.nbytes
         return out
 
-    def kv_bytes_per_token(self, bpe: int = 2) -> int:
-        """Bytes of KV per token. Only full-attention layers hold KV in hybrid models."""
-        a = self.attn
-        n_kv_layers = self.n_layer
-        if a.full_attention_interval > 1:
-            n_kv_layers = math.ceil(self.n_layer / a.full_attention_interval)
-        if a.variant == "mla" and a.kv_lora_rank > 0:
-            # MLA stores one compressed latent (+ decoupled rope key) per token/layer,
-            # not n_head_kv * head_dim.
-            return n_kv_layers * (a.kv_lora_rank + a.rope_dim) * bpe
-        if a.n_head_kv <= 0 or a.key_length <= 0:
-            return 0
-        # K and V, each n_head_kv * head_dim
-        return n_kv_layers * a.n_head_kv * (a.key_length + a.value_length) * bpe
-
     def to_json(self, include_tensors: bool = True) -> dict:
         d = {
             "arch": self.arch,
@@ -203,7 +187,6 @@ class ModelIR:
                 "total": self.total_bytes(),
                 "fixed": self.fixed_bytes(),
                 "experts": self.expert_bytes(),
-                "kv_per_token_bpe2": self.kv_bytes_per_token(),
             },
             "warnings": self.warnings,
             "layers": [asdict(l) for l in self.layers],

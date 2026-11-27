@@ -140,7 +140,6 @@ class Model {
   uint64_t fixed_bytes() const;
   uint64_t expert_bytes() const;
   std::map<int, uint64_t> expert_bytes_per_layer() const;
-  uint64_t kv_bytes_per_token(int bpe = 2) const;
 };
 
 Model build_from_gguf(const gguf::Model& g);
