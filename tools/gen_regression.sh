@@ -44,9 +44,18 @@ check() {
   if [ ! -f "$model" ]; then printf '%-28s SKIP (model missing)\n' "$tag"; return 0; fi
   if [ ! -x "$GEN" ]; then printf '%-28s FAIL (missing %s; run bash build.sh)\n' "$tag" "$GEN"; fail=$((fail + 1)); return 1; fi
   # shellcheck disable=SC2086
-  local out gen
-  out=$(env $envs "$GEN" --model "$model" --ids "$ids" --n "$n" --ctx 1024 2>&1)
-  gen=$(printf '%s\n' "$out" | sed -n 's/^gen: //p' | head -1)
+  local out gen attempt
+  # Load failures here are transient: a big model can fail with std::bad_alloc
+  # when another process briefly holds host RAM, or be refused while a previous
+  # CUDA context is still being reclaimed by WDDM.  An empty `gen:` therefore
+  # gets one delayed retry; a genuine numerical regression is non-empty and
+  # still fails immediately.
+  for attempt in 1 2; do
+    out=$(env $envs "$GEN" --model "$model" --ids "$ids" --n "$n" --ctx 1024 2>&1)
+    gen=$(printf '%s\n' "$out" | sed -n 's/^gen: //p' | head -1)
+    [ -n "$gen" ] && break
+    [ "$attempt" = 1 ] && { printf '%-28s (empty output; retrying once: transient RAM/VRAM pressure)\n' "$tag"; sleep 3; }
+  done
   if [ "$gen" = "$expect" ]; then
     printf '%-28s PASS (%d greedy tokens == llama.cpp)\n' "$tag" "$n"
     pass=$((pass + 1))
