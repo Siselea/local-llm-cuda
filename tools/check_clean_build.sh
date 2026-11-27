@@ -127,6 +127,21 @@ else
   else
     echo "[gate]   json writer UTF-8 sanitisation GREEN"
   fi
+  if [ -x build/test_text_util.exe ] && ! ./build/test_text_util.exe > text_util_gate.log 2>&1; then
+    fail "test_text_util (strict UTF-8: overlong/surrogate/>U+10FFFF)"
+    tail -8 text_util_gate.log >&2
+  else
+    echo "[gate]   strict UTF-8 GREEN"
+  fi
+  if [ -x build/test_tokenizer_budget.exe ] && [ -n "$MODELS" ] &&
+     [ -f "$MODELS/Qwen3.5-9B-Q5_K_M.gguf" ]; then
+    if ! ./build/test_tokenizer_budget.exe "$MODELS/Qwen3.5-9B-Q5_K_M.gguf" > tok_budget_gate.log 2>&1; then
+      fail "test_tokenizer_budget (BPE O(n log n) + input budget)"
+      tail -8 tok_budget_gate.log >&2
+    else
+      echo "[gate]   tokenizer budget/performance GREEN"
+    fi
+  fi
   if [ -x build/test_json_depth.exe ] && ! ./build/test_json_depth.exe > json_depth_gate.log 2>&1; then
     fail "test_json_depth (JSON reader must cap nesting depth, not overflow the stack)"
     tail -5 json_depth_gate.log >&2
