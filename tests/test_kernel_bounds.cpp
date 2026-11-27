@@ -21,6 +21,13 @@
 #include "engine/kernels.h"
 #include "engine/runner.h"
 
+// Geometry helpers defined in src/runner.cpp (extern linkage on purpose).
+namespace runner {
+int topk_partial_blocks(int vocab);
+int moe_slots_per_launch(int topk);
+bool dp4a_nin_ok(int n_in);
+}  // namespace runner
+
 namespace {
 
 int g_fail = 0;
@@ -236,6 +243,106 @@ void test_expert_overflow_fixture() {
         "if the IR limit is relaxed, n_expert=300 takes the host router");
 }
 
+// D4: the device top-k partial kernel keeps a 512-word (16384-index) selection bitmap
+// per block; the host block count must keep every slice inside it.
+void test_topk_bitmap_bound() {
+  std::printf("== #D4 top-k partial bitmap bound ==\n");
+  const int vocabs[] = {128, 1024, 248320, 1024 * 1024, 1 << 26};
+  for (int v : vocabs) {
+    const int nblk = runner::topk_partial_blocks(v);
+    const int chunk = nblk > 0 ? (v + nblk - 1) / nblk : -1;
+    check(nblk > 0 && chunk > 0 && chunk <= 16384,
+          "vocab=" + std::to_string(v) + " chunks fit the 16384-index bitmap",
+          "nblk=" + std::to_string(nblk) + " chunk=" + std::to_string(chunk));
+  }
+  check(runner::topk_partial_blocks(1 << 27) < 0,
+        "vocab=2^27 is refused instead of overflowing the bitmap");
+}
+
+// D8: dp4a kernels require a 32-multiple activation length.
+void test_dp4a_guard() {
+  std::printf("== #D8 dp4a n_in guard ==\n");
+  check(runner::dp4a_nin_ok(4096), "n_in=4096 accepted");
+  check(runner::dp4a_nin_ok(32), "n_in=32 accepted");
+  check(!runner::dp4a_nin_ok(33), "n_in=33 refused");
+  check(!runner::dp4a_nin_ok(0), "n_in=0 refused");
+}
+
+// D13: MoE expert kernels use grid.y as the (token,expert) slot axis (limit 65535).
+void test_moe_slot_chunking() {
+  std::printf("== #D13 MoE slot chunking ==\n");
+  const int topks[] = {1, 2, 4, 6, 8, 16};
+  for (int topk : topks) {
+    const int slots = runner::moe_slots_per_launch(topk);
+    check(slots >= 1 && static_cast<long long>(slots) * topk <= 65535,
+          "topk=" + std::to_string(topk) + " chunk fits grid.y",
+          "slots=" + std::to_string(slots));
+  }
+  // 35B topk=8, a 16384-token prefill batch: 131072 slots need 17 launches, not one.
+  const int slots = runner::moe_slots_per_launch(8);
+  const int launches = (16384 * 8 + slots - 1) / slots;
+  check(launches > 1 && launches <= 32, "16384-token prefill is split into bounded launches",
+        "launches=" + std::to_string(launches));
+}
+
+// D9: an all -inf score row (numerical overflow) must produce zeros, not NaN.
+bool test_softmax_all_inf() {
+  std::printf("== #D9 all -inf softmax row ==\n");
+  cuda::Module mod(cuda::compile_ptx(std::string(kernels::kMlaAttnCached), "softmax_inf_test"));
+  void* fn = mod.kernel("mla_attn_cached");
+  const int D = 4, max_seq = 2;
+  std::vector<float> hq(static_cast<size_t>(D), 3e38f);
+  std::vector<float> hk(static_cast<size_t>(max_seq) * D, -3e38f);
+  std::vector<float> hv(static_cast<size_t>(max_seq) * D, 0.f);
+  cuda::Buffer q(static_cast<size_t>(D) * 4), kc(static_cast<size_t>(max_seq) * D * 4),
+      vc(static_cast<size_t>(max_seq) * D * 4), out(static_cast<size_t>(D) * 4), posbuf(4);
+  q.upload(hq.data(), hq.size() * 4);
+  kc.upload(hk.data(), hk.size() * 4);
+  vc.upload(hv.data(), hv.size() * 4);
+  int pos = 0;
+  posbuf.upload(&pos, 4);
+  int n_head = 1, qk = D, vdim = D, ms = max_seq;
+  void* args[] = {&q, &kc, &vc, &out, &posbuf, &n_head, &qk, &vdim, &ms};
+  bool ok = true;
+  try {
+    cuda::launch(fn, 1, 1, 1, 32, 1, 1, static_cast<size_t>(max_seq) * 4, args);
+    cuda::sync();
+  } catch (const std::exception& e) {
+    ok = false;
+    std::printf("    launch failed: %s\n", e.what());
+  }
+  std::vector<float> got(static_cast<size_t>(D), -1.f);
+  out.download(got.data(), got.size() * 4);
+  for (float v : got) ok = ok && std::isfinite(v) && v == 0.f;
+  check(ok, "all -inf row yields finite zeros (no NaN/inf)");
+  return ok;
+}
+
+// D11: uploading a buffer while a CUDA graph is being recorded is a capture-unsafe
+// operation; with ENGINE_CAPTURE_STRICT it must throw (default keeps the old skip+warn).
+int child_capture_probe(bool expect_throw) {
+  cuda::init();
+  void* stream = cuda::create_stream();
+  cuda::set_stream(stream);
+  cuda::Buffer b(64);
+  float host[4] = {1, 2, 3, 4};
+  cuda::Graph g;
+  g.capture_begin();
+  bool threw = false;
+  try {
+    b.upload(host, sizeof(host));
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  g.capture_abort();
+  if (threw != expect_throw) {
+    std::printf("child: upload threw=%d expected=%d\n", static_cast<int>(threw),
+                static_cast<int>(expect_throw));
+    return 1;
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -244,6 +351,8 @@ int main(int argc, char** argv) {
     const int value = std::atoi(argv[2]);
     if (mode == "--child-kvsplit-reject") return child_kvsplit_reject(value);
     if (mode == "--child-kvsplit-eq") return child_kvsplit_eq(value);
+    if (mode == "--child-capture-strict") return child_capture_probe(true);
+    if (mode == "--child-capture-lenient") return child_capture_probe(false);
   }
 
   std::printf("== kv_split config bounds (#1) ==\n");
@@ -274,6 +383,14 @@ int main(int argc, char** argv) {
   void* stream = cuda::create_stream();
   cuda::set_stream(stream);
   test_device_route_guard();
+  test_topk_bitmap_bound();
+  test_dp4a_guard();
+  test_moe_slot_chunking();
+  if (!test_softmax_all_inf()) ++g_fail;
+  check(spawn_self("ENGINE_CAPTURE_STRICT", "1", "--child-capture-strict") == 0,
+        "capture-strict: upload during graph capture throws");
+  check(spawn_self(nullptr, nullptr, "--child-capture-lenient") == 0,
+        "default: upload during graph capture is skipped (unchanged contract)");
   if (!test_attn_combine()) ++g_fail;
   if (!test_attn_cfg_smem()) ++g_fail;
   test_expert_overflow_fixture();

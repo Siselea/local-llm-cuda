@@ -627,7 +627,6 @@ class DenseRunner {
   void* k_ropestrided_ = nullptr;
   void* k_split2_ = nullptr;
   void* k_buildk_ = nullptr;
-  void* k_mlaattn_ = nullptr;
   void* k_mlakv_ = nullptr;
   void* k_mlaattnc_ = nullptr;
   void* k_mlaqreorder_ = nullptr;
@@ -722,7 +721,6 @@ class DenseRunner {
   void* k_topkfinal_ = nullptr;        // device-side top-k stage 2
   void* k_rope_ = nullptr;
   void* k_kvwrite_ = nullptr;
-  void* k_attn_ = nullptr;
   void* k_kvwriteq_ = nullptr;       // quantizing KV write (q8_0 / q4_0)
   void* k_attntiled_ = nullptr;
   void* k_attntiledpre_ = nullptr;   // prefill: several query rows per block

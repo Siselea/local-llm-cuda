@@ -234,3 +234,22 @@ D2 是 >256 专家的新模型，D3 是通用架构 + 大 ctx。建议 v0.1.8 �
 | D6 `gd_ssm_prep hist[4]`（K>5 栈越界） | `kernels.h`: `hist[8]` + `K>9` 防御性返回；`qwen35.cpp`: fused 路径 host 门限加 `K <= 8` | 由 `tools/verify.sh` 的 q35 conv 一致性测试与五套覆盖（K=4 路径） |
 
 其余项（D4/D5/D7-D14）按 §5 待办保留，未在本次改动范围内。
+
+
+---
+
+## 7. v0.1.9 中低危清账（D4, D8–D14）
+
+| 缺陷 | 判定 | 修复 | 测试 |
+|---|---|---|---|
+| D4 `topk_partial taken[256]`（chunk>8192 时 shared 越界写） | **真**（潜在：vocab > ~496k 才触发，当前模型 vocab ≤248320） | bitmap 扩到 512 words=16384 索引；新增 `runner::topk_partial_blocks()`：块数 = max(旧公式, ceil(vocab/16384))，保证 chunk≤16384；vocab 大到 4096 块上限仍无法满足时**加载期拒绝**并提示关 head_topk | `test_kernel_bounds`：128/1k/248320/1M/2^26 的 chunk 都 ≤16384；2^27 返回 -1（拒绝） |
+| D8 激活量化内核假设 n%32==0 | **部分误报**：`quant_x_i8` 的尾部写有 kDp4aMaxElems 分配余量覆盖、`quantize_x_q8` 只处理整块不回读越界；但**静默截断**不可依赖 | dp4a 分支入口加显式守卫 `dp4a_nin_ok(n_in)`，非 32 倍数直接抛错；两个 kernel 加契约注释 | `test_kernel_bounds`：32/4096 通过，33/0 拒绝 |
+| D9 旧 softmax 无 `s==0` 守卫 | **真**（全 -inf 行 → inf/NaN） | `attn_cached_w`/`mla_attn_cached`/`attn_cached_cfg` 三处 `inv = lsum>0 ? 1/lsum : 0` | `test_kernel_bounds`：直接编译 `mla_attn_cached`，q=3e38/K=-3e38 制造全 -inf 行，输出必须全 0 且 finite |
+| D10 Buffer 账本只增不减、`g_buf_log` 无界 | **真**（诊断） | 析构/移动赋值释放时递减 `g_buf_bytes/g_buf_count`；`g_buf_log` 上限 8192 条 | 由 placement/ledger 日志与五套验证覆盖（无独立断言） |
+| D11 capture 期 upload/sync 静默跳过 | **真**（可靠性：半录制 graph 看起来成功） | 新增 `capture_unsafe()`：始终 warn（前 8 次），`ENGINE_CAPTURE_STRICT=1` 时**抛异常**；7 个入口（upload/upload_async/download/download_async/copy_d2d_async/stream_sync/sync）统一走它 | `test_kernel_bounds`：子进程捕获期间 `Buffer::upload` 在 strict 下抛错、默认仍跳过（契约不变） |
+| D12 `Event::record()` 记在 legacy 默认流 | **真**（仅 profiling 用，但会隐式串行化） | 改为记录在引擎的 `g_stream` 上 | 语法/五套覆盖；profiling 路径 ENGINE_PROFILE/ENGINE_PIPE_PROF 手工核对 |
+| D13 `nact>65535` 时 MoE 启动 grid.y 超限 | **真**（潜在：`--prefill-rows ≥ 8192` 时 topk=8 触发） | `runner::moe_slots_per_launch()` + 分块启动：host 路由与 device 路由的 gateup/down 都按 ≤65535 slot 的块循环，指针/slot 数组按全局 slot 偏移；不再依赖 prefill_rows 上限 | `test_kernel_bounds`：topk 1/2/4/6/8/16 的 chunk×topk ≤65535；35B topk=8 的 16384-token prefill 被拆成有界 launch 数 |
+| D14 死内核 `attn`/`attn_cached`/`mla_attn` | **真**（死代码，其中 mla_attn 硬编码 `sh+512` 一旦启用即越界） | 删除三个内核源码、`attn_cached`/`mla_attn` 的 module 源与 `mod_->kernel` 注册、`runner.h` 成员 | 编译 + 五套验证；grep 确认无引用 |
+
+修复 commit：`fix(kernels): clear audited medium/low-risk boundary items (D4, D8-D14)`。
+>256 专家的后续设计见 `docs/reports/LARGE-EXPERT-COUNT-PLAN.md`（不改代码）。

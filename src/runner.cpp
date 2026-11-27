@@ -39,6 +39,41 @@ void read_exact(std::ifstream& f, void* dst, size_t bytes, const std::string& wh
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Geometry helpers shared with tests/test_kernel_bounds.cpp (extern on purpose).
+// ---------------------------------------------------------------------------
+// Device top-k head: each block scans a contiguous logits slice and keeps the best k in
+// shared memory; taken[] in topk_partial is 512 words = 16384 indices, so the slice
+// ceil(vocab/nblk) must stay inside that.  Returns -1 when even the block cap cannot
+// satisfy the bitmap (vocab > ~67M) so the caller can refuse instead of overflowing.
+int topk_partial_blocks(int vocab) {
+  if (vocab <= 0) return 0;
+  constexpr int kBitmapBits = 512 * 32;   // topk_partial: __shared__ unsigned taken[512]
+  constexpr int kMaxBlocks = 4096;
+  int nblk = (vocab + 1939) / 1940;
+  const int need = (vocab + kBitmapBits - 1) / kBitmapBits;
+  if (nblk < need) nblk = need;
+  if (nblk < 1) nblk = 1;
+  if (nblk > kMaxBlocks) nblk = kMaxBlocks;
+  if ((vocab + nblk - 1) / nblk > kBitmapBits) return -1;
+  return nblk;
+}
+
+// MoE expert kernels use blockIdx.y for the (token,expert) slot; CUDA caps grid.y at
+// 65535, so a prefill batch whose n_tokens*topk exceeds that must be launched in
+// several pointer-strided slot chunks (audit D13).
+int moe_slots_per_launch(int topk) {
+  constexpr int kMaxGridY = 65535;
+  if (topk <= 0) return kMaxGridY;
+  const int slots = kMaxGridY / topk;
+  return slots < 1 ? 1 : slots;
+}
+
+// The int8 dp4a kernels index the quantised activation in 32-value blocks
+// (quantize_x_q8 passes n/32 blocks); the weight formats guarantee this, but keep an
+// explicit guard for future callers (audit D8).
+bool dp4a_nin_ok(int n_in) { return n_in > 0 && (n_in % 32) == 0; }
+
 
 int DenseRunner::attn_warps_for_ctx(int ctx_len) {
   static const int mid = static_cast<int>(engine::config::get_int("attn_warp_ctx_mid"));
@@ -347,12 +382,12 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   }
 
   std::string src = std::string(kernels::kRmsNorm) + kernels::kQuantCommon + kernels::kRope +
-                    kernels::kKvWrite + kernels::kAttnCached + kernels::kSiluMul +
+                    kernels::kKvWrite + kernels::kSiluMul +
                     kernels::kAdd + kernels::kAddThree + kernels::kAddBias + kernels::kDequantQ4K +
                     kernels::kDequantQ5K + kernels::kDequantQ6K + kernels::kDequantQ8_0 +
                     kernels::kDequantQ5_0 + kernels::kGatherRows + kernels::kScatterAddW + kernels::kDequantQ5_1 +
                     kernels::kRopeStrided + kernels::kSplit2 + kernels::kMlaBuildK +
-                    kernels::kMlaAttn + kernels::kMlaKvWrite + kernels::kMlaAttnCached +
+                    kernels::kMlaKvWrite + kernels::kMlaAttnCached +
                     kernels::kGdConv1d + kernels::kGdConvState + kernels::kGdNormQk +
                     kernels::kGdDelta + kernels::kGdDelta128 + kernels::kGdDelta128F +
                     kernels::kGdSsmPrep + kernels::kGdNormGate +
@@ -378,7 +413,6 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   k_topkfinal_ = mod_->kernel("topk_final");
   k_rope_ = mod_->kernel("rope");
   k_kvwrite_ = mod_->kernel("kv_write");
-  k_attn_ = mod_->kernel("attn_cached");
   k_silu_ = mod_->kernel("silu_mul");
   k_add_ = mod_->kernel("add_inplace");
   k_add3_ = mod_->kernel("add_three_inplace");
@@ -392,7 +426,6 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   k_ropestrided_ = mod_->kernel("rope_strided");
   k_split2_ = mod_->kernel("split2");
   k_buildk_ = mod_->kernel("mla_build_k");
-  k_mlaattn_ = mod_->kernel("mla_attn");
   k_mlakv_ = mod_->kernel("mla_kv_write");
   k_mlaattnc_ = mod_->kernel("mla_attn_cached");
   k_gdconv_ = mod_->kernel("gd_conv1d_silu");
@@ -770,8 +803,13 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
     head_topk_max_ = engine::config::get_int("head_topk_max");
     if (head_topk_max_ < 1) head_topk_max_ = 1;
     if (head_topk_max_ > kMaxTopK) head_topk_max_ = kMaxTopK;
-    int nblk = static_cast<int>((static_cast<size_t>(vocab_) + 1939) / 1940);
-    nblk = nblk < 1 ? 1 : (nblk > 256 ? 256 : nblk);
+    const int nblk = topk_partial_blocks(vocab_);
+    if (nblk <= 0) {
+      throw std::runtime_error(
+          "vocab=" + std::to_string(vocab_) +
+          " is too large for the device top-k head (the partial-topk bitmap covers "
+          "16384 indices per block even at the 4096-block cap); disable head_topk");
+    }
     topk_nblk_ = nblk;
     const size_t cap = static_cast<size_t>(kMaxTopK);
     topk_pv_ = cuda::Buffer(static_cast<size_t>(nblk) * cap * 4);
@@ -3612,25 +3650,37 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         moe_gp_.upload(gp.data(), gp.size() * 8);
         moe_up_.upload(up.data(), up.size() * 8);
         moe_dp_.upload(dp.data(), dp.size() * 8);
-        {
-          void* pgp = moe_gp_.data();
-          void* pup = moe_up_.data();
-          void* pi = const_cast<int*>(d_idx_base);
-          void* px = hn_.data();
-          void* pa = moe_gact_.data();
-          int hid = hidden_, inter = expert_inter_, tg = type_g, tu = type_u;
-          void* args[] = {&pgp, &pup, &pi, &px, &pa, &hid, &inter, &tg, &tu};
-          cuda::launch(k_moegateup_, (expert_inter_ + 7) / 8, nact, 1, 256, 1, 1, 0, args);
-        }
-        {
-          void* pdp = moe_dp_.data();
-          void* pi = const_cast<int*>(d_idx_base);
-          void* pw = const_cast<float*>(d_w_base);
-          void* pa = moe_gact_.data();
-          void* po = xout_.data();
-          int hid = hidden_, inter = expert_inter_, td = type_d;
-          void* args[] = {&pdp, &pi, &pw, &pa, &po, &hid, &inter, &td};
-          cuda::launch(k_modeown_, (hidden_ + 7) / 8, nact, 1, 256, 1, 1, 0, args);
+        // CUDA caps grid.y at 65535: prefill batches with n_tokens*topk slots are
+        // launched in pointer-strided chunks (the per-slot pointer arrays and the act
+        // scratch are indexed by the global slot, so a chunk only shifts its base).
+        auto slot_off = [](void* base, long long bytes) {
+          return static_cast<void*>(static_cast<unsigned char*>(base) + bytes);
+        };
+        const int slots_per_launch = moe_slots_per_launch(1);
+        for (int slot0 = 0; slot0 < nact; slot0 += slots_per_launch) {
+          const int chunk = std::min(slots_per_launch, nact - slot0);
+          {
+            void* pgp = slot_off(moe_gp_.data(), static_cast<long long>(slot0) * 8);
+            void* pup = slot_off(moe_up_.data(), static_cast<long long>(slot0) * 8);
+            void* pi = const_cast<int*>(d_idx_base + slot0);
+            void* px = hn_.data();
+            void* pa = slot_off(moe_gact_.data(),
+                                static_cast<long long>(slot0) * expert_inter_ * 4);
+            int hid = hidden_, inter = expert_inter_, tg = type_g, tu = type_u;
+            void* args[] = {&pgp, &pup, &pi, &px, &pa, &hid, &inter, &tg, &tu};
+            cuda::launch(k_moegateup_, (expert_inter_ + 7) / 8, chunk, 1, 256, 1, 1, 0, args);
+          }
+          {
+            void* pdp = slot_off(moe_dp_.data(), static_cast<long long>(slot0) * 8);
+            void* pi = const_cast<int*>(d_idx_base + slot0);
+            void* pw = const_cast<float*>(d_w_base + slot0);
+            void* pa = slot_off(moe_gact_.data(),
+                                static_cast<long long>(slot0) * expert_inter_ * 4);
+            void* po = xout_.data();
+            int hid = hidden_, inter = expert_inter_, td = type_d;
+            void* args[] = {&pdp, &pi, &pw, &pa, &po, &hid, &inter, &td};
+            cuda::launch(k_modeown_, (hidden_ + 7) / 8, chunk, 1, 256, 1, 1, 0, args);
+          }
         }
         fused_done = true;
       }
@@ -3711,31 +3761,41 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       {
         void* pg = all_gp_[static_cast<size_t>(L.all_ptr_idx)].data();
         void* pu = all_up_[static_cast<size_t>(L.all_ptr_idx)].data();
-        void* pe = slot_exp_.data();
-        void* pt = slot_tok_.data();
-        void* px = hn_.data();
-        void* pa = moe_gact_.data();
-        int hid = hidden_, inter = expert_inter_, t1 = tg, t2 = tu;
-        void* args[] = {&pg, &pu, &pe, &pt, &px, &pa, &hid, &inter, &t1, &t2};
-        cuda::launch(k_moegateupdev_, (expert_inter_ + 31) / 32, nact, 1, 256, 1, 1, 0, args);
-        if (ENGINE_ENV_ON("ENGINE_DBG_DEVROUTE")) {
-          cuda::sync();
-          std::fprintf(stderr, "[devroute]   gateup ok\n");
+        // Same grid.y limit as the host path: chunk the (token,expert) slots.  The
+        // router already produced slot_exp/slot_tok/slot_w for all nact slots.
+        auto slot_off = [](void* base, long long bytes) {
+          return static_cast<void*>(static_cast<unsigned char*>(base) + bytes);
+        };
+        const int slots_per_launch = moe_slots_per_launch(topk);
+        for (int slot0 = 0; slot0 < nact; slot0 += slots_per_launch) {
+          const int chunk = std::min(slots_per_launch, nact - slot0);
+          {
+            void* pe = slot_off(slot_exp_.data(), static_cast<long long>(slot0) * 4);
+            void* pt = slot_off(slot_tok_.data(), static_cast<long long>(slot0) * 4);
+            void* px = hn_.data();
+            void* pa = slot_off(moe_gact_.data(),
+                                static_cast<long long>(slot0) * expert_inter_ * 4);
+            int hid = hidden_, inter = expert_inter_, t1 = tg, t2 = tu;
+            void* args[] = {&pg, &pu, &pe, &pt, &px, &pa, &hid, &inter, &t1, &t2};
+            cuda::launch(k_moegateupdev_, (expert_inter_ + 31) / 32, chunk, 1, 256, 1, 1, 0,
+                         args);
+          }
+          {
+            void* pd = all_dp_[static_cast<size_t>(L.all_ptr_idx)].data();
+            void* pe = slot_off(slot_exp_.data(), static_cast<long long>(slot0) * 4);
+            void* pt = slot_off(slot_tok_.data(), static_cast<long long>(slot0) * 4);
+            void* pw = slot_off(slot_w_.data(), static_cast<long long>(slot0) * 4);
+            void* pa = slot_off(moe_gact_.data(),
+                                static_cast<long long>(slot0) * expert_inter_ * 4);
+            void* po = xout_.data();
+            int hid = hidden_, inter = expert_inter_, t3 = td;
+            void* args[] = {&pd, &pe, &pt, &pw, &pa, &po, &hid, &inter, &t3};
+            cuda::launch(k_modeowndev_, (hidden_ + 31) / 32, chunk, 1, 256, 1, 1, 0, args);
+          }
         }
-      }
-      {
-        void* pd = all_dp_[static_cast<size_t>(L.all_ptr_idx)].data();
-        void* pe = slot_exp_.data();
-        void* pt = slot_tok_.data();
-        void* pw = slot_w_.data();
-        void* pa = moe_gact_.data();
-        void* po = xout_.data();
-        int hid = hidden_, inter = expert_inter_, t3 = td;
-        void* args[] = {&pd, &pe, &pt, &pw, &pa, &po, &hid, &inter, &t3};
-        cuda::launch(k_modeowndev_, (hidden_ + 31) / 32, nact, 1, 256, 1, 1, 0, args);
         if (ENGINE_ENV_ON("ENGINE_DBG_DEVROUTE")) {
           cuda::sync();
-          std::fprintf(stderr, "[devroute]   down ok\n");
+          std::fprintf(stderr, "[devroute]   gateup+down ok\n");
         }
       }
       {
@@ -4583,6 +4643,10 @@ void DenseRunner::run_gemv_plan(const GemvChoice& c, const QTensor& w, cuda::Buf
     case GemvPlan::Q5K_DP4A_S:
     case GemvPlan::Q6K_DP4A:
     case GemvPlan::Q6K_DP4A_SK: {
+      if (!dp4a_nin_ok(w.n_in)) {
+        throw std::runtime_error("dp4a GEMV requires n_in % 32 == 0 (n_in=" +
+                                 std::to_string(w.n_in) + ", type=" + w.type + ")");
+      }
       void* pxf = in.data();
       void* pq = qx_i8_.data();
       void* pdx = dx_i8_.data();

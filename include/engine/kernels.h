@@ -51,7 +51,9 @@ extern "C" __global__ void rope(float* __restrict__ x, const int* __restrict__ p
 }
 )cuda";
 
-// causal GQA attention for a prompt of L tokens (no KV cache yet).
+// Reference causal GQA attention used by tests/test_layer.cpp for the synthetic-layer
+// check.  The engine itself does not launch this kernel (the tiled attention kernels
+// above/below are the production paths), so it lives on as a test asset only.
 // q: [L, n_head*D], k/v: [L, n_kv*D], out: [L, n_head*D]
 inline const char* kAttn = R"cuda(
 extern "C" __global__ void attn(const float* __restrict__ q, const float* __restrict__ k,
@@ -358,8 +360,9 @@ extern "C" __global__ void kv_write(const float* __restrict__ k, const float* __
 }
 )cuda";
 
-// Causal attention of one q row per block over the KV cache (0..start_pos+i).
-// Causal attention of one q row per block over the KV cache (0..start_pos+i).
+// Reference causal KV-cache attention (one q row per block, warp per query head) used
+// by tests/test_kv.cpp as the independent implementation to check kv_write.  The engine
+// itself launches attn_tiled / attn_cached_w / attn_cached_cfg only.
 // One warp per (query, head): lanes split the keys, scores staged in shared memory.
 inline const char* kAttnCached = R"cuda(
 extern "C" __global__ void attn_cached(const float* __restrict__ q,
@@ -523,45 +526,6 @@ extern "C" __global__ void mla_build_k(const float* __restrict__ kn, const float
     for (int d = threadIdx.x; d < qk_rope; d += blockDim.x)
       dst[qk_nope + d] = kpe[(long long)t * qk_rope + d];
   }
-}
-)cuda";
-
-// causal attention with asymmetric head dims (q/k: qk, v: v_dim). Prefill only.
-inline const char* kMlaAttn = R"cuda(
-extern "C" __global__ void mla_attn(const float* __restrict__ q, const float* __restrict__ k,
-                                    const float* __restrict__ v, float* __restrict__ out,
-                                    int n_head, int qk, int v_dim, float scale) {
-  extern __shared__ float sh[];
-  float* scores = sh;
-  float* acc = sh + 512;
-  const int i = blockIdx.x, h = blockIdx.y;
-  const float* qh = q + ((long long)i * n_head + h) * qk;
-  if (threadIdx.x == 0) {
-    float mx = -1e30f;
-    for (int j = 0; j <= i; ++j) {
-      const float* kh = k + ((long long)j * n_head + h) * qk;
-      float dot = 0.f;
-      for (int d = 0; d < qk; ++d) dot += qh[d] * kh[d];
-      scores[j] = dot * scale;
-      mx = fmaxf(mx, scores[j]);
-    }
-    float sum = 0.f;
-    for (int j = 0; j <= i; ++j) {
-      scores[j] = expf(scores[j] - mx);
-      sum += scores[j];
-    }
-    const float inv = 1.f / sum;
-    for (int j = 0; j <= i; ++j) scores[j] *= inv;
-  }
-  __syncthreads();
-  for (int d = threadIdx.x; d < v_dim; d += blockDim.x) {
-    float a = 0.f;
-    for (int j = 0; j <= i; ++j) a += scores[j] * v[((long long)j * n_head + h) * v_dim + d];
-    acc[d] = a;
-  }
-  __syncthreads();
-  for (int d = threadIdx.x; d < v_dim; d += blockDim.x)
-    out[((long long)i * n_head + h) * v_dim + d] = acc[d];
 }
 )cuda";
 
@@ -1059,7 +1023,7 @@ extern "C" __global__ void mla_attn_cached(const float* __restrict__ q,
   }
   for (int off = 16; off > 0; off >>= 1) lsum += __shfl_xor_sync(mask, lsum, off);
   __syncwarp();
-  const float inv = 1.f / lsum;
+  const float inv = lsum > 0.f ? 1.f / lsum : 0.f;   // all -inf row -> zeros, not NaN
   for (int d = lane; d < vdim; d += 32) {
     float a = 0.f;
     for (int j = 0; j <= qpos; ++j) a += sh[j] * inv * Vh[(long long)j * vdim + d];
@@ -1622,6 +1586,9 @@ extern "C" __global__ void q35_gate_mul(float* __restrict__ a, const float* __re
 // ---- int8 dot-product path (llama.cpp style): quantise x to Q8 per 32-elt block,
 // then use __dp4a against the already-int8 weights. 4x fewer arithmetic ops than f32.
 inline const char* kQuantXQ8 = R"cuda(
+// n must be a multiple of 32: the caller passes nblocks = n/32 and every lane reads
+// x[b*32 + lane].  This holds for Q8_0/Q5_0 weight formats by definition; the dp4a
+// dispatch in runner.cpp also asserts it before launching (audit D8).
 extern "C" __global__ void quantize_x_q8(const float* __restrict__ x, signed char* __restrict__ qx,
                                          float* __restrict__ dx, int nblocks) {
   const int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2680,6 +2647,8 @@ __device__ __forceinline__ float dp4a_h2f(unsigned short h) {
 
 // One warp per 32 values.  dx[2*blk], dx[2*blk+1] = first/residual scale,
 // xs8[blk] = sum of the reconstructed activation over the block.
+// Two-level int8 quantisation with a tail guard for i >= n; the dx/xs8 writes use
+// ceil(n/32) slots, which the host buffers cover up to kDp4aMaxElems (audit D8).
 extern "C" __global__ void quant_x_i8(const float* __restrict__ x, signed char* __restrict__ qx,
                                       float* __restrict__ dx, float* __restrict__ xs8, int n) {
   const int lane = threadIdx.x & 31;
@@ -3095,9 +3064,11 @@ extern "C" __global__ void topk_partial(const float* __restrict__ x, float* __re
                                         int* __restrict__ pi, int n, int nblk, int k) {
   __shared__ float sv[32];
   __shared__ int si[32];
-  // Selection bitmap over the block's local range (chunk <= 8192 indices).  An O(1)
-  // skip test instead of scanning the already-taken list keeps k=64/128 cheap.
-  __shared__ unsigned int taken[256];
+  // Selection bitmap over the block's local range.  512 words = 16384 indices; the
+  // host keeps chunk = ceil(vocab/nblk) inside that bound (runner::topk_partial_blocks),
+  // so no block can write past the array.  An O(1) skip test instead of scanning the
+  // already-taken list keeps k=64/128 cheap.
+  __shared__ unsigned int taken[512];
   const int b = blockIdx.x;
   const int chunk = (n + nblk - 1) / nblk;
   const int lo = b * chunk;
@@ -4278,7 +4249,7 @@ extern "C" __global__ void attn_cached_cfg(const float* __restrict__ q,
   }
   for (int off = 16; off > 0; off >>= 1) lsum += __shfl_xor_sync(mask, lsum, off);
   __syncwarp();
-  const float inv = 1.f / lsum;
+  const float inv = lsum > 0.f ? 1.f / lsum : 0.f;   // all -inf row -> zeros, not NaN
   for (int d = lane; d < D; d += 32) {
     float a = 0.f;
     for (int j = j0; j <= qpos; ++j) a += sh[j] * inv * Vh[(long long)j * D + d];

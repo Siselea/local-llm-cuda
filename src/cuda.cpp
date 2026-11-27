@@ -469,11 +469,21 @@ Buffer::Buffer(size_t bytes) {
   bytes_ = bytes;
   g_buf_bytes += static_cast<long long>(bytes);
   ++g_buf_count;
-  g_buf_log.emplace_back(bytes, 0);
+  // The log is a human diagnostic (only printed with debug output); cap it so a model
+  // with thousands of buffers cannot grow it without bound (audit D10).
+  static constexpr size_t kBufLogCap = 8192;
+  if (g_buf_log.size() < kBufLogCap) g_buf_log.emplace_back(bytes, 0);
 }
 
 Buffer::~Buffer() {
-  if (ptr_) g_driver.MemFree(static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptr_)));
+  if (ptr_) {
+    g_driver.MemFree(static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptr_)));
+    // Keep the diagnostic ledger in sync with actual frees: it is printed by the VRAM
+    // placement messages (and used when diagnosing a ledger gap), so a counter that
+    // only grows overstates the resident set (audit D10).
+    g_buf_bytes -= static_cast<long long>(bytes_);
+    if (g_buf_count > 0) --g_buf_count;
+  }
 }
 
 Buffer::Buffer(Buffer&& o) noexcept : ptr_(o.ptr_), bytes_(o.bytes_) {
@@ -483,7 +493,11 @@ Buffer::Buffer(Buffer&& o) noexcept : ptr_(o.ptr_), bytes_(o.bytes_) {
 
 Buffer& Buffer::operator=(Buffer&& o) noexcept {
   if (this != &o) {
-    if (ptr_) g_driver.MemFree(static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptr_)));
+    if (ptr_) {
+      g_driver.MemFree(static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptr_)));
+      g_buf_bytes -= static_cast<long long>(bytes_);
+      if (g_buf_count > 0) --g_buf_count;
+    }
     ptr_ = o.ptr_;
     bytes_ = o.bytes_;
     o.ptr_ = nullptr;
@@ -516,16 +530,34 @@ static bool g_capturing = false;   // == (g_capture_owner != nullptr)
 static bool capturing_now() { return g_capturing; }
 bool capturing_active() { return g_capturing; }
 
+// Uploads, downloads, synchronous copies and host syncs are illegal while a CUDA graph
+// is being recorded.  The engine skips them (they are supposed to be issued before the
+// capture), but a silent skip makes a half-recorded graph look successful: warn, and
+// hard-fail under ENGINE_CAPTURE_STRICT (used by the regression test and for bisecting
+// a capture problem).  See audit D11.
+static bool capture_unsafe(const char* op, size_t bytes) {
+  if (!capturing_now()) return false;
+  static const bool strict = std::getenv("ENGINE_CAPTURE_STRICT") != nullptr;
+  if (strict) {
+    throw std::runtime_error(std::string("capture-unsafe operation while a CUDA graph is "
+                                         "being recorded: ") +
+                             op + " (" + std::to_string(bytes) + " bytes)");
+  }
+  static int warned = 0;
+  if (warned++ < 8) std::fprintf(stderr, "[capture] skipped %s(%zu)\n", op, bytes);
+  return true;
+}
+
 
 
 void Buffer::upload_async(const void* host, size_t bytes) const {
-  if (capturing_now()) return;
+  if (capture_unsafe("Buffer::upload_async", bytes)) return;
   if (bytes > bytes_) throw std::runtime_error("Buffer::upload_async exceeds allocation");
   check(g_driver.MemcpyHtoDAsync(static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptr_)),
                                  host, bytes, g_stream), "cuMemcpyHtoDAsync");
 }
 void Buffer::download_async(void* host, size_t bytes) const {
-  if (capturing_now()) return;
+  if (capture_unsafe("Buffer::download_async", bytes)) return;
   if (bytes > bytes_) throw std::runtime_error("Buffer::download_async exceeds allocation");
   check(g_driver.MemcpyDtoHAsync(host, static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptr_)),
                                  bytes, g_stream), "cuMemcpyDtoHAsync");
@@ -533,7 +565,8 @@ void Buffer::download_async(void* host, size_t bytes) const {
 
 // Stream-ordered device-to-device copy (rollback snapshots, hidden-state saves).
 void copy_d2d_async(void* dst, const void* src, size_t bytes) {
-  if (capturing_now() || bytes == 0) return;
+  if (bytes == 0) return;
+  if (capture_unsafe("cuda::copy_d2d_async", bytes)) return;
   check(g_driver.MemcpyDtoDAsync(static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(dst)),
                                  static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(src)),
                                  bytes, g_stream),
@@ -541,11 +574,7 @@ void copy_d2d_async(void* dst, const void* src, size_t bytes) {
 }
 
 void Buffer::upload(const void* host, size_t bytes) {
-  if (capturing_now()) {
-    static int w = 0;
-    if (w++ < 8) std::fprintf(stderr, "[capture] skipped Buffer::upload(%zu)\n", bytes);
-    return;
-  }
+  if (capture_unsafe("Buffer::upload", bytes)) return;
   if (bytes > bytes_) throw std::runtime_error("Buffer::upload exceeds allocation");
   check(g_driver.MemcpyHtoD(static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptr_)), host,
                             bytes),
@@ -553,11 +582,7 @@ void Buffer::upload(const void* host, size_t bytes) {
 }
 
 void Buffer::download(void* host, size_t bytes) const {
-  if (capturing_now()) {
-    static int w = 0;
-    if (w++ < 8) std::fprintf(stderr, "[capture] skipped Buffer::download(%zu)\n", bytes);
-    return;
-  }
+  if (capture_unsafe("Buffer::download", bytes)) return;
   if (bytes > bytes_) throw std::runtime_error("Buffer::download exceeds allocation");
   check(g_driver.MemcpyDtoH(host,
                             static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptr_)), bytes),
@@ -575,11 +600,7 @@ void destroy_stream(void* s) {
 void set_stream(void* s) { g_stream = s; }
 void* current_stream() { return g_stream; }
 void stream_sync(void* s) {
-  if (capturing_now()) {
-    static int warned = 0;
-    if (warned++ < 8) std::fprintf(stderr, "[capture] skipped cuda::stream_sync()\n");
-    return;
-  }
+  if (capture_unsafe("cuda::stream_sync", 0)) return;
   void* use = s ? s : g_stream;
   if (use) {
     // Count the stream flush like cuda::sync() so the per-layer debugging output and
@@ -818,11 +839,7 @@ long long g_buf_count = 0;
 long long g_sync_calls = 0;
 double g_sync_ms = 0.0;
 void sync() {
-  if (capturing_now()) {
-    static int warned = 0;
-    if (warned++ < 8) std::fprintf(stderr, "[capture] skipped cuda::sync()\n");
-    return;
-  }
+  if (capture_unsafe("cuda::sync", 0)) return;
   const auto t0 = std::chrono::steady_clock::now();
   check(g_driver.CtxSynchronize(), "cuCtxSynchronize");
   g_sync_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
@@ -844,7 +861,7 @@ void Event::stream_wait(void* stream) {
 Event::~Event() {
   if (ev_) g_driver.EventDestroy(ev_);
 }
-void Event::record() { check(g_driver.EventRecord(ev_, nullptr), "cuEventRecord"); }
+void Event::record() { check(g_driver.EventRecord(ev_, g_stream), "cuEventRecord"); }
 void Event::synchronize() { check(g_driver.EventSynchronize(ev_), "cuEventSynchronize"); }
 double Event::elapsed_ms(const Event& end) const {
   float ms = 0;
