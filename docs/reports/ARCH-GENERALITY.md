@@ -1,8 +1,9 @@
 # ARCH-GENERALITY: metadata-driven architecture support
 
-Status: 2026-11-22. Owner: generalize. Commits: `8099b6c` (generic substrate),
-`d9bb37c` (extended dense path + gemma4), `dd96fa8` (legacy-path regression fix +
-`arch_ext` default off), `5014cc6` (this report).  Verification on an isolated
+Status: 2026-11-22 (updated 2026-11-27). Owner: generalize. Commits: `8099b6c`
+(generic substrate), `d9bb37c` (extended dense path + gemma4), `dd96fa8`
+(legacy-path regression fix + `arch_ext` default off), `5014cc6` (this report);
+the 2026-11-27 follow-up adds proportional-rope frequency factors (§7).  Verification on an isolated
 worktree build of main+fixes: `tools/smoke_models.sh` 4/4 green and
 `tools/gen_regression.sh` **10/10 PASS** (incl. coder_v2_lite 185).
 
@@ -180,3 +181,82 @@ python tools/tiny_gemma4_grid.py --ids 5,7,9
 # real checkpoint (GPU): load + generate
 ./build/test_gen.exe "${GEMMA_MODEL:-$MODEL_DIR/gemma-4-12b-it-Q4_K_M.gguf}" 9259 8 --ctx 64 --arch-ext auto
 ```
+
+## 7. Proportional rope (`rope_freqs.weight`) — implemented and verified (2026-11-27)
+
+The real gemma4-12b checkpoint carries one global F32 `rope_freqs.weight` tensor
+(shape 256 = full-layer `n_rot/2`): 64 entries of `1.0` followed by 192 entries of
+`1e30`.  llama.cpp binds it to every **full-attention** layer only
+(`src/models/gemma4.cpp:100-104`, `TENSOR_DUPLICATED`) and the rope cache divides
+the pair angle by it (`ggml/src/ggml-cpu/ops.cpp:6335-6349`, identical in
+`ggml/src/ggml-cuda/rope.cu:110-115`):
+
+```c
+theta_i = pos * freq_base^(-2i/n_rot) / ff[i]      i = 0 .. n_rot/2-1
+```
+
+`theta/1e30` underflows to 0, so cos=1/sin=0: the pair is not rotated.  This is
+HF's proportional rope (`partial_rotary_factor = 0.25`) — only 128 of the 512
+full-layer head dims rotate; sliding layers (base 1e4, 256 dims) use full rotary
+and no table.  The previous engine rotated all 512 dims on full layers.
+
+Implementation (all generic, metadata-driven):
+
+- `include/engine/rope_freqs.h`: pure helpers (sentinel detection at 1e20,
+  sanitising non-finite/non-positive factors, expected length, per-layer
+  applicability, inverse frequencies).  Unit-tested without a GPU.
+- `include/engine/kernels.h` `rope_strided_ff`: `theta = pos*freqs[i]` then
+  `theta /= ff[i]`; the existing `rope_strided` is untouched.
+- IR (`ArchCaps.rope_freq_factors`): detects the global table and validates
+  type F32 / length = max full-layer `rope_dim/2`; malformed tables produce an
+  actionable warning instead of being silently ignored.
+- runner: loads and validates the table before the layers; passes it **only for
+  `window == 0` (full-attention) layers** and only when its length matches that
+  layer's `n_rot/2` (otherwise plain rope, no OOB read); `arch_rope_freqs
+  auto|on|off` is the runtime fallback; the extended path logs
+  `[rope] proportional freq factors: 256 pairs (64 rotating = 128 dims)`.
+- `arch_ext` remains **default off** (red line); gemma4 still requires
+  `--arch-ext auto`.
+
+Verification:
+
+1. `tests/test_rope_freqs.cpp` (36 checks, in build.sh + clean-build gate):
+   gemma table 64 rotating pairs = 128 of 512 dims, sentinel handling, length
+   checks, sanitising, per-layer applicability, rotation semantics.
+2. `tools/check_rope_ff_tiny.py`: three tiny gemma4 models that differ only in
+   the table (ones / sentinel = real 12b layout / none = all sentinel), 8-token
+   prompt so rope positions > 0, llama.cpp CPU oracle:
+   `relL2 = 2.8e-4 / 3.3e-4 / 2.6e-4` with the table applied vs
+   `1.96e-3 / 5.98e-3` when ignored -> 10/10 checks pass (the `none` case pins
+   the "divide by ff" rule).  The same probe pins llama.cpp's sliding-window
+   convention to `dist < window` (identical to the engine).
+3. engine end-to-end on the tiny sentinel model: same greedy ids as llama.cpp
+   (`7 44`), and the log line confirms the table is active.
+4. Real 12B, llama.cpp **CPU** oracle, 16 greedy tokens:
+
+   | prompt | llama top1-top2 gap | engine 16 tokens | llama 16 tokens | parity |
+   |---|---|---|---|---|
+   | "The capital of France is" | -2.84 (decisive) | `236770` x16 | `236770` x16 | **16/16** |
+   | "Hello" | -0.63 (near tie) | `236761`x3 then flips | `236770` x16 | token 0 flips |
+   | "你好" | -0.26 (very near tie) | `236761` x16 | alternating | diverges at token 1 |
+
+5. Why the near ties are not a semantics bug — truncated real-checkpoint probe
+   (`tools/make_trunc_gemma4.py --dtype f16` + `tools/trunc_probe.py`), first two
+   real layers (both sliding; rope is a no-op at position 0):
+   - **F16 weights**: llama.cpp CPU vs our exact f32 reference `relL2 = 1.1e-4`
+     (8-token prompt 2.3e-4) -> architecture semantics match;
+   - **Q4_K weights, same layers**: `relL2 = 1.8e-2` (8-token 3.3e-2), 160x
+     larger: llama.cpp's own q8 activation quantisation noise for K-quant
+     weights.  That noise accumulates over 48 layers (~20% hidden direction at
+     the real checkpoint, matching the earlier 12B hidden comparison) and flips
+     top-1 only when the true margin is below it.  llama.cpp itself disagrees
+     between CPU and GPU on the 12B checkpoint (top-2 gap -0.63 vs -0.34), so
+     "exact greedy parity on a Q4_K checkpoint at near ties" is multi-valued;
+     on decisive-margin prompts the engine is 16/16 identical.
+
+Consequence: the full-layer rotary geometry is now correct (a genuine
+bug fix for multi-token behaviour), and the residual 12B greedy differences are
+quantisation-backend noise rather than missing architecture rules.  `arch_ext`
+stays off by default; a future F16/BF16 checkpoint or a backend-matched
+activation-quantisation path can be used to tighten parity further.
+

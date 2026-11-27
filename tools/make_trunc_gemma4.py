@@ -42,6 +42,10 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--out", default="")
     ap.add_argument("--src", default=str(SRC))
+    ap.add_argument("--dtype", choices=["keep", "f16"], default="keep",
+                    help="keep the original quantised tensors or convert the 2-D "
+                         "weight matrices to F16 so llama.cpp runs near-exact f32 "
+                         "math (semantic probes without K-quant activation noise)")
     opts = ap.parse_args()
     n = opts.n
     src = Path(opts.src)
@@ -76,7 +80,19 @@ def main() -> int:
             g.add(key, 9, struct.pack("<I", elem_t) + struct.pack("<Q", len(elems)) +
                   b"".join(elems))
 
-    keep = ("token_embd.weight", "output_norm.weight", "rope_freqs.weight")
+    # llama.cpp only creates the rope_freqs tensor for full-attention layers
+    # (src/models/gemma4.cpp:100-104), so a prefix without any full layer must not
+    # ship it or the tensor count mismatches.
+    swa_pattern = fields.get("gemma4.attention.sliding_window_pattern")
+    has_full = False
+    if swa_pattern is not None:
+        vals = swa_pattern.contents()
+        has_full = any(not bool(v) for v in vals[:n])
+    else:
+        has_full = True
+    keep = ["token_embd.weight", "output_norm.weight"]
+    if has_full:
+        keep.append("rope_freqs.weight")
     n_t = 0
     for t in r.tensors:
         name = t.name
@@ -90,7 +106,20 @@ def main() -> int:
             continue
         dims = list(reversed(t.shape))
         data = np.array(t.data).tobytes()
-        g.tensor(name, dims, data, type_id=int(t.tensor_type.value))
+        type_id = int(t.tensor_type.value)
+        if opts.dtype == "f16" and len(dims) == 2 and type_id != 0:
+            # dequantise the weight matrix and store it as F16: llama.cpp then uses
+            # plain fp16 loads with f32 accumulation (no per-32 activation q8
+            # quantisation), which isolates architecture semantics from its
+            # runtime quantisation noise.
+            from gguf.quants import dequantize
+            raw = np.array(t.data)
+            row_bytes = raw.shape[1]
+            f = dequantize(raw, t.tensor_type).astype(np.float32)
+            f = f.reshape(raw.shape[0], -1)
+            data = f.astype(np.float16).tobytes()
+            type_id = 1  # GGML_TYPE_F16
+        g.tensor(name, dims, data, type_id=type_id)
         n_t += 1
     data = g.build()
     out.write_bytes(data)

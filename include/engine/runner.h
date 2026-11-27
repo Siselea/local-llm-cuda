@@ -317,10 +317,17 @@ class DenseRunner {
 
   // ---- generic extended dense path (metadata-driven architectures) --------
   void load_ext_layer(int i, LayerW& w);
+  // Proportional-rope frequency factors (GGUF `rope_freqs.weight`, full-attention
+  // layers only): load + validate the global table before the layers are built.
+  void load_ext_rope_freq_factors();
   void run_layer_ext(int layer, int n_tokens, int start_pos);
   void ext_attention(LayerW& L, int n_tokens, int start_pos);
   void ext_ffn(LayerW& L, int n_tokens);
   bool ext_enabled_ = false;       // model uses the extended path (config may veto)
+  std::string ext_rope_freq_mode_ = "auto";  // arch_rope_freqs: auto | on | off
+  cuda::Buffer ext_rope_ff_;       // [full rope_dim/2] per-pair frequency divisors
+  int ext_rope_ff_len_ = 0;
+  bool ext_rope_ff_ok_ = false;    // table loaded, validated and uploaded
   double ext_embed_scale_ = 1.0;   // embedding multiplier actually used
   bool ext_gelu_ = false;
   double ext_attn_scale_ = -1.0;   // <0 = legacy rsqrt(d)
@@ -734,6 +741,7 @@ class DenseRunner {
   void* k_scale_ = nullptr;
   void* k_softcap_ = nullptr;
   void* k_attncfg_ = nullptr;
+  void* k_ropestridedff_ = nullptr;
   void* k_add_ = nullptr;
   void* k_add3_ = nullptr;  // a += (b + c) fused host-part + residual add
   void* k_bias_ = nullptr;

@@ -503,6 +503,31 @@ extern "C" __global__ void rope_strided(float* __restrict__ x, const int* __rest
 )cuda";
 
 // split a row into two column ranges: a = src[0:na], b = src[na:na+nb]
+// rope_strided with per-pair frequency divisors (GGUF gemma4 rope_freqs.weight).
+//   theta_i = pos * freqs[i] / ff[i]
+// ff == nullptr keeps the plain behaviour.  The GGUF sentinel 1e30 makes
+// theta_i underflow to 0 (cos=1, sin=0), i.e. that pair is not rotated: this is
+// exactly llama.cpp's "proportional rope" for full-attention layers.
+inline const char* kRopeStridedFF = R"cuda(
+extern "C" __global__ void rope_strided_ff(float* __restrict__ x, const int* __restrict__ pstart,
+                                           int n_heads, int head_stride, int rope_dim, int offset,
+                                           const float* __restrict__ freqs,
+                                           const float* __restrict__ ff, float mscale) {
+  const int row = blockIdx.x;
+  const int h = blockIdx.y;
+  const int half = rope_dim / 2;
+  for (int i = threadIdx.x; i < half; i += blockDim.x) {
+    float ang = (float)(*pstart + row) * freqs[i];
+    if (ff != nullptr) ang /= ff[i];
+    const float c = cosf(ang) * mscale, s = sinf(ang) * mscale;
+    float* p = x + ((long long)row * n_heads + h) * head_stride + offset;
+    const float x1 = p[i], x2 = p[i + half];
+    p[i] = x1 * c - x2 * s;
+    p[i + half] = x1 * s + x2 * c;
+  }
+}
+)cuda";
+
 inline const char* kSplit2 = R"cuda(
 extern "C" __global__ void split2(const float* __restrict__ src, float* __restrict__ a,
                                   float* __restrict__ b, int rows, int na, int nb) {

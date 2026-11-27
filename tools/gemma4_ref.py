@@ -201,6 +201,9 @@ class Config:
         else:
             self.is_swa = [False] * self.n_layer
         self.k_eq_v = bool(get("attention.k_eq_v", 0)) or ts.has("blk.0.attn_k_norm.weight")
+        # gemma4 proportional rope: global table bound to full-attention layers
+        # (src/models/gemma4.cpp:100-104); None for every other layout.
+        self.rope_freqs = (ts.get("rope_freqs.weight") if ts.has("rope_freqs.weight") else None)
         self.has_ple = int(get("embedding_length_per_layer_input", 0) or 0) > 0
         self.head_dim = [self.kl_swa if sw else self.kl for sw in self.is_swa]
         self.rope_theta = [self.rope_base_swa if sw else self.rope_base for sw in self.is_swa]
@@ -233,12 +236,20 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def rope(x: torch.Tensor, positions: torch.Tensor, n_rot: int, theta: float,
-         partial: bool) -> torch.Tensor:
-    """x: [T, heads, d]; rotary applied to the first n_rot dims (NEOX/rotate_half)."""
+         partial: bool, freq_factors: torch.Tensor | None = None) -> torch.Tensor:
+    """x: [T, heads, d]; rotary applied to the first n_rot dims (NEOX/rotate_half).
+
+    freq_factors is the GGUF gemma4 `rope_freqs.weight` table: llama.cpp divides
+    the pair angle by it (theta_i = pos * base^(-2i/n_rot) / ff[i]); the 1e30
+    sentinel leaves those pairs unrotated (proportional rope on full layers).
+    """
     d = x.shape[-1]
     n_rot = n_rot if partial else d
     n_rot = min(n_rot, d)
     inv = 1.0 / (theta ** (torch.arange(0, n_rot, 2, dtype=torch.float32) / n_rot))
+    if freq_factors is not None:
+        n = min(int(freq_factors.numel()), int(inv.numel()))
+        inv[:n] = inv[:n] / freq_factors[:n].float()
     ang = positions.float()[:, None] * inv[None, :]
     cos = torch.cat([ang.cos(), ang.cos()], dim=-1)[:, None, :]
     sin = torch.cat([ang.sin(), ang.sin()], dim=-1)[:, None, :]
@@ -295,14 +306,20 @@ def forward(cfg: Config, ts: GGUFTensors, ids: list[int], opts) -> torch.Tensor:
         residual = x
         hn = rms_norm(x, W["attn_norm"], cfg.eps, opts.norm_mode == "plus1")
         q = (hn @ W["q"].T).view(T, n_h, d)
+        ff_tab = None
+        if (cfg.rope_freqs is not None and getattr(opts, "rope_freqs", "auto") != "ignore"
+                and lp["window"] == 0):
+            cand = torch.from_numpy(cfg.rope_freqs).float()
+            if cand.numel() * 2 == lp["n_rot"]:
+                ff_tab = cand
         if W["q_norm"] is not None:
             q = rms_norm(q, W["q_norm"], cfg.eps, opts.qk_norm_mode == "plus1")
-        q = rope(q, pos, lp["n_rot"], lp["theta"], opts.rope_full)
+        q = rope(q, pos, lp["n_rot"], lp["theta"], opts.rope_full, ff_tab)
         if has_v:
             k = (hn @ W["k"].T).view(T, n_kv, d)
             if W["k_norm"] is not None:
                 k = rms_norm(k, W["k_norm"], cfg.eps, opts.qk_norm_mode == "plus1")
-            k = rope(k, pos, lp["n_rot"], lp["theta"], opts.rope_full)
+            k = rope(k, pos, lp["n_rot"], lp["theta"], opts.rope_full, ff_tab)
             v = (hn @ W["v"].T).view(T, n_kv, d)
             if opts.v_norm == "on":
                 v = rms_norm(v, None, cfg.eps)
@@ -310,7 +327,7 @@ def forward(cfg: Config, ts: GGUFTensors, ids: list[int], opts) -> torch.Tensor:
             k_raw = (hn @ W["k"].T).view(T, n_kv, d)
             k = rms_norm(k_raw, W["k_norm"], cfg.eps, opts.qk_norm_mode == "plus1") \
                 if W["k_norm"] is not None else k_raw
-            k = rope(k, pos, lp["n_rot"], lp["theta"], opts.rope_full)
+            k = rope(k, pos, lp["n_rot"], lp["theta"], opts.rope_full, ff_tab)
             v = rms_norm(k_raw, None, cfg.eps) if opts.v_norm == "on" else k_raw
 
         rep = n_h // n_kv
@@ -392,6 +409,8 @@ def main() -> int:
     ap.add_argument("--softcap", choices=["on", "off"], default="on")
     ap.add_argument("--act", choices=["gelu", "silu"], default="gelu")
     ap.add_argument("--attn-softcap", type=float, default=0.0)
+    ap.add_argument("--rope-freqs", choices=["auto", "ignore"], default="auto",
+                    help="apply the GGUF rope_freqs.weight table (auto) or ignore it")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--verbose", action="store_true")
     opts = ap.parse_args()

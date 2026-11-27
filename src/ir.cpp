@@ -408,13 +408,41 @@ Model build_from_gguf(const gguf::Model& g) {
     caps.gelu_mlp = gemma_trait;
     caps.embed_scale = gemma_trait ? std::sqrt(static_cast<double>(m.hidden)) : 1.0;
     caps.attn_scale = caps.qk_norm ? 1.0 : 0.0;
+    // GGUF gemma4 proportional rope: one global rope_freqs.weight table holds the
+    // per-pair frequency divisors for the full-attention layers (llama.cpp binds
+    // it to every !is_swa layer, TENSOR_DUPLICATED).  Expected length is
+    // (max full-layer rotary dim)/2 for an F32 tensor.  Validate here rather than
+    // at load time so `engine info` explains a malformed file.
+    {
+      const std::string rf_name = "rope_freqs.weight";
+      const gguf::TensorInfo* rf = nullptr;
+      for (const auto& t : g.tensors)
+        if (t.name == rf_name) { rf = &t; break; }
+      if (rf) {
+        int full_rot = 0;
+        for (int i = 0; i < m.n_layer; ++i) {
+          const auto& la = m.layers[i].attn;
+          if (la.window != 0) continue;
+          full_rot = std::max(full_rot, la.rope_dim > 0 ? la.rope_dim : la.key_dim);
+        }
+        const size_t want = full_rot > 0 ? static_cast<size_t>(full_rot) / 2 : 0;
+        if (rf->type_name == "F32" && want > 0 && rf->n_elements == want) {
+          caps.rope_freq_factors = true;
+        } else {
+          m.warnings.push_back(
+              "rope_freqs.weight present but unusable (type " + rf->type_name + ", " +
+              std::to_string(rf->n_elements) + " elements; expected F32 " +
+              std::to_string(want) + " = full-layer rope_dim/2); ignoring it");
+        }
+      }
+    }
     // Only metadata that the legacy dense path genuinely cannot express turns the
     // generic path on.  A bare per-head qk-norm tensor set is NOT enough: several
     // already-supported architectures (qwen3 family) carry attn_q_norm/attn_k_norm
     // and have their own loaders.  In particular never take over hybrid-SSM / MLA /
     // MoE models here; they keep their existing, verified code paths.
     caps.extended = caps.per_layer_attn || caps.sandwich_norm || caps.layer_scalar ||
-                    caps.logit_softcap != 0.0;
+                    caps.logit_softcap != 0.0 || caps.rope_freq_factors;
     if (caps.extended) {
       int n_eq_v = 0;
       for (int i = 0; i < m.n_layer; ++i)
@@ -427,7 +455,8 @@ Model build_from_gguf(const gguf::Model& g) {
           std::to_string(static_cast<int>(caps.sandwich_norm)) + " layer_scalar=" +
           std::to_string(static_cast<int>(caps.layer_scalar)) + " k_eq_v_layers=" +
           std::to_string(n_eq_v) + " logit_softcap=" +
-          std::to_string(caps.logit_softcap));
+          std::to_string(caps.logit_softcap) + " rope_freq_factors=" +
+          std::to_string(static_cast<int>(caps.rope_freq_factors)));
     }
   }
 
