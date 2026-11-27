@@ -395,6 +395,11 @@ class DenseRunner {
   // auto layer placement reserves it, otherwise the post-load margin is optimistic and
   // the driver pages (measured gap between device-used and cuda::g_buf_bytes).
   size_t vram_extra_reserve_ = 0;
+  // Serve-mode reserve for allocations made AFTER the loader's post-load check (the
+  // tokenizer/prefix-cache/sampler side of `engine serve`): measured as ~1.07 GiB on the
+  // 35B (runner check free 2162 MiB -> serve guard 1093 MiB).  Set from
+  // ENGINE_SERVE_RESERVE_MB (serve sets it) and applied only to models with MoE experts.
+  size_t serve_reserve_ = 0;
   bool vram_adaptive_ = true;
   bool gpu_layers_explicit_ = false;           // user pinned gpu_layers
   int planned_gpu_moe_layers_ = -1;            // pre-load estimate (0 = none)

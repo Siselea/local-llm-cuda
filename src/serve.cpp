@@ -2295,6 +2295,19 @@ int run(Options& opts) {
               st.tk.bos_id(), st.tk.eos_id(), ms_since(t_tok0));
   std::printf("[serve] chat tmpl  : %s%s\n", st.tk.template_name(),
               has_think_marker ? " (thinking-aware)" : "");
+  // Serve-mode allocations after the loader's post-load check (tokenizer tables,
+  // prefix-cache slot, sampler etc.) are invisible to the loader's VRAM budget; measured
+  // as ~1.07 GiB on the 35B (runner check free 2162 -> serve guard 1093 MiB, i.e. below
+  // the 1200 MiB margin).  Tell the loader to keep that much extra free so placement
+  // drops a layer instead of the serve guard refusing the start.  Only affects models
+  // with MoE experts (dense 9B/0.5B budgets are unchanged).
+  if (std::getenv("ENGINE_SERVE_RESERVE_MB") == nullptr) {
+#ifdef _WIN32
+    _putenv_s("ENGINE_SERVE_RESERVE_MB", "2048");
+#else
+    setenv("ENGINE_SERVE_RESERVE_MB", "2048", 0);
+#endif
+  }
   std::printf("[serve] loading model (ctx=%s) ...\n",
               opts.ctx > 0 ? std::to_string(opts.ctx).c_str() : "auto");
   std::fflush(stdout);
@@ -2409,6 +2422,22 @@ int run(Options& opts) {
         static_cast<size_t>(engine::config::get_int("vram_margin_mb")) << 20;
     const cuda::MemInfo mem = cuda::mem_info();
     if (mem.free_bytes < margin_bytes) {
+      // Desktop WDDM can grow between the loader's post-load check and this guard (measured
+      // 1.5-1.7 GiB swings on this VM while the loader ledger gap moved 1.6 -> 3.2 GiB), so
+      // a hard refusal here makes the default launcher start environment-flaky.  Between the
+      // hard floor and the margin, start loudly instead: the serve reserve already made
+      // placement leave room, and the operator gets an actionable warning.
+      constexpr size_t kHardFloor = 700ull << 20;
+      const bool strict_vram = engine::config::get_bool("strict_vram");
+      if (!strict_vram && mem.free_bytes >= kHardFloor) {
+        std::fprintf(stderr,
+                     "[serve] WARN: only %.0f MiB free after load (< margin %zu MiB, >= hard "
+                     "floor %zu MiB); starting anyway. External/desktop WDDM memory likely grew "
+                     "during the load; driver paging risk. Fix: lower --ctx / --gpu-layers, "
+                     "close other GPU apps, or pass --strict-vram to refuse instead.\n",
+                     static_cast<double>(mem.free_bytes) / 1048576.0, margin_bytes >> 20,
+                     kHardFloor >> 20);
+      } else {
       uint64_t kv_bpt = 0;
       {
         const std::string kvt = engine::config::get_string("kv_type");
@@ -2437,7 +2466,8 @@ int run(Options& opts) {
                        "[serve] ERROR: VRAM over-subscribed after load (free %.0f MiB < margin "
                        "%zu MiB) even though ctx would have to drop from %d to %d; not retrying. "
                        "Lower --gpu-layers / disable --vram-auto-layers, or raise --vram-margin "
-                       "so placement leaves room for the CUDA graph pools.\n",
+                       "so placement leaves room for the CUDA graph pools (or pass "
+                       "--strict-vram to keep refusing).\n",
                        static_cast<double>(mem.free_bytes) / 1048576.0, margin_bytes >> 20,
                        opts.ctx, suggested);
           return 1;
@@ -2460,6 +2490,7 @@ int run(Options& opts) {
                    opts.ctx_suggested > 0 ? " Retrying is possible with the suggested ctx."
                                           : "");
       return opts.ctx_suggested > 0 ? 4 : 1;
+      }
     }
   }
 

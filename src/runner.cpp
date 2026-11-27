@@ -725,7 +725,8 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
   // first prefill of such a process ran 12x slow).
   {
     const size_t free_now = cuda::mem_info().free_bytes;
-    const size_t need_margin = vram_margin_bytes_ + (64ull << 20);
+    const size_t need_margin = vram_margin_bytes_ + (64ull << 20) +
+                               (ir_.moe.n_expert > 0 ? serve_reserve_ : 0);
     // activation_bytes() is the design formula; the constructor allocates measurably
     // more (measured on the 9B hybrid at rows=4096: 2300 MiB real vs 1925 MiB estimated,
     // i.e. ~18% more -- attention scratch and staging buffers the formula omits).  The
@@ -992,7 +993,8 @@ void DenseRunner::derive_ctx_limit(int requested) {
   const size_t weights = static_cast<size_t>(ir_.fixed_bytes());
   const size_t margin = static_cast<size_t>(cfg.get_int("vram_margin_mb")) << 20;
   const size_t workspace = static_cast<size_t>(cfg.get_int("workspace_mb")) << 20;
-  const size_t reserve = margin + workspace;
+  const size_t moe_serve_reserve = ir_.moe.n_expert > 0 ? serve_reserve_ : 0;
+  const size_t reserve = margin + workspace + moe_serve_reserve;
   const size_t free_at_load = cuda::mem_info().free_bytes;
   // activation bytes as a function of the number of rows actually allocated
   auto act_bytes = [&](int rows) -> size_t { return activation_bytes(rows); };
@@ -1038,7 +1040,7 @@ void DenseRunner::derive_ctx_limit(int requested) {
     // appears, so this small clamp does not trigger a promotion.
     size_t kv_req = 0;
     const size_t experts = split_experts_at(want, &kv_req);
-    const size_t overhead = workspace + ledger_gap + (96ull << 20);
+    const size_t overhead = workspace + ledger_gap + (96ull << 20) + moe_serve_reserve;
     const size_t safety = 128ull << 20;
     const int rows = std::min(want, row_cap);
     const size_t base_fit = weights + experts + act_bytes(rows) + overhead + margin + safety;
@@ -4975,6 +4977,11 @@ void DenseRunner::load_config_snapshot() {
   vram_margin_bytes_ = static_cast<size_t>(cfg.get_int("vram_margin_mb")) << 20;
   vram_adaptive_ = cfg.get_bool("vram_check");
   vram_extra_reserve_ = static_cast<size_t>(cfg.get_int("vram_extra_reserve_mb")) << 20;
+  serve_reserve_ = 0;
+  if (const char* e = std::getenv("ENGINE_SERVE_RESERVE_MB")) {
+    const long v = std::atol(e);
+    if (v > 0) serve_reserve_ = static_cast<size_t>(v) << 20;
+  }
   gpu_layers_explicit_ = cfg.was_set("gpu_layers");
   has_kernel_overrides_ = !cfg.kernel_overrides().empty();
 }
@@ -5002,8 +5009,9 @@ bool DenseRunner::expert_layer_fits_vram(int layer, int moe_index, size_t device
   // layer can consume the post-load margin (that was the auto-placement flake: the same
   // command landed on 14/15/17 GPU layers depending on ambient free VRAM and one of
   // those picked free=0 after load).
-  const size_t need =
-      device_bytes + extra_bytes + residual + (96ull << 20) + vram_extra_reserve_;
+  const size_t need = device_bytes + extra_bytes + residual + (96ull << 20) +
+                      vram_extra_reserve_ +
+                      (ir_.moe.n_expert > 0 ? serve_reserve_ : 0);
   if (mi.free_bytes >= need + vram_margin_bytes_) {
     if (debug_)
       std::fprintf(stderr,
@@ -5037,11 +5045,15 @@ void DenseRunner::check_post_load_vram() {
   // is calibrated against; printing it makes future calibration data-driven.
   const long long used_mb = static_cast<long long>((mi.total_bytes - mi.free_bytes) >> 20);
   const long long ledger_mb = static_cast<long long>(cuda::g_buf_bytes >> 20);
-  if (mi.free_bytes >= vram_margin_bytes_) {
+  const size_t check_need = vram_margin_bytes_ +
+                            (ir_.moe.n_expert > 0 ? serve_reserve_ : 0);
+  if (mi.free_bytes >= check_need) {
     std::fprintf(stderr,
-                 "[vram] check OK: %lld MiB free >= %lld MiB margin (gpu_moe_layers=%d)"
+                 "[vram] check OK: %lld MiB free >= %lld MiB margin%s (gpu_moe_layers=%d)"
                  "%s [ledger gap %lld MiB, reserve %lld MiB]\n",
-                 free_mb, margin_mb, gpu_moe_layers_,
+                 free_mb, margin_mb,
+                 (ir_.moe.n_expert > 0 && serve_reserve_ > 0) ? " +serve-reserve" : "",
+                 gpu_moe_layers_,
                  gpu_layers_explicit_ ? " [explicit --gpu-layers]" : " [auto]",
                  used_mb - ledger_mb,
                  static_cast<long long>(vram_extra_reserve_ >> 20));
@@ -5094,7 +5106,7 @@ void DenseRunner::apply_auto_vram_layers() {
     // and a promotion must not create that state; when the reserve does not fit, keep the
     // layer on the CPU (explicit --gpu-layers is still available).
     const size_t promo_reserve = std::max(vram_margin_floor_bytes_, vram_margin_bytes_) +
-                                 vram_extra_reserve_ + (1152ull << 20);
+                                 vram_extra_reserve_ + serve_reserve_ + (1152ull << 20);
     if (mi.free_bytes < need + promo_reserve) {
       if (debug_)
         std::fprintf(stderr,

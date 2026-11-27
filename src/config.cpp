@@ -94,6 +94,12 @@ const OptionDef kDefs[] = {
      false, Type::Bool, "false", 0, 0,
      "continue when the placement decider reports the model does not fit VRAM+RAM "
      "(the driver will page: expect single-digit tok/s)"},
+    {"strict_vram", "ENGINE_STRICT_VRAM", "strict-vram", false, false, Type::Bool, "false",
+     0, 0,
+     "strict VRAM policy for `serve`: refuse to start when the measured free VRAM after "
+     "load is below --vram-margin (v0.1.6 behaviour). Default (off) starts with a loud "
+     "WARN when free VRAM is between a 700 MiB hard floor and the margin, because desktop "
+     "WDDM can consume VRAM between the loader check and the serve guard"},
 
     // ---------------- startup interaction ----------------
     {"interactive", "ENGINE_INTERACTIVE", "no-interactive", false, false, Type::Bool, "true",
