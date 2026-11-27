@@ -14,6 +14,14 @@
 
 namespace runner {
 
+// moe_route (device-side router) has pr[256] on the stack and returns early when
+// n_expert > 256; device routing must therefore fall back to the host router for
+// wider expert tables instead of leaving the routing slots uninitialised.
+constexpr int kMaxDeviceRouteExperts = 256;
+inline bool device_route_supported(int n_expert) {
+  return n_expert > 0 && n_expert <= kMaxDeviceRouteExperts;
+}
+
 enum class Container { Safetensors, Gguf };
 
 // Auto-detect the container from the path: a directory is a HF safetensors
@@ -461,6 +469,8 @@ class DenseRunner {
   void set_position(int start_pos);
   bool load_qtensor(const std::string& name, QTensor& out);
   void build_block_major(QTensor& q);
+  void zero_device_buffer(cuda::Buffer& b, long long n);
+  void ensure_route_slots_zeroed(int nact);
   void build_half_transposed(QTensor& q);
   cuda::Buffer upload_norm(const std::vector<float>& v) const;
   const std::vector<float>& lm_head_f32();   // materialise the f32 head on demand
@@ -642,6 +652,7 @@ class DenseRunner {
   cuda::Buffer moe_gp_, moe_up_, moe_dp_;   // device pointer arrays (fused MoE)
   cuda::Buffer moe_gact_;                    // fused MoE activation buffer
   cuda::Buffer slot_exp_, slot_tok_, slot_w_;  // device routing output
+  bool route_slots_zeroed_ = false;             // routing slots are cleared once
   std::vector<cuda::Buffer> all_gp_, all_up_, all_dp_;  // per layer: ne pointers
   bool xexp_ready_ = false;
   bool layer_graph_mode_ = false;

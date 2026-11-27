@@ -151,9 +151,10 @@ const OptionDef kDefs[] = {
      "keep the KV cache in host memory instead of VRAM (host-mapped KV is not implemented "
      "yet; the option is parsed and reported, the cache must fit in VRAM)"},
     {"kv_split", "ENGINE_KV_SPLIT", "kv-split", true, false, Type::Int, "32",
-     1, 64,
-     "split-K partials for the tiled decode attention: the key range of one query row is "
-     "spread over this many blocks (prefill batches use 1 and finish in-register)"},
+     1, 32,
+     "split-K partials for the tiled decode attention (1..32; 32 measured best after the "
+     "GQA kernel: the key range of one query row is split across this many blocks, "
+     "prefill batches use 1 and finish in-register)"},
     {"ctx_auto", "ENGINE_CTX_AUTO", "ctx-auto", true, false, Type::Bool, "true",
      0, 0,
      "derive the maximum ctx from free VRAM - weights - workspace - activations for the "
@@ -694,7 +695,9 @@ void Config::ensure_initialized() const {
       it.raw = v ? "true" : "false";
       it.src = Source::Env;
     } else {
-      self->apply_text(d, e, Source::Env, &err, "environment");
+      if (!self->apply_text(d, e, Source::Env, &err, "environment")) {
+        throw std::runtime_error(err);
+      }
     }
   }
 }

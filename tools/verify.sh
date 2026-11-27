@@ -41,6 +41,7 @@ echo "q35 conv consistency : PASS (chunked vs incremental)"
 N_LAYER=4 "$PY" tests/make_tiny_model.py build/fixtures/tiny_model4 >/dev/null || fail=1
 "$PY" tests/make_tiny_moe.py >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_moe.py >/dev/null || fail=1
+N_EXPERT=300 "$PY" tests/make_tiny_gguf_moe.py build/fixtures/tiny_gguf_moe300 >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_mla.py >/dev/null || fail=1
 "$PY" tests/make_tiny_gguf_ds2.py >/dev/null || fail=1
 QW="${MODEL_DIR}/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_K_M.gguf"
@@ -77,6 +78,7 @@ if [ -x ./build/test_quant.exe ]; then ./build/test_quant.exe || fail=1; else ec
 if [ -x ./build/test_cpu_moe.exe ]; then ./build/test_cpu_moe.exe || fail=1; else echo "missing build/test_cpu_moe.exe"; fail=1; fi
 if [ -x ./build/test_gemv.exe ]; then ./build/test_gemv.exe || fail=1; else echo "missing build/test_gemv.exe"; fail=1; fi
 if [ -x ./build/test_kv.exe ]; then ./build/test_kv.exe || fail=1; else echo "missing build/test_kv.exe"; fail=1; fi
+if [ -x ./build/test_kernel_bounds.exe ]; then ./build/test_kernel_bounds.exe || fail=1; else echo "missing build/test_kernel_bounds.exe"; fail=1; fi
 if [ -x ./build/test_model.exe ]; then
   ./build/test_model.exe || fail=1
   ./build/test_model.exe build/fixtures/tiny_model4 || fail=1

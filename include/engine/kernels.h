@@ -1360,11 +1360,12 @@ extern "C" __global__ void gd_ssm_prep(const float* __restrict__ x,
     }
     return;
   }
+  if (K > 9) return;   // host gate uses the fused path only for K <= 8 (qwen35: K=4)
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
-  float hist[4];
+  float hist[8];
   const int nh_hist = K - 1;
-  for (int i = 0; i < nh_hist && i < 4; ++i) hist[i] = state[i * C + c];
+  for (int i = 0; i < nh_hist && i < 8; ++i) hist[i] = state[i * C + c];
   float acc = 0.f;
   for (int kk = 0; kk < K; ++kk) {
     const int j = kk - (K - 1);
@@ -1377,7 +1378,7 @@ extern "C" __global__ void gd_ssm_prep(const float* __restrict__ x,
   else v[c - 2 * key_dim] = acc;
   // T == 1: state[a] = input at (T-1-a) -> state[0] = x[0], state[a] = old state[a-1]
   state[c] = x[c];
-  for (int i = 1; i < nh_hist && i < 4; ++i) state[i * C + c] = hist[i - 1];
+  for (int i = 1; i < nh_hist && i < 8; ++i) state[i * C + c] = hist[i - 1];
 }
 )cuda";
 
@@ -3584,7 +3585,7 @@ extern "C" __global__ void attn_combine(const float* __restrict__ scratch,
   const int i = blockIdx.x;
   const int h = blockIdx.y;
   const float* base = scratch + (long long)((i * n_head + h) * nsplit) * scratch_stride;
-  __shared__ float w[33];
+  __shared__ float w[64];   // kv_split is capped at 32; 64 is defensive headroom
   __shared__ float inv_s;
   if (threadIdx.x == 0) {
     float mx = -1e30f;

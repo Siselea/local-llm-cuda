@@ -39,8 +39,11 @@
   做 `atomicAdd(&xout[slot_tok*hidden + row], ...)` → **越界写/非法地址/崩溃**。
 - 触发条件：MoE 模型 `n_expert > 256` 且走 device-route。device route 默认值是
   **`dev_route_default_ = !q51_expert`（`runner.cpp:119`）**，即除 Q5_1 专家外的 MoE 模型默认开启。
-  当前三个模型 ne = 256 / 64 / 0（35B 恰好 256，边界安全），**任何 >256 专家的模型（Kimi-K2 384、
-  Qwen3-Next 等）会命中**。这是"架构通用化轮"之后最值得修的边界。
+  当前三个模型 ne = 256 / 64 / 0（35B 恰好 256，边界安全）。
+  **修正（修复阶段核实）**：v0.1.7 的 IR 校验在加载期就硬拒绝 `n_expert > 256`
+  （`src/ir.cpp:581`：`expert_count ... > 256: ... not supported`，`test_model` 以 exit 2 退出）
+  ⇒ 这条静默返回路径**当前不可达**，也不会真的出现野指针；它属于"若未来放宽 256 限制就会踩"的
+  **潜在缺陷/防御缺口**（Kimi-K2 384 类模型现在会被明确拒绝而不是崩溃）。
 - 已实机确认（§4 harness）：ne=256 正常写槽；**ne=300 时 slot 保持哨兵值 `0x7f7f7f7f` 未写**。
 - 修复（30 分钟）：host 侧 `if (ne > 256)` 回退到 host 路由（现有 host path 可用）；
   kernel 侧把固定 `pr[256]` 改为分块/动态上限，或用 `ne <= 256` 在 host 选择 kernel；
@@ -198,7 +201,7 @@ harness: 3 confirmed, 0 not reproduced
 | # | 缺陷 | 修复 | 工作量 | 风险 |
 |---|---|---|---|---|
 | 1 | D1 `attn_combine w[33]` vs kv_split≤64（shared 越界写） | `w[64]` + 配置/选择处断言；顺势把 kv_split 上限 32 | 10 min | 极低 |
-| 2 | D2 `moe_route ne>256` 静默 → 野指针/越界写 | host `ne>256` 回退 host 路由 + slot `zero_fill`；kernel 分块或删除 256 限 | 30 min + 五套 | 低（默认模型不变） |
+| 2 | D2 `moe_route ne>256` 静默（当前被 IR 校验挡住，潜在） | host `ne>256` 回退 host 路由 + slot `zero_fill`（已修，作为放宽 256 限制前的前置防御） | 30 min + 五套 | 低（默认模型不变） |
 | 3 | D3 `attn_cached_cfg` 无 opt-in（长 ctx 崩溃） | call `max_dynamic_shared_mem` + ctx clamp | 5-15 min | 极低 |
 | 4 | D3b MLA opt-in 超设备上限（ctx>25344） | ctx 预算按 kernel smem 上限 clamp + 明确报错 | 15 min | 低 |
 | 5 | D4 `topk_partial taken[256]` host 无断言 | nblk 至少 ceil(vocab/8192) + assert | 15 min | 极低 |
@@ -217,3 +220,17 @@ harness: 3 confirmed, 0 not reproduced
 会立即触发的生产缺陷**；确认的高危项都是"边界外推"型：D1 是用户可设配置（`--kv-split >33`），
 D2 是 >256 专家的新模型，D3 是通用架构 + 大 ctx。建议 v0.1.8 前把 #1/#2/#3 修掉（合计约 1 小时），
 其余按表排期。
+
+
+---
+
+## 6. 修复记录（v0.1.8，commit `fix(kernels): bounds + smem opt-in + >256-expert guard`）
+
+| 缺陷 | 修复内容 | 回归测试 |
+|---|---|---|
+| D1 `attn_combine` w[33] / kv_split≤64 | `kernels.h`: `w[64]`；`config.cpp`: kv_split 上限 64→**32**（GQA 后 32 即最优）；`runner.cpp`: clamp 同步 32；`CONFIG.md` 更新。另：**非法 env 值现在直接报错**（此前被静默忽略，`ENGINE_KV_SPLIT=34` 会悄悄回退默认） | `tests/test_kernel_bounds.cpp`：默认 32；`ENGINE_KV_SPLIT=34/64` 被配置层拒绝；8/16/32 接受；`attn_combine` 在 nsplit=8/16/32 下与 host 参考合并一致（含一个空 split 的边界） |
+| D2 `moe_route` ne>256 静默（潜在；当前 IR 校验会拒绝该模型） | `runner.h`: `kMaxDeviceRouteExperts=256` + `device_route_supported(ne)`；`runner.cpp`: 两个 device-route 启用条件都要求它（单点语义），`slot_exp_/slot_tok_/slot_w_` 在分配后由 `ensure_route_slots_zeroed()` 清零（含 reallocation 后），即使漏掉守卫也不会把垃圾下标喂给 `gptrs[e]`/`atomicAdd`。**目的**：在放宽 256 专家限制之前先有安全回退 | 守卫单测（256/64 可用，257/300/384 回退）；`tests/make_tiny_gguf_moe.py` 支持 `N_EXPERT` 环境变量，`verify.sh` 生成 **300 专家** fixture，测试断言加载被 **明确拒绝**（`expert_count 300 > 256 ... not supported`，exit≠0），把"拒绝而非崩溃/野指针"的契约钉住 |
+| D3 `attn_cached_cfg` 无 smem opt-in | `runner.cpp`: 启动前 `cuda::max_dynamic_shared_mem(k_attncfg_)`；加载期按两个随 ctx 增长的 kernel（`attn_cached_cfg`、`mla_attn_cached`）的 smem 上限 **clamp ctx** 并打印 `[ctx] kernel-smem clamp`，不再在 `cuLaunchKernel` 里崩 | `test_kernel_bounds.cpp`：48 KiB 动态 smem 正常；opt-in 后 60 KB（原失败场景）成功 |
+| D6 `gd_ssm_prep hist[4]`（K>5 栈越界） | `kernels.h`: `hist[8]` + `K>9` 防御性返回；`qwen35.cpp`: fused 路径 host 门限加 `K <= 8` | 由 `tools/verify.sh` 的 q35 conv 一致性测试与五套覆盖（K=4 路径） |
+
+其余项（D4/D5/D7-D14）按 §5 待办保留，未在本次改动范围内。

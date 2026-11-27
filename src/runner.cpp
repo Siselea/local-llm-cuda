@@ -817,6 +817,7 @@ DenseRunner::DenseRunner(const std::string& path, int max_seq, Container contain
     slot_exp_ = cuda::Buffer(route_slots * 4);
     slot_tok_ = cuda::Buffer(route_slots * 4);
     slot_w_ = cuda::Buffer(route_slots * 4);
+    route_slots_zeroed_ = false;
     moe_gact_ = cuda::Buffer(route_slots * static_cast<size_t>(expert_inter_) * 4);
   }
   // MTP / speculative-decoding block (only in models that ship a `nextn` layer).
@@ -1071,6 +1072,38 @@ void DenseRunner::derive_ctx_limit(int requested) {
                    "the cache must fit in VRAM (see docs/CONFIG.md)\n");
   }
   max_seq_ = final_seq;
+  // Kernel shared-memory limits: attn_cached_cfg stages max_seq floats of scores and
+  // mla_attn_cached does the same.  Their dynamic shared memory scale is what actually
+  // bounds the context on cards with a 48 KiB default (99 KiB opt-in on this GPU), so
+  // clamp here with a clear message instead of failing inside cuLaunchKernel later.
+  {
+    auto smem_ctx_limit = [](void* fn, int extra_floats) -> int {
+      size_t cap = cuda::max_dynamic_shared_mem(fn);
+      if (cap == 0) cap = 48u * 1024u;   // default window when the opt-in is unsupported
+      const int lim = static_cast<int>(cap / sizeof(float)) - extra_floats;
+      return lim < 1 ? 1 : lim;
+    };
+    if (ext_enabled_ && k_attncfg_) {
+      const int lim = smem_ctx_limit(k_attncfg_, 32);
+      if (lim < max_seq_) {
+        std::fprintf(stderr,
+                     "[ctx] kernel-smem clamp: %d -> %d (attn_cached_cfg needs "
+                     "(ctx+32)*4 bytes of dynamic shared memory, limit %d)\n",
+                     max_seq_, lim, lim);
+        max_seq_ = lim;
+      }
+    }
+    if (ir_.attn.variant == "mla" && k_mlaattnc_) {
+      const int lim = smem_ctx_limit(k_mlaattnc_, 0);
+      if (lim < max_seq_) {
+        std::fprintf(stderr,
+                     "[ctx] kernel-smem clamp: %d -> %d (mla_attn_cached stages one "
+                     "float per position in dynamic shared memory)\n",
+                     max_seq_, lim);
+        max_seq_ = lim;
+      }
+    }
+  }
   kv_override_ctx_ = true;
 }
 
@@ -1580,6 +1613,9 @@ void DenseRunner::ext_attention(LayerW& L, int n_tokens, int start_pos) {
     void* pp = pos_dev_.data();
     void* args[] = {&pq, &pK, &pV, &po, &pp, &nhh, &nk, &dd, &ms, &scale, &window};
     const size_t sh = (static_cast<size_t>(max_seq_) + 32) * sizeof(float);
+    // Without this the launch is rejected once (max_seq+32)*4 > 48 KiB (ctx > 12256);
+    // the ctx is also clamped to the returned limit at load time (see the ctor).
+    cuda::max_dynamic_shared_mem(k_attncfg_);
     cuda::launch(k_attncfg_, n_tokens, nh, 1, 32, 1, 1, sh, args);
   }
   // output projection + sandwich norm + residual
@@ -3046,8 +3082,8 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
   const bool dev_ok = ENGINE_ENV_ON("ENGINE_DEV_ROUTE") ||
                       layer_graph_ || layer_graph_mode_ || dev_route_default_;
   bool use_dev = false;
-  if (dev_ok && gpu_n_pre == ne && L.all_ptr_idx >= 0 && k_moeroute_ && n_tokens <= 8 &&
-      !L.q_experts.empty()) {
+  if (dev_ok && gpu_n_pre == ne && device_route_supported(ne) && L.all_ptr_idx >= 0 &&
+      k_moeroute_ && n_tokens <= 8 && !L.q_experts.empty()) {
     use_dev = type_id_of(L.q_experts[0].type) >= 0 && type_id_of(L.q_experts[1].type) >= 0 &&
               type_id_of(L.q_experts[2].type) >= 0 &&
               !ENGINE_ENV_ON("ENGINE_DEV_NO_Q51");
@@ -3548,7 +3584,8 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       dev_route_auto;
   const int gpu_n_dr = (L.cpu_begin >= 0 && L.cpu_begin <= ne) ? L.cpu_begin
                                                               : ((gpu_experts_ < 0) ? ne : ne);
-  if (dev_route_env && gpu_n_dr == ne && L.all_ptr_idx >= 0 && k_moeroute_ && n_tokens <= 8) {
+  if (dev_route_env && gpu_n_dr == ne && device_route_supported(ne) && L.all_ptr_idx >= 0 &&
+      k_moeroute_ && n_tokens <= 8) {
     auto type_id = [](const std::string& t) {
       if (t == "Q4_K") return 0;
       if (t == "Q5_K") return 1;
@@ -3571,6 +3608,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         slot_exp_ = cuda::Buffer(static_cast<size_t>(nact) * 4);
         slot_tok_ = cuda::Buffer(static_cast<size_t>(nact) * 4);
         slot_w_ = cuda::Buffer(static_cast<size_t>(nact) * 4);
+        route_slots_zeroed_ = false;   // fresh allocation: clear before the next route
       }
       if (moe_gact_.size() < static_cast<size_t>(nact) * expert_inter_ * 4)
         moe_gact_ = cuda::Buffer(static_cast<size_t>(nact) * expert_inter_ * 4);
@@ -3578,6 +3616,7 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
       // added their contribution -- zeroing again here would wipe it out.
       if (ENGINE_ENV_ON("ENGINE_DBG_LG2") && layer == 1)
         std::fprintf(stderr, "[lg2] route kernel\n");
+      ensure_route_slots_zeroed(nact);
       {
         void* pl = router_logits_.data();
         int nen = ne, tk = topk, sg = (ir_.moe.router_kind == "sigmoid_topk") ? 1 : 0;
@@ -4073,6 +4112,29 @@ void DenseRunner::build_block_major(QTensor& q) {
   const int blocks = static_cast<int>((bytes / 4 + 255) / 256);
   cuda::launch(k_repackbm_, blocks, 1, 1, 256, 1, 1, 0, args);
   q.has_bm = true;
+}
+
+// zero a device buffer with the strided zero_fill kernel (a cuMemsetD32 would work
+// too, but every capture-safe primitive here goes through cuda::launch).
+void DenseRunner::zero_device_buffer(cuda::Buffer& b, long long n) {
+  if (!k_zerofill_ || !b.data() || n <= 0) return;
+  void* p = b.data();
+  long long count = n;
+  void* args[] = {&p, &count};
+  cuda::launch(k_zerofill_, 64, 1, 1, 256, 1, 1, 0, args);
+}
+
+// The device router writes every slot for n_expert <= 256; for wider expert tables it
+// returns early (see runner::device_route_supported) and the host router is used, so a
+// stale/uninitialised slot array can no longer feed a garbage expert index into
+// gptrs[e] or an out-of-bounds atomicAdd.  Clearing the slots once (and after any
+// reallocation) is defence in depth for paths that still read them.
+void DenseRunner::ensure_route_slots_zeroed(int nact) {
+  if (route_slots_zeroed_ || nact <= 0) return;
+  zero_device_buffer(slot_exp_, nact);
+  zero_device_buffer(slot_tok_, nact);
+  zero_device_buffer(slot_w_, nact);
+  route_slots_zeroed_ = true;
 }
 
 bool DenseRunner::load_qtensor(const std::string& name, QTensor& out) {
@@ -4771,7 +4833,7 @@ void DenseRunner::load_config_snapshot() {
                    kvt.c_str());
     kv_split_ = static_cast<int>(cfg.get_int("kv_split"));
     if (kv_split_ < 1) kv_split_ = 1;
-    if (kv_split_ > 64) kv_split_ = 64;
+    if (kv_split_ > 32) kv_split_ = 32;   // config caps at 32; keep the clamp in sync
   }
   vram_margin_bytes_ = static_cast<size_t>(cfg.get_int("vram_margin_mb")) << 20;
   vram_adaptive_ = cfg.get_bool("vram_check");

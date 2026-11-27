@@ -9,6 +9,7 @@ Usage: python tests/make_tiny_gguf_moe.py [out_dir]
 from __future__ import annotations
 
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -21,7 +22,7 @@ N_KV = 2
 HEAD_DIM = 16
 FFN = 128
 EXPERT_INTER = 32
-N_EXPERT = 4
+N_EXPERT = int(os.environ.get("N_EXPERT", "4"))
 TOP_K = 2
 VOCAB = 128
 N_LAYER = 2

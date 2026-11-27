@@ -371,7 +371,7 @@ void DenseRunner::run_q35_linear_attn(int layer, int n_tokens, int start_pos) {
   // Fused decode path (T == 1): conv1d+silu writes q/k/v directly, the conv history
   // is shifted in the same launch, and the beta/g block runs alongside.
   const bool fused_ssm = ssm_fuse_ && gd_delta_128_ && n_tokens == 1 && k_gdprep_ &&
-                         k_gddelta128f_ && KD == 128 && VD == 128;
+                         k_gddelta128f_ && KD == 128 && VD == 128 && K <= 8;
   // bisection aids for A/B on the two halves of the fused chain
   static const bool prep_only = ENGINE_ENV_ON("ENGINE_SSM_PREP_ONLY");
   static const bool delta_only = ENGINE_ENV_ON("ENGINE_SSM_DELTA_ONLY");

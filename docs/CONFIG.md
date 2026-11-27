@@ -174,7 +174,7 @@ KV cache 是 decode 阶段唯一随上下文线性增长的显存与读放来源
 | `attn_gqa_wide` | `--no-attn-gqa-wide` | `ENGINE_NO_ATTN_GQA_WIDE` | bool | `true` | GQA decode 的 f32 K/V 用 float4（两次 512B 全合并）读，替代 8 次 strided 4B |
 | `attn_pre_rows` | `--attn-pre-rows <v>` | `ENGINE_ATTN_PRE_ROWS` | int [1,32] | `8` | prefill attention 每 block 的 query 行数：同 block 的 8 个 warp 走同一份 K/V（L1 复用）。1 = 关（回到每 warp 一个 (token,head)）；实测 444 ms → 138 ms（1622 token 单块，8 层） |
 | `attn_gqa` | `--attn-gqa[=0]` | `ENGINE_ATTN_GQA` | bool | `true` | prefill attention 的 GQA 组共享：一个 warp 负责一个 query 行的**全部 rep 个 q head**，K/V 只读一遍（4× 流量）。每个 head 的算术顺序不变 ⇒ 结果与 `attn_tiled_pre` 逐位一致。仅 f32 KV + head_dim 256（9B/35B） |
-| `kv_split` | `--kv-split <v>` | `ENGINE_KV_SPLIT` | int [1,64] | `32` | decode attention 的 split-K 份数（一条 query 的 key 区间分给多少个 block）。prefill batch 固定用 1（每个 (token,head) 一个 block，寄存器内完成 softmax，不需要 scratch） |
+| `kv_split` | `--kv-split <v>` | `ENGINE_KV_SPLIT` | int [1,32] | `32` | decode attention 的 split-K 份数（一条 query 的 key 区间分给多少个 block）。prefill batch 固定用 1（每个 (token,head) 一个 block，寄存器内完成 softmax，不需要 scratch） |
 
 **实现位置**：内核 `kv_write_q` / `attn_tiled` / `attn_combine`（`include/engine/kernels.h`，
 新增在文件末尾；注入在 `src/runner.cpp` 的 NVRTC 源码拼接与 kernel 注册处）；
