@@ -99,7 +99,7 @@ else echo "missing build/test_model.exe"; fail=1; fi
 if [ -x ./build/test_mla_kv.exe ]; then ./build/test_mla_kv.exe || fail=1; else echo "missing build/test_mla_kv.exe"; fail=1; fi
 
 echo
-echo "== >256-expert MoE (host-route fallback): load + 30-token generation =="
+echo "== >256-expert MoE: load + device/host router parity + 30-token generation =="
 mkdir -p build/logs
 for ne in 300 384; do
   d="build/fixtures/tiny_gguf_moe${ne}"
@@ -107,6 +107,7 @@ for ne in 300 384; do
   ./build/test_model.exe "$d" || fail=1
   ENGINE_GPU_EXPERTS=0 ./build/test_model.exe "$d" || fail=1
   ENGINE_GPU_EXPERTS="$ne" ENGINE_DEV_ROUTE=1 ./build/test_model.exe "$d" || fail=1
+  ENGINE_GPU_EXPERTS="$ne" ENGINE_NO_DEV_ROUTE=1 ./build/test_model.exe "$d" || fail=1
   ENGINE_TOPK=1 ./build/test_gen.exe "$d/model.gguf" "1,2,3,4" 30 \
     >"build/logs/large_${ne}_default.log" 2>&1 || fail=1
   ENGINE_TOPK=1 ENGINE_DEV_ROUTE=0 ./build/test_gen.exe "$d/model.gguf" "1,2,3,4" 30 \

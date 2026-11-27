@@ -216,9 +216,11 @@ void test_device_route_guard() {
   std::printf("== device-route expert-count guard ==\n");
   check(runner::device_route_supported(256), "n_expert=256 uses the device router");
   check(runner::device_route_supported(64), "n_expert=64 uses the device router");
-  check(!runner::device_route_supported(257), "n_expert=257 falls back to the host router");
-  check(!runner::device_route_supported(300), "n_expert=300 falls back to the host router");
-  check(!runner::device_route_supported(384), "n_expert=384 falls back to the host router");
+  check(runner::device_route_supported(257), "n_expert=257 uses the device router (dynamic smem)");
+  check(runner::device_route_supported(300), "n_expert=300 uses the device router (dynamic smem)");
+  check(runner::device_route_supported(384), "n_expert=384 uses the device router (dynamic smem)");
+  check(runner::device_route_supported(4096), "n_expert=4096 (IR cap) uses the device router");
+  check(!runner::device_route_supported(4097), "n_expert>4096 falls back to the host router");
   check(!runner::device_route_supported(0), "n_expert=0 is not routed by the device");
 }
 
@@ -251,8 +253,8 @@ void test_expert_overflow_fixture() {
                 (env ? env : "auto") + ")");
     }
   }
-  check(!runner::device_route_supported(300),
-        "n_expert=300 still takes the host router (device router capped at 256)");
+  check(runner::device_route_supported(300),
+        "n_expert=300 now takes the device router (dynamic shared memory)");
 }
 
 // D4: the device top-k partial kernel keeps a 512-word (16384-index) selection bitmap

@@ -3746,7 +3746,9 @@ void DenseRunner::run_moe(int layer, int n_tokens) {
         void* pt = slot_tok_.data();
         void* pw = slot_w_.data();
         void* args[] = {&pl, &nen, &tk, &sg, &nt, &pe, &pt, &pw};
-        cuda::launch(k_moeroute_, n_tokens, 1, 1, 32, 1, 1, 0, args);
+        // dynamic shared memory: one float per expert (see moe_route)
+        cuda::launch(k_moeroute_, n_tokens, 1, 1, 32, 1, 1,
+                     static_cast<size_t>(ne) * sizeof(float), args);
         if (ENGINE_ENV_ON("ENGINE_DBG_DEVROUTE")) {
           cuda::sync();
           std::vector<int> he(nact), ht(nact);

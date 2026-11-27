@@ -2251,11 +2251,13 @@ extern "C" __global__ void moe_route(const float* __restrict__ logits, int ne, i
                                      int router_sigmoid, int norm_topk,
                                      int* __restrict__ slot_exp, int* __restrict__ slot_tok,
                                      float* __restrict__ slot_w) {
+  // Routing probabilities live in dynamic shared memory: the host passes ne floats
+  // (IR caps expert_count at 4096, i.e. 16 KiB, well inside the 48 KiB default limit;
+  // the old stack float pr[256] hard-capped the device router at 256 experts).
+  extern __shared__ float pr[];
   if (threadIdx.x != 0) return;
   const int t = blockIdx.x;
-  if (ne > 256) return;
   const float* row = logits + (long long)t * ne;
-  float pr[256];
   if (router_sigmoid) {
     for (int e = 0; e < ne; ++e) pr[e] = sigmoidf_(row[e]);
   } else {

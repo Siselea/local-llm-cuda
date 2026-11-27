@@ -610,8 +610,9 @@ std::vector<std::string> validate(Model& m) {
     } else if (m.moe.n_expert > 256) {
       m.warnings.push_back(
           "expert_count " + std::to_string(m.moe.n_expert) +
-          " > 256: the device-side router is disabled for this model; host-side routing "
-          "is used (correct, slower by one host round-trip per MoE layer)");
+          " > 256: the device router uses dynamic shared memory (ne*4 bytes; fine at "
+          "this size); the host router is still used when the experts are not all "
+          "GPU-resident");
     }
     if (m.moe.n_expert_used <= 0)
       errs.push_back("expert_used_count missing/0 (MoE top-k unknown)");
