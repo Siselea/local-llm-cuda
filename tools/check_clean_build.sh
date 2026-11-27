@@ -127,6 +127,10 @@ else
   else
     echo "[gate]   json writer UTF-8 sanitisation GREEN"
   fi
+  if [ -x build/test_json_depth.exe ] && ! ./build/test_json_depth.exe > json_depth_gate.log 2>&1; then
+    fail "test_json_depth (JSON reader must cap nesting depth, not overflow the stack)"
+    tail -5 json_depth_gate.log >&2
+  fi
 fi
 
 echo

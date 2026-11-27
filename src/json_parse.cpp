@@ -21,8 +21,16 @@ class Parser {
   }
 
  private:
+  // Bounded nesting: a recursive-descent parser must cap recursion depth, otherwise a
+  // single hostile body such as "[[[[...]]]]" overflows the native stack and kills the
+  // process (reproduced: POST /tokenize with 200k '[' -> server dies, no 4xx).  128 is
+  // far beyond any real request shape (OpenAI-style bodies nest < 10 deep) while leaving
+  // plenty of stack for the 32 MiB body limit.
+  static constexpr int kMaxDepth = 128;
+
   const std::string& s_;
   size_t pos_ = 0;
+  int depth_ = 0;
 
   [[noreturn]] void fail(const char* what) {
     throw std::runtime_error(std::string("JSON parse error: ") + what + " at offset " +
@@ -59,9 +67,14 @@ class Parser {
   Value parse_value() {
     skip_ws();
     char c = peek();
+    if (c == '{' || c == '[') {
+      if (depth_ >= kMaxDepth) fail("nesting too deep");
+      ++depth_;
+      Value v = (c == '{') ? parse_object() : parse_array();
+      --depth_;
+      return v;
+    }
     switch (c) {
-      case '{': return parse_object();
-      case '[': return parse_array();
       case '"': {
         Value v;
         v.type = Value::Type::Str;
