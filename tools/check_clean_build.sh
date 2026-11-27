@@ -61,6 +61,29 @@ echo "[gate] HEAD=$REF  worktree=$WT$MODE_LABEL"
 git worktree add --detach "$WT" HEAD >/dev/null 2>&1 || { echo "[gate] cannot create worktree"; exit 1; }
 cd "$WT" || exit 1
 
+# --- machine-specific path scan (same patterns as .github/workflows/build.yml) ---
+# Why: CI no-private-paths went red three times for committed local paths; catching it
+# in the local gate costs 5 s instead of a CI round-trip.  Patterns are assembled from
+# pieces so this file does not itself contain a machine-specific literal.
+echo "[gate] 0/6 private paths (CI no-private-paths patterns)"
+D="D:"; U="U:"; C="C:"; PY="py"; PY="${PY}312"; UN="320"; UN="${UN}40"
+pp_fail=0
+for pat in "${D}/p0" "${D}\\p0" "${D}\\\\p0" \
+           "${U}/AI" "${U}\\AI" "${U}\\\\AI" \
+           "${C}/Users" "${C}\\Users" "${C}\\\\\\Users" \
+           "${PY}" "${UN}"; do
+  if out=$(git grep -nF -e "$pat" -- . 2>/dev/null); then
+    echo "ERROR: private path [$pat] in tracked files:" >&2
+    echo "$out" | head -10 >&2
+    pp_fail=1
+  fi
+done
+if [ "$pp_fail" != "0" ]; then
+  echo "[gate] ABORT: machine-specific path(s) committed; fix before tagging" >&2
+  exit 1
+fi
+echo "[gate]   private paths: 0 hits"
+
 echo "[gate] 1/6 build.sh"
 if ! bash build.sh > build_gate.log 2>&1; then
   fail "build.sh (see $WT/build_gate.log)"

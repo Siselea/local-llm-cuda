@@ -1,9 +1,14 @@
 """Collect the llama.cpp greedy oracle for the gemma4-12B parity run (CPU, no VRAM)."""
-import json, subprocess, time, urllib.request
+import json, os, subprocess, time, urllib.request
 from pathlib import Path
 
-LLAMA = "U:/llama/llama-server.exe"
-MODEL = "U:/AI/gemma-4-12b-it-Q4_K_M.gguf"
+# Paths come from the environment (CI no-private-paths: no machine-specific literals).
+LLAMA = os.environ.get("LLAMA_SERVER") or "llama-server.exe"
+_default_model = os.path.join(os.environ.get("MODEL_DIR", ""),
+                              "gemma-4-12b-it-Q4_K_M.gguf")
+MODEL = os.environ.get("GEMMA_MODEL") or (_default_model if os.environ.get("MODEL_DIR") else "")
+if not MODEL:
+    raise SystemExit("set MODEL_DIR (or GEMMA_MODEL) to the gemma-4-12b gguf")
 PORT = 8092
 PROMPTS = {
     "hello": [9259],
