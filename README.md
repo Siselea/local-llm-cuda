@@ -21,6 +21,10 @@
 
 ![llama.cpp 官方聊天界面](docs/images/webui-chat.png)
 
+> **监听地址安全提示**：`engine serve` 默认只监听 `127.0.0.1`（仅本机可访问）。若改为 `--host 0.0.0.0`，
+> 同一局域网内任何设备都能访问 API（`/v1/*`、`/tokenize`、`/props` 等，**没有鉴权**），请勿直接暴露公网；
+> 需要远程访问时请放在 SSH 隧道/反向代理+鉴权之后。
+
 *`engine serve` 直接服务的 llama.cpp 官方 web UI（MIT）。Release zip 已内置；源码构建可用 `bash tools/fetch_webui.sh` 获取，未获取时使用内置极简页。*
 
 

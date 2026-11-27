@@ -120,16 +120,52 @@
 
 ---
 
-## 6. 仍需运行时验证（已由 Lead 决策推迟到 v0.1.9；不阻塞 v0.1.8）
+## 6. v0.1.9 运行时实测：RST 泄漏 / shutdown 并发（2026-11-27 完成）
 
-1. **200 次"流式发起后立即 RST"压测**：连续 200 次观察 engine RSS、VRAM、`/health` slot 计数是否稳定（本轮只做了 1–3 次单发断连 + 断连后正确性）。脚本已就绪：`build/rst_shutdown_test.py`（200 cycles 采样 RSS/VRAM + shutdown 并发），v0.1.9 窗口执行。计划命令：
-   `python build/rst_shutdown_test.py --port 7024`（启动 0.5B serve；200 次 RST 每 25 次采样 RSS/VRAM，随后测 shutdown 并发）。
-2. **慢读客户端 + 大输出**：客户端只读 header 不读 body，服务端 `send()` 是否会阻塞（需要 >socket 缓冲的输出；本机单线程下会体现在服务不可用窗口）。SO_SNDTIMEO 只在 listening socket 上设置，accepted socket 是否继承需实测。
-3. **`/shutdown` 并发变体**：生成中 + 两个 `/shutdown` 同时到达（第二个连接在 backlog 中被处理还是被丢弃？）；shutdown 后进程退出码/端口/VRAM 清理。
-4. **`--host 0.0.0.0` 局域网可达性**：默认 loopback 安全；绑定 0.0.0.0 后无鉴权，/props 暴露 model_path、/tokenize 等可被任意 LAN 客户使用；本次修复让单请求有界，但仍应只在可信网络使用。
-5. **静态文件/协议细节**：HEAD 请求是否带 body（语义小问题）、`/props` 的 model_path 隐私（llama.cpp 也暴露，低危）。
+**结论：200 次"流式请求后立即 RST"未发现 RSS/VRAM/slot 泄漏或 prefix-cache 污染；shutdown
+并发行为符合单线程语义，进程/端口/VRAM 清理干净。** 测试脚本已固化：
+`tools/serve_rst_shutdown_probe.py`（原 `build/rst_shutdown_test.py`），0.5B 模型，GPU 占用 ~2.6 GB。
 
----
+环境：0.5B qwen2.5-instruct-q4_k_m，`--ctx 512 --gpu-layers -1 --threads 8`，本机 v0.1.8
+（HEAD `143d89d`，release tag `5249d75`），先做 2 次 warmup 让 prefill/generation workspace
+完成一次性分配，再采基线（避免把 ~118 MB 一次性分配误判成泄漏）。
+
+### 6.1 200 次 RST 泄漏采样
+
+| 指标 | 数值 |
+|---|---|
+| 基线（warmup 后） | RSS **549.6 MB** / VRAM **2601 MB** |
+| 200 次采样（每 25 次） | RSS **549.7 / 549.7 / 549.7 / 549.7 / 549.7 / 549.7 / 549.7 / 549.7 / 549.7 MB** |
+| RSS 增长 | **+0.1 MB**（200 次全程，基本为噪声；无单调上升） |
+| VRAM | **2601 → 2599 MB**（-2 MB，无增长） |
+| slot 计数（9 次采样） | **slots_idle=1 / slots_processing=0，全部 9/9 次** |
+| 客户端错误 | 0 / 200 |
+| 200 次耗时 | 4.84 s |
+| 风暴后正常请求 | 200，`content='OK'` |
+| prefix cache 一致性（cache_prompt false vs true） | **token ids 完全相等** |
+| RST 后 `/health` | 200，slots 1/0 |
+
+说明：冷启动基线 431.7 MB，warmup 后 549.6 MB 是 prefill/生成 workspace 的**一次性**分配（+118 MB），
+不是每次请求增长；200 次采样从第一个点起完全平坦。**无泄漏、无 slot 泄漏、无 prefix-cache 污染。**
+
+### 6.2 shutdown 并发
+
+| 场景 | 结果 |
+|---|---|
+| ① 生成中两个并发 `/shutdown`（流式客户端仍在连接） | 第一个 **HTTP/1.1 200**（等待当前生成 handler 结束后处理，延迟 **5.22 s**，符合单线程语义）；第二个连接被 **TCP RST（10054）**；随后端口关闭、进程 **rc=0**、VRAM 释放到 **312 MB** |
+| ② 空闲时两个并发 `/shutdown` | 第一个 **200**、第二个 **RST**，延迟 **0.01 s**；端口关闭、rc=0、VRAM 312 MB |
+| ③ shutdown 后清理 | `engine.exe` 退出，端口不可连接，`nvidia-smi` 回到 312 MB 基础占用，无残留进程 |
+
+判定：**无泄漏/无状态污染**。唯一可改进点（低危、非阻塞）：第二个并发 `/shutdown` 得到 TCP RST
+而不是 HTTP 200/503 之类的明确响应；建议 v0.1.10 在 accept 循环里对正在 shutdown 的连接返回
+`503 shutting down` 再关闭（纯 UX/协议礼貌，不影响正确性）。
+
+### 6.3 本轮仍未覆盖（后续低优先级）
+
+- **慢读客户端 + 大输出**：客户端只读 header 不读 body 时服务端 `send()` 的阻塞窗口（需构造 >socket
+  缓冲的响应；本轮未测，属单线程架构已知面）。
+- `--host 0.0.0.0` 的局域网可达性：默认 loopback 安全；已改为 `0.0.0.0` 时无鉴权（见 §8/README 警告）。
+- 静态文件 HEAD/协议细节（语义小问题，低危）。
 
 ## 7. 输入驱动 DoS 面清单 + 通用防御（本轮沉淀）
 
@@ -213,5 +249,6 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7020/tokenize \
 - 已完成的验证：主树/worktree 构建、两个单测 GREEN、42/42 tokenizer golden、HTTP 用例 31/31。
 - **发布门禁已完成（2026-11-27，`70c8f0c`）**：干净 worktree 完整 6/6 → `CLEAN BUILD GATE GREEN`（详见 §4）。
   唯一环境项：`webui/index.html` 为未入库抓取资产，需在 gate worktree 中种入，否则 `/` 会 404（已知假失败）。
-- **推迟到 v0.1.9**：§6 的 RST 200 次泄漏采样、shutdown 并发、慢读客户端大输出实测（Lead 决策，不阻塞 v0.1.8；
-  脚本 `build/rst_shutdown_test.py` 已就绪）。
+- **v0.1.9 运行时实测已完成**（2026-11-27）：200 次 RST 无 RSS/VRAM/slot 泄漏、prefix cache 无污染；
+  shutdown 并发行为见 §6.2（进程/端口/VRAM 清理干净；第二并发连接 RST 为低危 UX 项）。
+- `--host 0.0.0.0` 警告已进 README（默认 127.0.0.1；改为 0.0.0.0 后 LAN 无鉴权，勿暴露公网）。
